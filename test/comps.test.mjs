@@ -6,7 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpDir } from './helpers/tmp.mjs';
@@ -71,7 +71,6 @@ test('discover: every .dc.html becomes a comp with a sanitized, collision-free n
     'Atlas.dc.html': 'atlas',
     'Atlas 5 Mobile.dc.html': 'atlas-5-mobile',
     'Signin.dc.html': 'signin',
-    'signin.dc.html': 'signin-2',
     'comps/Atlas.dc.html': 'atlas-comps',
     'comps/Signin Variations.dc.html': 'signin-variations',
   });
@@ -86,7 +85,6 @@ test('discover: results are sorted by name, records carry path/screens/dependenc
     'atlas-5-mobile',
     'atlas-comps',
     'signin',
-    'signin-2',
     'signin-variations',
   ]);
   for (const comp of comps) {
@@ -104,8 +102,21 @@ test('discover: collision naming — root keeps the bare name, subdir is suffixe
   assert.equal(byName['atlas-comps'], 'comps/Atlas.dc.html');
 });
 
-test('discover: case-collision falls back to a deterministic numeric suffix', () => {
-  const comps = discoverComps(TREE);
+test('discover: case-collision falls back to a deterministic numeric suffix', (t) => {
+  // The colliding pair cannot live in the repository: checking out both
+  // 'Signin.dc.html' and 'signin.dc.html' collides on case-insensitive
+  // filesystems (macOS, Windows), so the scenario is built at runtime — and
+  // skipped where the filesystem itself cannot represent it, since there the
+  // collision cannot occur in an extracted tree either.
+  const root = tmpDir('case-collision');
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, 'Signin.dc.html'), readFixture('tree/Signin.dc.html'));
+  writeFileSync(join(root, 'signin.dc.html'), readFixture('tree/Signin.dc.html'));
+  const listed = readdirSync(root).filter((f) => f.toLowerCase() === 'signin.dc.html');
+  if (listed.length < 2) {
+    return t.skip('case-insensitive filesystem: the colliding pair cannot exist on disk');
+  }
+  const comps = discoverComps(root);
   const byPath = Object.fromEntries(comps.map((c) => [c.path, c.name]));
   assert.equal(byPath['Signin.dc.html'], 'signin');
   assert.equal(byPath['signin.dc.html'], 'signin-2');
