@@ -1,0 +1,23 @@
+# Review scratch, spike artifacts, and extracted design bundles — disposable,
+# and design comps never enter the tracked tree (same rule as deck).
+.review/
+
+# Uploaded design export zips — import them, don't commit them.
+*.zip
+
+# Imported reference renders, vendored CDN dependencies, and extracted design
+# bundles are runtime artifacts — design comps never enter the tracked tree.
+.visual-diff/
+
+# Toolchain
+node_modules/
+dist/
+
+# Orchestration scratch (per-worktree task isolation).
+.worktrees/
+.tmp-v/
+
+# Test scratch: the suite's managed temp root (test/helpers/tmp.mjs).
+.tmp/
+# Harness/tool scratch (command-code workspaces, review probes).
+.commandcode/

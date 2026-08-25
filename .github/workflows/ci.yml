@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Install and test
+        run: |
+          npm ci
+          npm test
+
+  sea-build:
+    # Merge gate: the single-file Node SEA payload must build on the pinned
+    # runtime. npm ci installs the build-time devDependencies (esbuild,
+    # postject) and the embedded playwright trees; npm run build:sea stages
+    # dist/ and verifies the result is a genuine ELF, not a shebang bundle.
+    # dist/ is build output only — gitignored — and the staged payload is
+    # uploaded as a build artifact for downstream packaging; this repo never
+    # writes into a live libexec root. The smoke step dispatches the built
+    # binary directly so a build that cannot exec (missing postjection,
+    # broken bundle) fails here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Install
+        run: npm ci
+      - name: Build the SEA payload
+        run: npm run build:sea
+      - name: Smoke-run the built entry
+        run: |
+          ./dist/noise-visual-diff report | grep -q 'no published run'
+          json=$(./dist/noise-visual-diff report --json)
+          echo "$json" | grep -q '"schema": 1'
+          echo "$json" | grep -q '"command": "report"'
+          if ./dist/noise-visual-diff frobnicate 2>/dev/null; then
+            echo "unknown verb must exit nonzero" >&2
+            exit 1
+          fi
+      - name: Upload the SEA payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: noise-visual-diff-sea
+          path: dist/
+          if-no-files-found: error

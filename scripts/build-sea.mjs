@@ -1,0 +1,198 @@
+#!/usr/bin/env node
+// Builds the noise-visual-diff Node SEA single-file executable and the staged
+// dist/ payload the suite packaging process consumes (FR-1/NFR-3; the
+// SEA + asset-materialization strategy validated by spike).
+//
+// Usage: node scripts/build-sea.mjs [--out <dir>] [--node <node-binary>]
+//   --out   staged payload directory (default: <repo>/dist) — the suite
+//           packaging process assembles the plugin root from this layout.
+//           Never a live libexec root.
+//   --node  pinned node binary to postject into (default: process.execPath).
+//
+// Steps:
+//   1. esbuild flattens src/sea-entry.mjs (ESM) to one CJS main — SEA requires
+//      a CJS entry. esbuild is a build step only; the distribution is the
+//      postjected binary, never a shebang bundle (DESIGN §7).
+//   2. Walk node_modules/{playwright,playwright-core} (the whole NFR-4 client
+//      closure) into a per-file manifest (name/size/sha256) + flat SEA asset
+//      map. pngjs/pixelmatch are pure JS and inline into the bundle.
+//   3. node --experimental-sea-config -> sea-prep.blob.
+//   4. Copy the pinned node binary and inject the blob with postject
+//      --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2.
+//   5. Write dist/manifest.json (version, node version, sha256) and verify the
+//      result is a genuine ELF executable, not a shebang bundle.
+//
+// The pinned node binary is copied into the output tree; the copy is
+// cached in <out>/.build/node-pristine so repeat builds
+// never re-read the 123 MiB source. This repo never writes into a live
+// libexec root.
+
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import {
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+  mkdirSync,
+  copyFileSync,
+  existsSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, '..');
+
+function arg(name, fallback) {
+  const i = process.argv.indexOf(name);
+  if (i >= 0 && process.argv[i + 1]) return resolve(process.argv[i + 1]);
+  return fallback;
+}
+const outDir = arg('--out', join(repoRoot, 'dist'));
+const nodeBin = arg('--node', process.execPath);
+const buildDir = join(outDir, '.build');
+
+const pkgJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
+const playwrightPkg = JSON.parse(
+  readFileSync(join(repoRoot, 'node_modules', 'playwright', 'package.json'), 'utf8'),
+);
+
+const PACKAGE_TREES = ['playwright', 'playwright-core'];
+
+console.log(`[1/6] bundling src/sea-entry.mjs -> single CJS main`);
+rmSync(outDir, { recursive: true, force: true });
+mkdirSync(buildDir, { recursive: true });
+await build({
+  entryPoints: [join(repoRoot, 'src', 'sea-entry.mjs')],
+  outfile: join(buildDir, 'sea-main.cjs'),
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node24',
+  minify: false,
+  // The only import.meta uses are dev-only or guarded: cli.mjs's isMain
+  // guard is wrapped in try/catch (bundled: import_meta is empty, isMain is
+  // false, so the SEA entry's own main() is the only runner), and
+  // playwright-loader.mjs prefers __filename in CJS, falling back to
+  // import.meta only in ESM dev. Verified benign — the warning
+  // is noise, so silence it here rather than emit it on every build.
+  logOverride: { 'empty-import-meta': 'silent' },
+});
+
+console.log(`[2/6] embedding ${PACKAGE_TREES.join(' + ')} package trees as SEA assets`);
+const files = [];
+const walk = (dir, relBase) => {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const abs = join(dir, entry.name);
+    const rel = join(relBase, entry.name);
+    if (entry.isDirectory()) walk(abs, rel);
+    else files.push(rel);
+  }
+};
+for (const pkg of PACKAGE_TREES) {
+  walk(join(repoRoot, 'node_modules', pkg), join('node_modules', pkg));
+}
+const assetManifest = files.map((rel, i) => {
+  const buf = readFileSync(join(repoRoot, rel));
+  return {
+    name: 'sea' + i,
+    rel,
+    size: buf.length,
+    sha256: createHash('sha256').update(buf).digest('hex'),
+  };
+});
+const assetManifestDoc = {
+  version: playwrightPkg.version,
+  files: assetManifest,
+  sha256: createHash('sha256')
+    .update(JSON.stringify(assetManifest))
+    .digest('hex'),
+};
+const assetManifestPath = join(buildDir, 'sea-assets.json');
+writeFileSync(assetManifestPath, JSON.stringify(assetManifestDoc));
+
+console.log(`[3/6] writing sea-config.json (main + assets)`);
+const assets = { manifest: assetManifestPath };
+for (const f of assetManifest) assets[f.name] = join(repoRoot, f.rel);
+const seaConfigPath = join(buildDir, 'sea-config.json');
+writeFileSync(
+  seaConfigPath,
+  JSON.stringify(
+    {
+      main: join(buildDir, 'sea-main.cjs'),
+      output: join(buildDir, 'sea-prep.blob'),
+      disableExperimentalSEAWarning: true,
+      useCodeCache: true,
+      assets,
+    },
+    null,
+    2,
+  ),
+);
+
+console.log(`[4/6] generating sea-prep.blob`);
+execFileSync(process.execPath, ['--experimental-sea-config', seaConfigPath], {
+  stdio: 'inherit',
+});
+
+console.log(`[5/6] postjecting blob into a copy of the pinned node binary`);
+const binPath = join(outDir, 'noise-visual-diff');
+const pristinePath = join(buildDir, 'node-pristine');
+const pristineMarker = join(buildDir, 'node-pristine.sha256');
+const nodeHash = createHash('sha256').update(readFileSync(nodeBin)).digest('hex');
+const pristineReady =
+  existsSync(pristinePath) &&
+  existsSync(pristineMarker) &&
+  readFileSync(pristineMarker, 'utf8') === nodeHash;
+if (!pristineReady) {
+  console.log(`  copying pinned node binary (${nodeHash.slice(0, 12)}...)`);
+  copyFileSync(nodeBin, pristinePath);
+  writeFileSync(pristineMarker, nodeHash);
+}
+copyFileSync(pristinePath, binPath);
+execFileSync(
+  process.execPath,
+  [
+    join(repoRoot, 'node_modules', 'postject', 'dist', 'cli.js'),
+    binPath,
+    'NODE_SEA_BLOB',
+    join(buildDir, 'sea-prep.blob'),
+    '--sentinel-fuse',
+    'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
+  ],
+  { stdio: 'inherit' },
+);
+
+console.log(`[6/6] writing dist/manifest.json`);
+const binBuf = readFileSync(binPath);
+const nodeVersion = execFileSync(pristinePath, ['--version'], {
+  encoding: 'utf8',
+}).trim();
+const distManifest = {
+  name: pkgJson.name,
+  version: pkgJson.version,
+  entry: 'noise-visual-diff',
+  nodeVersion,
+  clientVersion: playwrightPkg.version,
+  size: binBuf.length,
+  sha256: createHash('sha256').update(binBuf).digest('hex'),
+};
+writeFileSync(join(outDir, 'manifest.json'), JSON.stringify(distManifest, null, 2));
+
+// The payload is a genuine single-file ELF executable, not a shebang bundle
+// (DESIGN §7) — guard the first bytes.
+const magic = binBuf.subarray(0, 4).toString('latin1');
+if (magic !== '\x7fELF') {
+  throw new Error(
+    `built binary is not an ELF executable (magic ${JSON.stringify(magic)}); ` +
+      `a shebang/JS bundle is rejected (DESIGN §7)`,
+  );
+}
+const meta = `${pkgJson.name} ${pkgJson.version} (node ${nodeVersion}, ` +
+  `playwright ${playwrightPkg.version}), ${binBuf.length} bytes, ` +
+  `${assetManifest.length} embedded assets`;
+
+rmSync(buildDir, { recursive: true, force: true });
+console.log(`built ${binPath} — ${meta}`);

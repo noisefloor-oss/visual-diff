@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hello implementation</title>
+  <style>
+    body { margin: 0; }
+    .screen {
+      width: 1502px; height: 818px;
+      display: flex; align-items: center; justify-content: center;
+      background: #f5f3ff; font-family: system-ui, sans-serif;
+    }
+    .card {
+      width: 360px; padding: 32px; border-radius: 12px; background: #ffffff;
+      box-shadow: 0 4px 12px rgba(76, 29, 149, 0.15); text-align: center;
+    }
+    .card h1 { margin: 0 0 8px; font-size: 24px; color: #1e1b4b; }
+    .card p { margin: 0 0 24px; font-size: 14px; color: #6d28d9; }
+    /* Deliberately wrong: the design says #7c3aed. Fix it to converge. */
+    .card a {
+      display: inline-block; padding: 10px 24px; border-radius: 6px;
+      background: #a78bfa; color: #ffffff; font-size: 14px;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="screen">
+    <div class="card">
+      <h1>Hello, pixels</h1>
+      <p>The reference render of this card is the ground truth.</p>
+      <a>Get started</a>
+    </div>
+  </div>
+</body>
+</html>

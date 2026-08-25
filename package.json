@@ -1,0 +1,27 @@
+{
+  "name": "noise-visual-diff",
+  "version": "0.8.0",
+  "description": "Design-fidelity hill-climbing tool for the noise CLI suite",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "noise-visual-diff": "src/cli.mjs"
+  },
+  "engines": {
+    "node": ">=24.18.1"
+  },
+  "scripts": {
+    "test": "node --test",
+    "build:sea": "node scripts/build-sea.mjs"
+  },
+  "dependencies": {
+    "pixelmatch": "7.2.0",
+    "playwright": "1.62.1",
+    "pngjs": "7.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.6",
+    "postject": "1.0.0-alpha.6"
+  }
+}

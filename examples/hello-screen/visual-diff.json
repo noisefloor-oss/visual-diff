@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "states": {
+    "hello": {
+      "route": { "staticDir": "implementation" },
+      "comp": "hello#01-hello",
+      "viewport": { "width": 1502, "height": 818, "fullPage": true },
+      "readiness": { "policy": "networkidle", "timeout": 10000, "settle": 250 },
+      "threshold": 0.1
+    }
+  }
+}
