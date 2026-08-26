@@ -59,6 +59,7 @@ import { renderPage, isTimeoutError } from './render.mjs';
 import { createRecord, sha256Hex, vendorHashesFor, writeRecord } from './provenance.mjs';
 import { initRunDir, newRunId } from './run.mjs';
 import { probeMaskElements, probeToRegion } from './masks.mjs';
+import { accommodationDivergence, frameShortfall, pngDimensions } from './png.mjs';
 
 export const EXIT = Object.freeze({
   OK: 0,
@@ -623,6 +624,28 @@ async function renderCapture({
     const { pathFired, selectorFired } = await waitReady(page, state.readiness, {
       gotoTimedOut: Boolean(result.navigation && result.navigation.timedOut),
     });
+    // FR-9: an aborted external FONT is fatal, exactly like an unvendored
+    // stylesheet at import time. A font requests lazily — only after its
+    // (possibly vendored) stylesheet parses: during fonts.ready, during the
+    // async layout/mask/style work below, or inside page.screenshot itself
+    // (Playwright's screenshot preparation waits on document.fonts.ready) —
+    // so it is checked after readiness AND re-checked after the shot
+    // resolves, never only at navigation. A capture shot with fallback
+    // glyphs (tofu) against a real-face reference reads as a visual
+    // regression; against an equally-degraded reference it is a silent false
+    // pass. Both are wrong ground truths — fail closed and name the URL.
+    const throwOnAbortedFonts = () => {
+      const abortedFonts = result.aborted.filter((r) => r.resourceType === 'font');
+      if (abortedFonts.length > 0) {
+        throw new CaptureError(
+          `state ${stateName}: aborted external font request(s) — the capture would record fallback glyphs, ` +
+            `not the design's ground truth: ${abortedFonts.map((r) => r.url).join(', ')} — ` +
+            're-run import so discovery vendors the font, or drop the external @font-face',
+          { code: 'render-defect' },
+        );
+      }
+    };
+    throwOnAbortedFonts();
     const fonts = await collectFonts(page);
     // animations:'disabled' is the authoritative FR-14 freeze: Playwright
     // cancels infinite animations to their initial state (and fast-forwards
@@ -658,6 +681,72 @@ async function renderCapture({
       const scroll = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
       clipRect = { x: box.x + scroll.x, y: box.y + scroll.y, width: box.width, height: box.height };
     }
+    // FR-38 canvas accommodation (mirrors the reference render): a page that
+    // scrolls in an inner container (html,body at height:100% + overflow:auto
+    // — the standard app shell) has a document canvas exactly the viewport,
+    // so a clip element taller than the viewport would be clamped by
+    // Chromium's clip behavior. Grow the viewport to contain the clip rect —
+    // a height:100% shell's inner container grows with it — then re-probe the
+    // element's box: identity of the re-probed rect guards the clip GEOMETRY
+    // (a page whose clip box shifts under a taller viewport is refused
+    // loudly). Rect identity does NOT prove the internal pixels are
+    // viewport-independent — that is what the GATED inputs.effectiveViewport
+    // exists for (FR-23).
+    let canvasGrown;
+    if (clipRect !== undefined) {
+      const canvas = await page.evaluate(() => ({
+        width: Math.max(document.documentElement.scrollWidth, window.innerWidth),
+        height: Math.max(document.documentElement.scrollHeight, window.innerHeight),
+      }));
+      // Per-axis: only an axis the clip actually overflows is grown; the
+      // other keeps its declared size (a width-only overflow must not raise
+      // the viewport height and fire height media queries the declared
+      // conditions never would).
+      const overflowX = clipRect.x + clipRect.width > canvas.width;
+      const overflowY = clipRect.y + clipRect.height > canvas.height;
+      if (overflowX || overflowY) {
+        const grown = {
+          width: overflowX
+            ? Math.max(state.viewport.width, Math.ceil(clipRect.x + clipRect.width))
+            : state.viewport.width,
+          height: overflowY
+            ? Math.max(state.viewport.height, Math.ceil(clipRect.y + clipRect.height))
+            : state.viewport.height,
+        };
+        await page.setViewportSize(grown);
+        await page.waitForTimeout(Math.max(state.readiness.settle ?? 0, 100));
+        const refound = await page.$$(state.clip);
+        const rebox = refound.length === 1 ? await refound[0].boundingBox() : null;
+        const fmt = (r) => `{x:${r.x},y:${r.y},w:${r.width},h:${r.height}}`;
+        const unstable = (measured) => new CaptureError(
+          `state ${JSON.stringify(stateName)}: clip ${JSON.stringify(state.clip)} framed ${fmt(clipRect)} ` +
+            `at the declared viewport but ${measured} after the viewport was grown to ` +
+            `${grown.width}x${grown.height} to fit it — the page reflows responsively under a taller ` +
+            'viewport, so the tool cannot safely extend the canvas without changing the pixels being ' +
+            'captured. Fix the page to a static frame, or let the document itself scroll.',
+          { code: 'frame-unstable' },
+        );
+        if (rebox === null) {
+          throw unstable(refound.length === 1 ? 'lost its layout box' : `matched ${refound.length} elements`);
+        }
+        const rescroll = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+        const rerect = {
+          x: rebox.x + rescroll.x,
+          y: rebox.y + rescroll.y,
+          width: rebox.width,
+          height: rebox.height,
+        };
+        const round = (r) => ({
+          x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height),
+        });
+        const a = round(clipRect);
+        const b = round(rerect);
+        if (a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height) {
+          throw unstable(`measured ${fmt(rerect)}`);
+        }
+        canvasGrown = grown;
+      }
+    }
     const resolvedMasks = await resolveAnchoredMasks(page, masks ?? {}, clipRect, stateName, { fullPage: state.viewport.fullPage });
     if (fixtureCss !== '') {
       // re-assert post-bootstrap, same task as the freeze (see above)
@@ -666,7 +755,45 @@ async function renderCapture({
     const buffer = clipRect === undefined
       ? await page.screenshot({ fullPage: state.viewport.fullPage, animations: 'disabled' })
       : await page.screenshot({ fullPage: true, clip: clipRect, animations: 'disabled' });
-    return { buffer, fonts, pathFired, selectorFired, masks: resolvedMasks, isolation: result };
+    // re-check after the shot resolves — see throwOnAbortedFonts above
+    throwOnAbortedFonts();
+    if (clipRect !== undefined) {
+      // Delivered-frame gate (mirrors the reference render): Chromium clamps
+      // a clip to the document scroll box and returns a short PNG without
+      // error, and the FR-17 self-check cannot catch it — both passes clamp
+      // identically. A truncated capture silently exempts the clipped-away
+      // region from every comparison; fail loud instead.
+      const shortfall = frameShortfall(buffer, clipRect, DEVICE_SCALE_FACTOR);
+      if (shortfall !== null) {
+        const got = shortfall.delivered === null
+          ? 'an undecodable buffer'
+          : `${shortfall.delivered.width}x${shortfall.delivered.height} device px`;
+        throw new CaptureError(
+          `state ${JSON.stringify(stateName)}: the clipped capture delivered ${got} but the clip ` +
+            `rect requires ${shortfall.expected.width}x${shortfall.expected.height} — the screenshot ` +
+            'clip was clamped to the document scroll box. This usually means the page scrolls in an ' +
+            'inner container (html,body at height:100% with an overflow:auto region), so the clipped ' +
+            'element extends past the document canvas and its bottom would silently never be compared. ' +
+            'Let the document itself scroll, or size the scroll container to its content — the ' +
+            'automatic canvas grow could not accommodate it.',
+          { code: 'frame-truncated' },
+        );
+      }
+    }
+    // effectiveViewport: the size the render ACTUALLY shot under — the
+    // state's declared viewport, or the grown size (FR-38). Gated by FR-23.
+    return {
+      buffer,
+      fonts,
+      pathFired,
+      selectorFired,
+      masks: resolvedMasks,
+      isolation: result,
+      clipFrame: clipRect,
+      delivered: pngDimensions(buffer),
+      canvasGrown,
+      effectiveViewport: canvasGrown ?? { width: state.viewport.width, height: state.viewport.height },
+    };
   } finally {
     await context.close().catch(() => {});
   }
@@ -700,6 +827,49 @@ export async function captureState({
 }) {
   const first = await renderCapture({ browser, url, state, stateName, masks, projectDir, vendorDir, log, captureFlags });
   const verify = await renderCapture({ browser, url, state, stateName, masks, projectDir, vendorDir, log, captureFlags });
+
+  // FR-38 x FR-17: the primary and verification captures must make the
+  // IDENTICAL structural canvas-accommodation decision. A canvas race (one
+  // pass grew the viewport, the other did not) can deliver byte-identical
+  // buffers — or a pixel difference a declared selfCheck.maxDiffPixels budget
+  // would absorb — while the two renders ran under different effective
+  // conditions. The check is structural and runs BEFORE the byte compare and
+  // outside any pixel budget: divergence is a determinism failure (exit 4),
+  // never within selfCheck. With NO grow on either pass there is no
+  // accommodation decision to diverge — plain frame/pixel nondeterminism
+  // stays the byte/selfCheck path below (a dimension change there still
+  // fails: measureSelfCheckDifference reports dimsMatch false).
+  const roundRect = (r) => ({
+    x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height),
+  });
+  const structural = (first.canvasGrown === undefined && verify.canvasGrown === undefined)
+    ? null
+    : accommodationDivergence(
+      {
+        canvasGrown: first.canvasGrown,
+        effectiveViewport: first.effectiveViewport,
+        frame: first.clipFrame === undefined ? undefined : roundRect(first.clipFrame),
+      },
+      {
+        canvasGrown: verify.canvasGrown,
+        effectiveViewport: verify.effectiveViewport,
+        frame: verify.clipFrame === undefined ? undefined : roundRect(verify.clipFrame),
+      },
+    );
+  if (structural !== null) {
+    return {
+      stateName,
+      url,
+      ok: false,
+      verified: false,
+      reason: 'determinism',
+      differingBytes: byteDifference(first.buffer, verify.buffer),
+      localization:
+        `canvas accommodation diverged between the primary and verification captures: ${structural} — ` +
+        'a structural determinism failure no selfCheck pixel budget may absorb',
+      pathFired: first.pathFired,
+    };
+  }
 
   let selfCheck;
   if (!sameBytes(first.buffer, verify.buffer)) {
@@ -740,6 +910,10 @@ export async function captureState({
     artifactBytes: first.buffer,
     renderer,
     inputs: {
+      // The DECLARED viewport, even when the render grew the canvas
+      // (inputs.canvasGrown): the declared conditions are what the config
+      // asked for; the conditions the render ACTUALLY shot under are the
+      // GATED inputs.effectiveViewport below (FR-38/FR-23).
       viewport: state.viewport,
       deviceScaleFactor: DEVICE_SCALE_FACTOR,
       readiness: { ...state.readiness, pathFired: first.pathFired, selectorFired: first.selectorFired },
@@ -756,6 +930,18 @@ export async function captureState({
       // When --serve rooted the run, the dist tree's content hash
       // pins WHAT was served (informational — the FR-23 gate never reads it).
       ...(serve !== undefined ? { serve } : {}),
+      // Delivered-frame evidence (informational — the FR-23 gate never reads
+      // it): the clip rect actually framed and the pixel dimensions the
+      // renderer delivered, so a truncation dispute is decidable from the
+      // record instead of from re-measurement.
+      ...(first.clipFrame !== undefined ? { clipFrame: first.clipFrame } : {}),
+      ...(first.delivered !== null ? { delivered: first.delivered } : {}),
+      // FR-38 canvas accommodation evidence (informational): the viewport
+      // the render grew to so the document canvas contains the clip rect.
+      ...(first.canvasGrown !== undefined ? { canvasGrown: first.canvasGrown } : {}),
+      // GATED (FR-38/FR-23): the effective viewport the render shot under —
+      // the state's declared viewport, or the grown size.
+      effectiveViewport: first.effectiveViewport,
     },
   });
   await writeRecord(layout.captureProvenance(runId, stateName), record);

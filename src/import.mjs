@@ -54,7 +54,15 @@
 //         "relPath": "App.dc.html",
 //         "contentSha256": "<hex>",        // comp file bytes (FR-12 change signal)
 //         "screens": [
-//           { "label": "01 Main", "id": "01-main", "noiseFloor": 0.0012 }
+//           { "label": "01 Main", "id": "01-main", "noiseFloor": 0.0012 },
+//           // FR-37 driven reference (one per compDrive state mapping a screen):
+//           { "label": "01 Main (@menu)", "id": "01-main@menu", "driven": true, "noiseFloor": 0 },
+//           // a runtime-conditional screen that renders empty undriven and is
+//           // mapped only by compDrive state(s) — no base reference exists;
+//           // noiseFloor is the first driven pair's measured floor:
+//           { "label": "02 Menu", "id": "02-menu", "drivenOnly": true, "noiseFloor": 0 },
+//           // a runtime-conditional screen no state maps — skipped, no artifacts:
+//           { "label": "03 Help", "id": "03-help", "skipped": "empty-undriven" }
 //         ]
 //       }
 //     }
@@ -86,6 +94,8 @@ import {
 import { createServer } from 'node:http';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { PNG } from 'pngjs';
+
+import { accommodationDivergence, frameShortfall, pngDimensions } from './png.mjs';
 
 import { init, guardProjectPath, layoutFor, PathEscapeError } from './artifact-layout.mjs';
 import { ConfigError, effectiveMasks, loadConfig, parseCompRef, stateConfigHash } from './config.mjs';
@@ -301,6 +311,25 @@ export function extNameForUrl(url) {
   return m ? `.${m[1].toLowerCase()}` : '';
 }
 
+// Content type recorded into the vendor manifest for an external whose URL
+// alone cannot name its kind (no path extension — e.g.
+// https://fonts.googleapis.com/css2?family=Inter). The browser's resourceType
+// classification from the discovery abort log is the trusted signal; without
+// the recorded type, fulfillment would fall back to application/octet-stream
+// and Chromium can ignore a stylesheet served that way ENTIRELY — silently,
+// with no font abort left to fail on. A URL with an extension records
+// nothing: fulfillment's extension inference already names it.
+const KIND_CONTENT_TYPES = {
+  stylesheet: 'text/css',
+  script: 'text/javascript',
+  font: 'font/woff2',
+};
+
+export function contentTypeForExternal(url, kind) {
+  if (extNameForUrl(url) !== '') return undefined;
+  return KIND_CONTENT_TYPES[kind];
+}
+
 /**
  * Union of the FR-8 external set: every non-loopback request the isolation
  * machinery aborted, plus every external script/link the page DOM declares
@@ -311,7 +340,12 @@ export function mergeExternalSet(aborted, declared) {
   const map = new Map();
   for (const rec of aborted) {
     if (rec && rec.reason === 'external' && rec.url) {
-      map.set(rec.url, { url: rec.url, integrity: undefined });
+      // The abort log's resourceType is the browser's own classification of
+      // what the resource IS — the only trustworthy kind signal for a URL
+      // with no telling extension (an extensionless stylesheet, a font
+      // behind a query string). It rides the external through vendoring.
+      const prev = map.get(rec.url);
+      map.set(rec.url, { url: rec.url, integrity: prev?.integrity, kind: rec.resourceType ?? prev?.kind });
     }
   }
   for (const d of declared) {
@@ -393,6 +427,18 @@ function measureScreenFrame(page, screenId) {
     return { missing: false, figRect, capRect, docHeight: document.documentElement.scrollHeight };
   }, screenId);
 }
+
+// The document canvas a fullPage screenshot can cover (CSS px): Chromium
+// clamps a screenshot clip to the document scroll box, so a frame extending
+// past this canvas would be silently truncated (FR-38).
+function measureDocumentCanvas(page) {
+  return page.evaluate(() => ({
+    width: Math.max(document.documentElement.scrollWidth, window.innerWidth),
+    height: Math.max(document.documentElement.scrollHeight, window.innerHeight),
+  }));
+}
+
+const fmtRect = (r) => `{x:${r.x},y:${r.y},w:${r.width},h:${r.height}}`;
 
 // External scripts/links the page DOM declares, with their SRI (FR-8). Only
 // non-loopback http(s) resources count — loopback and data:/blob: never touch
@@ -477,7 +523,11 @@ async function renderCompDiscovery({ browser, url, vendorDir, readiness, log }) 
     }
     await waitForCompReady(page, readiness);
     const declared = await collectDeclaredExternals(page);
-    return { url, aborted: result.aborted, declared };
+    // result.fulfilled rides along: for an ALREADY-vendored external the
+    // request is fulfilled, never aborted, so the fulfillment log is the only
+    // place the browser's resourceType classification of it is observable —
+    // the signal that upgrades a legacy (pre-contentType) manifest entry.
+    return { url, aborted: result.aborted, fulfilled: result.fulfilled, declared };
   } finally {
     await safeCloseContext(context);
   }
@@ -496,6 +546,7 @@ async function renderCompScreen({
   readiness,
   drive,
   compMasks,
+  allowEmpty = false,
   log,
 }) {
   const { page, context, result } = await renderPage({
@@ -560,13 +611,124 @@ async function renderCompScreen({
     }
     const frame = screenFrameRect(measured.figRect, measured.capRect);
     if (frame.width < 1 || frame.height < 1) {
-      throw usageError('empty-frame', `screen ${JSON.stringify(screenId)} in ${url} has an empty frame (caption only?)`);
+      // The orchestration decides what an empty UNDRIVEN frame means (skip,
+      // driven-only, or a hard error naming the mapping states) — it passes
+      // allowEmpty and gets the measurement back instead of a throw. A
+      // driven render (or a second pass of a non-empty first pass) reaching
+      // this point is always a hard error.
+      if (allowEmpty) return { empty: true, frame };
+      throw usageError(
+        'empty-frame',
+        `screen ${JSON.stringify(screenId)} in ${url} has an empty frame (caption only?) — ` +
+          'a screen that only renders under runtime state (e.g. an sc-if conditional) can be ' +
+          'referenced driven-only by mapping it with a compDrive state (FR-37)',
+      );
+    }
+    // FR-38 canvas accommodation: with an inner-scroll comp (html,body at
+    // height:100% + an overflow:auto region — the standard app shell) the
+    // document canvas is exactly the viewport, so a screen frame taller than
+    // the viewport would be clamped by Chromium's clip behavior. Grow the
+    // viewport to contain the frame — a height:100% shell's inner container
+    // grows with the viewport, bringing the whole frame inside the document
+    // canvas — then RE-MEASURE the frame: identity of the re-measured rect
+    // guards the frame GEOMETRY (a comp whose frame shifts under a taller
+    // viewport is refused loudly rather than referenced). Rect identity does
+    // NOT prove the internal pixels are viewport-independent — that is what
+    // the GATED inputs.effectiveViewport exists for: a grown reference only
+    // ever compares against a capture rendered under the identical effective
+    // viewport (FR-23).
+    let canvasGrown;
+    {
+      const canvas = await measureDocumentCanvas(page);
+      // Per-axis: only an axis the frame actually overflows is grown; the
+      // other keeps its declared size (a width-only overflow in a tall
+      // document must not raise the viewport height — that could fire height
+      // media queries the declared conditions never would).
+      const overflowX = frame.x + frame.width > canvas.width;
+      const overflowY = frame.y + frame.height > canvas.height;
+      if (overflowX || overflowY) {
+        const grown = {
+          width: overflowX
+            ? Math.max(DEFAULT_VIEWPORT.width, Math.ceil(frame.x + frame.width))
+            : DEFAULT_VIEWPORT.width,
+          height: overflowY
+            ? Math.max(DEFAULT_VIEWPORT.height, Math.ceil(frame.y + frame.height))
+            : DEFAULT_VIEWPORT.height,
+        };
+        await page.setViewportSize(grown);
+        await page.waitForTimeout(Math.max(readiness.settle ?? 0, 100));
+        const remeasured = await measureScreenFrame(page, screenId);
+        if (remeasured.missing) {
+          throw trustError(
+            'frame-unstable',
+            `screen ${JSON.stringify(screenId)} in ${url} disappeared after the viewport was grown to ` +
+              `${grown.width}x${grown.height} to fit its frame — the comp's layout depends on viewport size, ` +
+              'so the tool cannot safely extend the canvas',
+          );
+        }
+        const regrown = screenFrameRect(remeasured.figRect, remeasured.capRect);
+        if (regrown.x !== frame.x || regrown.y !== frame.y
+          || regrown.width !== frame.width || regrown.height !== frame.height) {
+          throw trustError(
+            'frame-unstable',
+            `screen ${JSON.stringify(screenId)} in ${url} measured ${fmtRect(frame)} at the declared viewport ` +
+              `but ${fmtRect(regrown)} after the viewport was grown to ${grown.width}x${grown.height} to fit it — ` +
+              'the comp reflows responsively under a taller viewport, so the tool cannot safely extend the ' +
+              'canvas without changing the pixels being referenced. Fix the comp to a static frame, or let ' +
+              'the document itself scroll, and re-import.',
+          );
+        }
+        canvasGrown = grown;
+      }
     }
     // animations:'disabled' — the same screenshot-time freeze capture uses
     // (FR-14): the comp's own infinite animations (a measured comp declares
     // `animation:wsspin .8s linear infinite`) would otherwise land in the
     // reference mid-flight AND inflate the double-render noise floor.
+    // Late aborts are the same FR-9 provenance defect as the check above: a
+    // CSS sub-resource — an @font-face woff2 of a vendored stylesheet — only
+    // requests after the stylesheet parses (during fonts.ready, a drive
+    // step, or even inside page.screenshot itself: Playwright's screenshot
+    // preparation waits on document.fonts.ready, so a font can be requested
+    // and aborted AFTER any pre-shot check). A reference recorded with
+    // fallback glyphs is a WRONG ground truth, not a degraded one. Check
+    // immediately before the shutter AND re-check after it resolves, before
+    // the PNG is used for anything — nothing aborted between navigation and
+    // artifact is ever silent.
+    const throwOnLateAborts = () => {
+      if (result.aborted.length > 0) {
+        throw trustError(
+          'render-defect',
+          `reference render of ${url} aborted requests after load — unvendored external or isolation failure: ` +
+            `${formatDefects(result.aborted)}; re-run import so discovery can vendor it`,
+        );
+      }
+    };
+    throwOnLateAborts();
     const png = await page.screenshot({ fullPage: true, clip: frame, animations: 'disabled' });
+    throwOnLateAborts();
+    // Delivered-frame gate: Chromium clamps a clip to the document scroll box
+    // and returns a short PNG without error, so a comp that scrolls in an
+    // inner container (html,body{height:100%} + an overflow:auto main) would
+    // otherwise get a reference missing its bottom — and the double render
+    // clamps identically, so the noise floor cannot see it either. A clamped
+    // reference is a false ground truth; fail loud instead.
+    const shortfall = frameShortfall(png, frame, DEVICE_SCALE_FACTOR);
+    if (shortfall !== null) {
+      const got = shortfall.delivered === null
+        ? 'an undecodable buffer'
+        : `${shortfall.delivered.width}x${shortfall.delivered.height} device px`;
+      throw trustError(
+        'frame-truncated',
+        `screen ${JSON.stringify(screenId)} in ${url}: the render delivered ${got} ` +
+          `but the screen frame requires ${shortfall.expected.width}x${shortfall.expected.height} — ` +
+          'the screenshot clip was clamped to the document scroll box. This usually means the comp ' +
+          'scrolls in an inner container (html,body at height:100% with an overflow:auto region), so ' +
+          'the screen extends past the document canvas and its bottom would silently never be compared ' +
+          '— and the automatic canvas grow could not accommodate it. ' +
+          'Let the document itself scroll, or size the scroll container to its content, and re-import.',
+      );
+    }
     const fonts = await fontsOf(page);
     // Comp-side mask anchors resolve against this render, with the
     // screen frame as origin — the same fail-loud contract as
@@ -642,7 +804,20 @@ async function renderCompScreen({
         });
       }
     }
-    return { png, fonts, pathFired, compSelectorFired, masks, compAuthoredMasks };
+    // effectiveViewport: the size the render ACTUALLY shot under — the
+    // declared FR-14 default, or the grown size (FR-38). Gated by FR-23.
+    return {
+      png,
+      fonts,
+      pathFired,
+      compSelectorFired,
+      masks,
+      compAuthoredMasks,
+      frame,
+      delivered: pngDimensions(png),
+      canvasGrown,
+      effectiveViewport: canvasGrown ?? { width: DEFAULT_VIEWPORT.width, height: DEFAULT_VIEWPORT.height },
+    };
   } finally {
     await safeCloseContext(context);
   }
@@ -656,7 +831,7 @@ async function renderCompScreen({
 // Instead of skipping blind, re-probe just the anchors and rewrite the
 // provenance records; the rendered pixels (and noise floor) are untouched.
 async function repairSkippedCompMasks({
-  comp, config, browser, url, vendorEntries, vendorDir, readiness, screenReadiness,
+  comp, oldEntry, config, browser, url, vendorEntries, vendorDir, readiness, screenReadiness,
   screenCompMasks, drivenStates, layout, log,
 }) {
   const staleEntries = (record, declared) =>
@@ -666,7 +841,15 @@ async function repairSkippedCompMasks({
     });
   for (const screen of comp.screens) {
     const key = `${comp.name}#${screen.id}`;
+    // A screen the prior import recorded without a base reference has no
+    // base record to repair: a skipped (empty-undriven) screen has no
+    // artifacts at all, and a driven-only screen's records are its @state
+    // records handled in the driven loop below.
+    const manifestScreen = oldEntry?.screens?.find((s) => s.id === screen.id);
+    if (manifestScreen?.skipped !== undefined) continue;
+    const drivenOnly = manifestScreen?.drivenOnly === true;
     const declared = screenCompMasks.get(key);
+    if (!drivenOnly) {
     const provPath = layout.referenceProvenance(comp.name, screen.id);
     const record = await readRecord(provPath);
     const stale = declared !== undefined ? staleEntries(record, declared) : [];
@@ -685,6 +868,7 @@ async function repairSkippedCompMasks({
       if (stale.length > 0) record.inputs.masks = probed.masks;
       record.inputs.compAuthoredMasks = probed.compAuthoredMasks;
       await writeRecord(provPath, record);
+    }
     }
     for (const { stateName, state } of drivenStates.get(key) ?? []) {
       const driveMasks = Object.fromEntries(
@@ -784,8 +968,10 @@ async function verifyVendoredSri({ url, entry, vendorDir, integrity }) {
  * Existing entries are reconciled against the current declarations: an entry
  * whose URL the DOM now declares SRI for is verified
  * against that declaration from the vendored bytes and fails closed on
- * mismatch; a still-undeclared entry keeps the current skip. Returns the map
- * of newly vendored URLs -> entries.
+ * mismatch; a still-undeclared entry keeps the current skip. An existing
+ * entry lacking a recorded contentType that discovery has now classified
+ * (extensionless URL + observed kind) is upgraded in place and the manifest
+ * rewritten. Returns the map of newly vendored or upgraded URLs -> entries.
  */
 export async function vendorExternals({ externals, vendorDir, existing, fetcher, log }) {
   const fetchImpl = typeof fetcher === 'function' ? fetcher : defaultFetcher;
@@ -797,12 +983,30 @@ export async function vendorExternals({ externals, vendorDir, existing, fetcher,
   // fetched and SRI-verified. No bytes touch disk until the complete set has
   // passed (a failure here leaves the vendor dir untouched).
   const pending = [];
+  let upgraded = false;
   for (const ext of externals) {
     const existingEntry = entries.get(ext.url);
     if (existingEntry) {
       if (ext.integrity) {
         await verifyVendoredSri({ url: ext.url, entry: existingEntry, vendorDir, integrity: ext.integrity });
         if (log) log(`import: verified existing vendored copy of ${ext.url} against declared SRI`);
+      }
+      // Legacy manifest upgrade: a version-1 entry written before
+      // contentType existed keeps no recorded type, so an extensionless
+      // stylesheet it names is fulfilled as application/octet-stream forever
+      // — Chromium can ignore it, its @font-face never fires, and re-running
+      // import preserves the silent fallback reference. When discovery has
+      // now observed the kind (from the fulfillment log), reconcile the
+      // recorded type onto the entry; the rewrite below persists it even
+      // when nothing new is pending. A type already recorded is never
+      // clobbered.
+      const observedType = contentTypeForExternal(ext.url, ext.kind);
+      if (observedType !== undefined && existingEntry.contentType === undefined) {
+        const upgradedEntry = { ...existingEntry, kind: ext.kind, contentType: observedType };
+        entries.set(ext.url, upgradedEntry);
+        newEntries[ext.url] = upgradedEntry;
+        upgraded = true;
+        if (log) log(`import: recorded content type ${observedType} for already-vendored ${ext.url} (legacy manifest upgrade)`);
       }
       continue;
     }
@@ -823,10 +1027,22 @@ export async function vendorExternals({ externals, vendorDir, existing, fetcher,
     }
     const sha = sha256Hex(fetched.body);
     const file = `sha256-${sha}${extNameForUrl(ext.url)}`;
-    pending.push({ url: ext.url, integrity: ext.integrity, body: fetched.body, sha, file });
+    pending.push({
+      url: ext.url,
+      integrity: ext.integrity,
+      body: fetched.body,
+      sha,
+      file,
+      kind: ext.kind,
+      contentType: contentTypeForExternal(ext.url, ext.kind),
+    });
   }
 
-  if (pending.length === 0) return newEntries;
+  // Nothing fetched and nothing upgraded — the manifest on disk is already
+  // exact. An upgrade alone still falls through: the reconciled contentType
+  // must be persisted (the staging machinery below is a no-op with an empty
+  // pending set; only the manifest is rewritten).
+  if (pending.length === 0 && !upgraded) return newEntries;
 
   // Pass 2 — stage everything, then publish: write every fetched byte under a
   // per-run staging directory (same filesystem, so the renames below are
@@ -850,7 +1066,13 @@ export async function vendorExternals({ externals, vendorDir, existing, fetcher,
     }
     for (const item of pending) {
       const dest = join(vendorDir, item.file);
-      const entry = { file: item.file, sha256: item.sha, integrity: item.integrity };
+      const entry = {
+        file: item.file,
+        sha256: item.sha,
+        integrity: item.integrity,
+        kind: item.kind,
+        ...(item.contentType !== undefined ? { contentType: item.contentType } : {}),
+      };
       let prior;
       try {
         prior = await stat(dest);
@@ -874,6 +1096,7 @@ export async function vendorExternals({ externals, vendorDir, existing, fetcher,
         file: entry.relFile ?? entry.file,
         sha256: entry.sha256,
         ...(entry.integrity ? { integrity: entry.integrity } : {}),
+        ...(entry.contentType ? { contentType: entry.contentType } : {}),
       };
     }
     const manifest = {
@@ -1185,6 +1408,13 @@ export async function importZip(options, deps = {}) {
   // (compDrive) states are excluded — they compare against their own
   // <screen>@<state> records, which carry their own state's hash below.
   const screenStates = new Map();
+  // The non-driven states naming a screen EXACTLY (<comp>#<screen>, never a
+  // whole-comp mapping). Only these make an empty-undriven screen a hard
+  // error below: an exact mapping demands that screen's undriven reference,
+  // while a whole-comp mapping resolves to the sole ordinary base screen at
+  // compare time (driven-only and skipped siblings excluded), so under it a
+  // runtime-conditional screen triages exactly as if unmapped.
+  const screenExactStates = new Map();
   if (config !== null) {
     for (const stateName of Object.keys(config.states)) {
       const state = config.states[stateName];
@@ -1229,6 +1459,10 @@ export async function importZip(options, deps = {}) {
           const list = drivenStates.get(key) ?? [];
           list.push({ stateName, state });
           drivenStates.set(key, list);
+        } else {
+          const exact = screenExactStates.get(key) ?? new Set();
+          exact.add(stateName);
+          screenExactStates.set(key, exact);
         }
       }
     }
@@ -1273,27 +1507,70 @@ export async function importZip(options, deps = {}) {
 
     const vendorDir = layout.vendorDir;
 
-    // --- FR-8 discovery pass ---
-    const discoveries = [];
-    for (const comp of comps) {
-      const url = served.origin + '/' + comp.path.split('/').map(encodeURIComponent).join('/');
-      log(`import: discovery render ${comp.name} (${url})`);
-      discoveries.push({ comp, url, ...(await renderCompDiscovery({ browser, url, vendorDir, readiness, log })) });
+    // --- FR-8 discovery + vendor passes ---
+    // A vendored stylesheet only reveals its CSS sub-resources (an
+    // @font-face woff2, a url() image) once it is FULFILLED from the vendor
+    // dir — while the stylesheet itself is still aborted, its sub-resources
+    // never fire a request, so a single discovery pass cannot see them (they
+    // are not DOM-declared either). Re-run discovery whenever a pass vendored
+    // a stylesheet, so fonts referenced by vendored CSS are observed as
+    // aborts, join the external set, and are fetched on the FIRST import —
+    // instead of surfacing only on a re-import with a different reference
+    // sha256 (two imports, two ground truths). Bounded: a pass that vendors
+    // no new stylesheet ends the loop, and each pass strictly grows the
+    // vendor manifest; anything still unvendored past the cap fails loudly
+    // at the reference render below (render-defect), never silently.
+    const runDiscoveryPass = async () => {
+      const passDiscoveries = [];
+      for (const comp of comps) {
+        const url = served.origin + '/' + comp.path.split('/').map(encodeURIComponent).join('/');
+        log(`import: discovery render ${comp.name} (${url})`);
+        passDiscoveries.push({ comp, url, ...(await renderCompDiscovery({ browser, url, vendorDir, readiness, log })) });
+      }
+      return passDiscoveries;
+    };
+    const MAX_DISCOVERY_PASSES = 3;
+    for (let pass = 1; ; pass++) {
+      const discoveries = await runDiscoveryPass();
+      // Fulfillments join the merge alongside aborts: an already-vendored
+      // external never aborts, so its browser-classified resourceType is only
+      // observable from the fulfillment log — and vendorExternals needs that
+      // kind to upgrade a legacy manifest entry written before contentType
+      // existed (otherwise an extensionless stylesheet from a 0.8.x manifest
+      // stays application/octet-stream forever, Chromium ignores it, and no
+      // font abort ever fires). Reusing reason 'external' is exact: only
+      // vendored externals are ever fulfilled by the isolation machinery.
+      const externals = mergeExternalSet(
+        [
+          ...discoveries.flatMap((d) => d.aborted),
+          ...discoveries.flatMap((d) => d.fulfilled).map((f) => ({
+            url: f.url,
+            reason: 'external',
+            resourceType: f.resourceType,
+          })),
+        ],
+        discoveries.flatMap((d) => d.declared),
+      );
+      const currentVendor = await loadVendorManifest(vendorDir, { log });
+      const newlyVendored = await vendorExternals({
+        externals,
+        vendorDir,
+        existing: currentVendor.entries,
+        fetcher,
+        log,
+      });
+      // A stylesheet is recognized by the browser's own resourceType
+      // classification from the abort log (carried through mergeExternalSet
+      // and vendorExternals), never by URL shape alone — an extensionless
+      // stylesheet URL (https://fonts.googleapis.com/css2?family=Inter) must
+      // still trigger the re-run. The extension check stays as a fallback
+      // for a DOM-declared stylesheet no abort ever classified.
+      const revealing = Object.entries(newlyVendored).filter(
+        ([u, e]) => e.kind === 'stylesheet' || e.contentType === 'text/css' || extNameForUrl(u) === '.css',
+      );
+      if (revealing.length === 0 || pass >= MAX_DISCOVERY_PASSES) break;
+      log(`import: newly vendored stylesheet(s) may reference sub-resources — re-running discovery (pass ${pass + 1})`);
     }
-
-    // --- FR-8 vendor pass ---
-    const externals = mergeExternalSet(
-      discoveries.flatMap((d) => d.aborted),
-      discoveries.flatMap((d) => d.declared),
-    );
-    const currentVendor = await loadVendorManifest(vendorDir, { log });
-    await vendorExternals({
-      externals,
-      vendorDir,
-      existing: currentVendor.entries,
-      fetcher,
-      log,
-    });
     const vendorEntries = (await loadVendorManifest(vendorDir, { log })).entries;
     const vendorHashes = await vendorHashesFor(vendorDir);
 
@@ -1325,7 +1602,7 @@ export async function importZip(options, deps = {}) {
         // compSelector mask provenance is compare-time config (never in the
         // hash) — re-probe anchors whose record is missing or stale.
         await repairSkippedCompMasks({
-          comp, config, browser,
+          comp, oldEntry: oldComps.get(comp.name), config, browser,
           url: served.origin + '/' + comp.path.split('/').map(encodeURIComponent).join('/'),
           vendorEntries, vendorDir, readiness, screenReadiness, screenCompMasks, drivenStates, layout, log,
         });
@@ -1344,17 +1621,86 @@ export async function importZip(options, deps = {}) {
         // FR-23: a config-mapped screen renders under the mapping state's
         // readiness so the reference record matches the capture's provenance
         // fields; unmapped screens keep the hydration default.
-        const mapped = screenReadiness.get(`${comp.name}#${screen.id}`);
+        const screenKey = `${comp.name}#${screen.id}`;
+        const mapped = screenReadiness.get(screenKey);
         const renderReadiness = mapped ?? readiness;
-        const compMasks = screenCompMasks.get(`${comp.name}#${screen.id}`);
+        const compMasks = screenCompMasks.get(screenKey);
+        const drivenForScreen = drivenStates.get(screenKey) ?? [];
         log(`import: render ${comp.name}#${screen.id} (pass 1/2)`);
         const first = await renderCompScreen({
-          browser, url, screenId: screen.id, vendor: vendorEntries, vendorDir, readiness: renderReadiness, compMasks, log,
+          browser, url, screenId: screen.id, vendor: vendorEntries, vendorDir, readiness: renderReadiness, compMasks,
+          allowEmpty: true, log,
         });
+        // Empty-undriven triage (FR-10/FR-11/FR-37): a real multi-screen SPA
+        // export is one app shell whose conditional screens (sc-if) render at
+        // zero size until driven, so an empty UNDRIVEN frame is triaged, not
+        // an unconditional hard error:
+        //   - named exactly (<comp>#<screen>) by a non-compDrive state →
+        //     hard error (that state demands this screen's undriven
+        //     reference, which cannot exist); a whole-comp mapping never
+        //     hardens the triage — compare resolves it to the sole ordinary
+        //     base screen, excluding driven-only/skipped siblings;
+        //   - mapped only by compDrive state(s) → driven-only: no base
+        //     reference; the driven render below is the reference and fails
+        //     loudly on its own if the drive cannot produce a visible frame;
+        //   - unmapped → skip with a logged warning and a manifest entry, so
+        //     a later config mapping gets a precise compare diagnostic.
+        let drivenOnlyEntry = null;
+        if (first.empty === true) {
+          const undrivenStates = screenExactStates.get(screenKey);
+          if (undrivenStates !== undefined && undrivenStates.size > 0) {
+            throw usageError(
+              'empty-frame',
+              `screen ${screenKey} renders empty undriven, but state(s) ` +
+                `${[...undrivenStates].map((n) => JSON.stringify(n)).join(', ')} map it without compDrive — ` +
+                'an undriven reference cannot exist for it. Give the mapping state a compDrive that makes ' +
+                'the screen visible (it becomes a driven-only reference, FR-37), or fix the comp so the ' +
+                'screen renders undriven',
+            );
+          }
+          if (drivenForScreen.length === 0) {
+            log(
+              `import: warning screen ${screenKey} renders empty undriven — likely a runtime-conditional ` +
+                'screen; map it with a compDrive state to reference it, or ignore this warning if it is ' +
+                'intentionally unused',
+            );
+            screens.push({ id: screen.id, label: screen.label, skipped: 'empty-undriven' });
+            continue;
+          }
+          log(`import: screen ${screenKey} renders empty undriven — rendering driven-only (no base reference)`);
+          // The entry's noise floor is filled from the FIRST driven state's
+          // measured pair below (config order); each @state entry still
+          // carries its own floor, and compare reads those.
+          drivenOnlyEntry = { label: screen.label, id: screen.id, drivenOnly: true, noiseFloor: null };
+          screens.push(drivenOnlyEntry);
+        } else {
         log(`import: render ${comp.name}#${screen.id} (pass 2/2)`);
         const second = await renderCompScreen({
           browser, url, screenId: screen.id, vendor: vendorEntries, vendorDir, readiness: renderReadiness, compMasks, log,
         });
+        // FR-38 x FR-11: when EITHER pass made an accommodation, both passes
+        // must have made the IDENTICAL structural decision (grow, effective
+        // viewport, re-measured frame). A canvas race (one pass grew, one did
+        // not) can deliver equal pixels — or jitter the noise floor would
+        // absorb — while the two renders ran under different effective
+        // conditions, so the check is structural, outside any pixel
+        // arithmetic. With NO grow on either pass there is no accommodation
+        // decision to diverge: a plain frame/dimension mismatch stays the
+        // FR-11 floor-1 path below.
+        const divergence = (first.canvasGrown === undefined && second.canvasGrown === undefined)
+          ? null
+          : accommodationDivergence(
+            { canvasGrown: first.canvasGrown, effectiveViewport: first.effectiveViewport, frame: first.frame },
+            { canvasGrown: second.canvasGrown, effectiveViewport: second.effectiveViewport, frame: second.frame },
+          );
+        if (divergence !== null) {
+          throw trustError(
+            'canvas-divergent',
+            `double render of ${comp.name}#${screen.id} disagreed on the canvas accommodation: ${divergence} — ` +
+              'the two passes must make an identical structural decision (this is a canvas race, not pixel ' +
+              'jitter, and no noise floor may absorb it); the reference cannot be trusted',
+          );
+        }
         const { floor, note } = measureNoiseFloor(first.png, second.png);
         if (note) log(`import: warning ${comp.name}#${screen.id}: ${note}`);
         screens.push({ label: screen.label, id: screen.id, noiseFloor: floor });
@@ -1391,7 +1737,10 @@ export async function importZip(options, deps = {}) {
             // The reference frame's provenance viewport stays the shared FR-14
             // default; a mapped state's viewport must equal it for the FR-23
             // gate, exactly as before — nothing about the viewport contract
-            // changes here.
+            // changes here. A canvas grow (inputs.canvasGrown) does NOT change
+            // this field — the declared conditions are what the author asked
+            // for; the conditions the render ACTUALLY shot under are the
+            // GATED inputs.effectiveViewport below (FR-38/FR-23).
             viewport: { ...DEFAULT_VIEWPORT, fullPage: true },
             deviceScaleFactor: DEVICE_SCALE_FACTOR,
             readiness: {
@@ -1423,10 +1772,24 @@ export async function importZip(options, deps = {}) {
             // annotated"; a record LACKING the field predates the feature and
             // is repaired on re-import.
             compAuthoredMasks: first.compAuthoredMasks,
+            // Delivered-frame evidence (informational — the FR-23 gate never
+            // reads it): the screen frame rect and the pixel dimensions the
+            // renderer delivered, so a truncation dispute is decidable from
+            // the record instead of from re-measurement.
+            frame: first.frame,
+            ...(first.delivered !== null ? { delivered: first.delivered } : {}),
+            // FR-38 canvas accommodation evidence (informational): the
+            // viewport the render grew to so the document canvas contains
+            // the frame.
+            ...(first.canvasGrown !== undefined ? { canvasGrown: first.canvasGrown } : {}),
+            // GATED (FR-38/FR-23): the effective viewport the render shot
+            // under — the declared default, or the grown size.
+            effectiveViewport: first.effectiveViewport,
           },
         });
         await writeRecord(provPath, record);
         log(`import: wrote ${relative(projectDir, pngPath)} (noise floor ${(floor * 100).toFixed(4)}%)`);
+        }
 
         // FR-37: one driven reference per compDrive state mapping this
         // screen — rendered after the base screen, double-rendered with its
@@ -1434,7 +1797,7 @@ export async function importZip(options, deps = {}) {
         // driven: true; artifacts via the state-suffixed layout path). The
         // existing per-screen pruning unlinks stale @state entries for free:
         // driven ids ride old.screens and SCREEN_RE admits the suffix.
-        for (const { stateName, state } of drivenStates.get(`${comp.name}#${screen.id}`) ?? []) {
+        for (const { stateName, state } of drivenForScreen) {
           const driveMasks = Object.fromEntries(
             Object.entries(effectiveMasks(config, state))
               .filter(([, m]) => m.selector !== undefined && m.compSelector !== undefined)
@@ -1448,9 +1811,27 @@ export async function importZip(options, deps = {}) {
           const dSecond = await renderCompScreen({
             browser, url, screenId: screen.id, vendor: vendorEntries, vendorDir, readiness: state.readiness, drive: state.compDrive, compMasks: driveMasks, log,
           });
+          // Same FR-38 x FR-11 structural agreement as the base pair.
+          const dDivergence = (dFirst.canvasGrown === undefined && dSecond.canvasGrown === undefined)
+            ? null
+            : accommodationDivergence(
+              { canvasGrown: dFirst.canvasGrown, effectiveViewport: dFirst.effectiveViewport, frame: dFirst.frame },
+              { canvasGrown: dSecond.canvasGrown, effectiveViewport: dSecond.effectiveViewport, frame: dSecond.frame },
+            );
+          if (dDivergence !== null) {
+            throw trustError(
+              'canvas-divergent',
+              `double render of ${comp.name}#${screen.id}@${stateName} disagreed on the canvas accommodation: ` +
+                `${dDivergence} — the two passes must make an identical structural decision (this is a canvas ` +
+                'race, not pixel jitter, and no noise floor may absorb it); the reference cannot be trusted',
+            );
+          }
           const dFloor = measureNoiseFloor(dFirst.png, dSecond.png);
           if (dFloor.note) log(`import: warning ${comp.name}#${screen.id}@${stateName}: ${dFloor.note}`);
           screens.push({ label: `${screen.label} (@${stateName})`, id: `${screen.id}@${stateName}`, driven: true, noiseFloor: dFloor.floor });
+          // A driven-only screen's base entry carries the driven noise floor
+          // (FR-11 amendment: there is no undriven pair to measure).
+          if (drivenOnlyEntry !== null && drivenOnlyEntry.noiseFloor === null) drivenOnlyEntry.noiseFloor = dFloor.floor;
 
           const dPngPath = layout.referencePng(comp.name, screen.id, stateName);
           const dProvPath = layout.referenceProvenance(comp.name, screen.id, stateName);
@@ -1484,11 +1865,31 @@ export async function importZip(options, deps = {}) {
               // this post-drive render, exactly like the base record's
               // (always recorded; empty ≡ none annotated).
               compAuthoredMasks: dFirst.compAuthoredMasks,
+              // Delivered-frame evidence (informational; see the base record).
+              frame: dFirst.frame,
+              ...(dFirst.delivered !== null ? { delivered: dFirst.delivered } : {}),
+              // FR-38 canvas accommodation (informational evidence; see the
+              // base record — the declared viewport above is likewise
+              // unchanged) plus the GATED effective viewport.
+              ...(dFirst.canvasGrown !== undefined ? { canvasGrown: dFirst.canvasGrown } : {}),
+              effectiveViewport: dFirst.effectiveViewport,
             },
           });
           await writeRecord(dProvPath, dRecord);
           log(`import: wrote ${relative(projectDir, dPngPath)} (noise floor ${(dFloor.floor * 100).toFixed(4)}%)`);
         }
+      }
+      // Every screen skipped means the comp produced no reference at all —
+      // a hard error naming the likely cause (driven-only screens still
+      // produce their driven references, so they count as rendered).
+      if (screens.length > 0 && screens.every((s) => s.skipped !== undefined)) {
+        throw usageError(
+          'all-screens-empty',
+          `every screen of comp ${comp.name} renders empty undriven — the export likely gates all its ` +
+            'screens behind runtime conditions (e.g. sc-if with a hint-placeholder default that renders ' +
+            'nothing), so no reference can exist. Map at least one screen with a compDrive state ' +
+            '(driven-only, FR-37) and re-run import',
+        );
       }
       nextComps.set(comp.name, {
         name: comp.name,
@@ -1497,11 +1898,15 @@ export async function importZip(options, deps = {}) {
         screens,
       });
       // Drop stale per-screen artifacts for a re-rendered comp (FR-12: the
-      // reference set exactly matches the current screens).
+      // reference set exactly matches the current screens). A manifest entry
+      // WITHOUT a base artifact (skipped, or driven-only whose reference is
+      // its @state artifact) does not keep an old base PNG alive — a screen
+      // that transitioned to skipped/driven-only has its stale base pruned.
       const old = oldComps ? oldComps.get(comp.name) : undefined;
       if (old) {
+        const keepsBase = (id) => screens.some((ns) => ns.id === id && ns.skipped === undefined && ns.drivenOnly !== true);
         for (const s of old.screens) {
-          if (screens.every((ns) => ns.id !== s.id)) {
+          if (!keepsBase(s.id)) {
             await unlink(layout.referencePng(comp.name, s.id)).catch(() => {});
             await unlink(layout.referenceProvenance(comp.name, s.id)).catch(() => {});
           }

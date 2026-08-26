@@ -346,7 +346,13 @@ export function enumerateScreens(html, { path: displayPath = '<comp>', allowEmpt
         // screen — that is the case the label would address ambiguously.
         const inDc = stack.some((frame) => frame.name === 'x-dc');
         const inScreen = stack.some((frame) => frame.screen === true);
-        const dynamicScreen = inDc && !inScreen && (parent?.name === 'x-dc' || tok.name === 'figure');
+        const dynamicScreen = inDc && !inScreen;
+        if (inScreen) {
+          throw new ScreenStructureError(
+            `${displayPath}: <${tok.name} data-screen-label> is nested inside another screen — ` +
+              'screens may not nest; each label must address exactly one screen',
+          );
+        }
         if (parent?.name === 'body' && tok.name !== 'figure') {
           throw new ScreenStructureError(
             `${displayPath}: data-screen-label on <${tok.name}> directly under <body> — ` +
@@ -358,8 +364,8 @@ export function enumerateScreens(html, { path: displayPath = '<comp>', allowEmpt
           throw new ScreenStructureError(
             `${displayPath}: screen element not a supported direct child — ` +
               `<${tok.name} data-screen-label> sits under ${where}; screens must be either ` +
-              'a <figure> directly under <body>, any element directly under <x-dc>, or a ' +
-              '<figure> nested under <x-dc>',
+              'a <figure> directly under <body>, or any element inside <x-dc> ' +
+              '(layout wrappers between <x-dc> and the screen are fine)',
           );
         }
         if (label.trim() === '') {

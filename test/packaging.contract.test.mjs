@@ -215,6 +215,8 @@ test('packaging: staged manifest records version, node version, and sha256', (t)
   assert.equal(manifest.name, pkg.name);
   assert.equal(manifest.version, pkg.version);
   assert.equal(manifest.entry, 'noise-visual-diff');
+  assert.equal(manifest.platform, process.platform, 'SEA binaries are platform-specific');
+  assert.equal(manifest.arch, process.arch, 'SEA binaries are arch-specific');
   assert.equal(manifest.nodeVersion, sea.node.version, 'SEA runtime node version');
   const bin = readFileSync(ENTRY);
   assert.equal(

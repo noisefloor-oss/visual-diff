@@ -625,6 +625,106 @@ describe('driven-state failure diagnostics (FR-37)', () => {
   });
 });
 
+describe('driven-only and skipped screens (FR-10/FR-37 runtime-conditional)', () => {
+  // The import manifest for a multi-screen SPA export: one visible screen,
+  // one driven-only screen (empty undriven, mapped by a compDrive state at
+  // import time), one skipped screen (empty undriven, unmapped at import).
+  const spaManifest = {
+    schema: 1,
+    comps: {
+      app: {
+        name: 'app',
+        relPath: 'App.dc.html',
+        contentSha256: 'a'.repeat(64),
+        screens: [
+          { label: '01 Main', id: '01-main', noiseFloor: 0 },
+          { label: '02 Menu', id: '02-menu', drivenOnly: true, noiseFloor: 0.0005 },
+          { label: '02 Menu (@menu)', id: '02-menu@menu', driven: true, noiseFloor: 0.0005 },
+          { label: '03 Help', id: '03-help', skipped: 'empty-undriven' },
+        ],
+      },
+    },
+  };
+  const state = (over) => ({
+    route: { url: 'http://localhost:5173/' },
+    viewport: { width: 100, height: 50, fullPage: false },
+    readiness: { policy: 'networkidle', timeout: 10000, settle: 250 },
+    threshold: 1,
+    ...over,
+  });
+
+  test('a compDrive state compares a driven-only screen against its @state reference (no base reference exists)', async () => {
+    const ref = pngBuffer(4, 4);
+    const config = {
+      version: 1,
+      states: { menu: state({ comp: 'app#02-menu', compDrive: [{ click: '.open-menu' }] }) },
+    };
+    await withProject(config, {}, { r1: { menu: ref } }, async ({ dir, layout }) => {
+      await writeFile(layout.referencePng('app', '02-menu', 'menu'), ref);
+      await writeRecord(
+        layout.referenceProvenance('app', '02-menu', 'menu'),
+        createRecord({
+          kind: 'reference',
+          artifactPath: '.visual-diff/references/app#02-menu@menu.png',
+          artifactBytes: ref,
+          renderer: RENDERER,
+          inputs: recordInputs({ hash: configHash(config) }),
+        }),
+      );
+      const res = await compareAt(dir);
+      assert.equal(res.code, 0);
+      assert.equal(res.report.states.menu.comp, 'app#02-menu@menu');
+      assert.equal(res.report.states.menu.noiseFloor, 0.0005, 'the @state entry noise floor');
+    }, { manifest: spaManifest });
+  });
+
+  test('a non-compDrive state mapping a driven-only screen is refused with the compDrive remedy (exit 2)', async () => {
+    const ref = pngBuffer(4, 4);
+    const config = { version: 1, states: { menu: state({ comp: 'app#02-menu' }) } };
+    await withProject(config, {}, { r1: { menu: ref } }, async ({ dir }) => {
+      const res = await compareAt(dir);
+      assert.equal(res.code, 2);
+      assert.match(res.streams.err(), /app#02-menu without compDrive/);
+      assert.match(res.streams.err(), /driven-only/);
+      assert.match(res.streams.err(), /declare a compDrive/);
+    }, { manifest: spaManifest });
+  });
+
+  test('a config mapping a screen the import skipped gets the re-import diagnostic, not a missing-PNG hunt (exit 2)', async () => {
+    const ref = pngBuffer(4, 4);
+    const config = {
+      version: 1,
+      states: { help: state({ comp: 'app#03-help', compDrive: [{ click: '.open-help' }] }) },
+    };
+    await withProject(config, {}, { r1: { help: ref } }, async ({ dir }) => {
+      const res = await compareAt(dir);
+      assert.equal(res.code, 2);
+      assert.match(res.streams.err(), /import skipped that screen/);
+      assert.match(res.streams.err(), /empty-undriven/);
+      assert.match(res.streams.err(), /import --refresh/);
+    }, { manifest: spaManifest });
+
+    // without compDrive the remedy additionally names the compDrive path
+    const config2 = { version: 1, states: { help: state({ comp: 'app#03-help' }) } };
+    await withProject(config2, {}, { r1: { help: ref } }, async ({ dir }) => {
+      const res = await compareAt(dir);
+      assert.equal(res.code, 2);
+      assert.match(res.streams.err(), /driven-only/);
+      assert.match(res.streams.err(), /give this state a compDrive/);
+    }, { manifest: spaManifest });
+  });
+
+  test('whole-comp resolution excludes driven-only and skipped screens (resolves the one base screen)', async () => {
+    const ref = pngBuffer(4, 4);
+    const config = { version: 1, states: { whole: state({ comp: 'app' }) } };
+    await withProject(config, { 'app#01-main': ref }, { r1: { whole: ref } }, async ({ dir }) => {
+      const res = await compareAt(dir);
+      assert.equal(res.code, 0, 'one base + one driven-only + one skipped resolves without multi-screen refusal');
+      assert.equal(res.report.states.whole.comp, 'app#01-main');
+    }, { manifest: spaManifest });
+  });
+});
+
 // ===========================================================================
 // automatic diagnostic region rollup (FR-20)
 // ===========================================================================

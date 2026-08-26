@@ -167,6 +167,24 @@ function solidPng(w, h, [r, g, b, a = 255]) {
   return makePng(w, h, () => [r, g, b, a]);
 }
 
+// Clip-aware solid screenshot honoring the delivered-frame gate (FR-38): the
+// PNG is exactly the requested clip at DPR 2. Cached per (size, color) — the
+// default frame is 393x852 CSS px, so building the 786x1704 buffer once and
+// sharing the bytes keeps the suite fast (and keeps double-renders
+// byte-identical, floor 0).
+const clipSolidCache = new Map();
+function clipSolid(opts, color = [255, 0, 0, 255]) {
+  const w = Math.round(opts.clip.width * DEVICE_SCALE_FACTOR);
+  const h = Math.round(opts.clip.height * DEVICE_SCALE_FACTOR);
+  const key = `${w}x${h}:${color.join(',')}`;
+  let png = clipSolidCache.get(key);
+  if (png === undefined) {
+    png = solidPng(w, h, color);
+    clipSolidCache.set(key, png);
+  }
+  return png;
+}
+
 // =============================================================================
 // Fakes: browser / context / page / routing (mirrors render.test.mjs)
 // =============================================================================
@@ -209,8 +227,12 @@ function makeFakePage({
   waitForSelectorImpl,
   maskProbes,
   compAuthoredProbes = { missing: false, entries: [] },
+  // The document canvas the FR-38 accommodation probes (scrollWidth/Height x
+  // innerWidth/Height max). Default: huge, so existing scenarios never grow.
+  // Function form is called per probe (with the page) for grow scenarios.
+  canvas = { width: 100000, height: 100000 },
 } = {}) {
-  const calls = { goto: [], screenshot: [], evaluate: [], waitForFunction: [], waitForSelector: [], click: [], hover: [], waitForTimeout: [] };
+  const calls = { goto: [], screenshot: [], evaluate: [], waitForFunction: [], waitForSelector: [], click: [], hover: [], waitForTimeout: [], setViewportSize: [] };
   const frame = {};
   const routes = [];
   let shotIndex = 0;
@@ -226,15 +248,19 @@ function makeFakePage({
     async route(pattern, handler) {
       routes.push({ pattern, handler });
     },
-    async goto(url, opts) {
-      calls.goto.push({ url, opts });
-      page._url = url;
-      // render.mjs intercepts at context scope (context.route): drive the
-      // context-installed handler, falling back to a page-level one.
+    // render.mjs intercepts at context scope (context.route): drive the
+    // context-installed handler, falling back to a page-level one. Requests
+    // with `phase: 'fonts'` model CSS sub-resources (an @font-face woff2):
+    // they fire during the document.fonts.ready evaluate — AFTER navigation
+    // and any entry-time abort check — never during goto. `phase:
+    // 'screenshot'` requests fire while page.screenshot is in flight
+    // (Playwright's screenshot preparation waits on document.fonts.ready, so
+    // a real font request can abort inside the shot).
+    async _dispatch(selected) {
       const handler =
         (page._ctx && page._ctx._routes[0] && page._ctx._routes[0].handler) ||
         (routes[0] && routes[0].handler);
-      for (const r of requests) {
+      for (const r of selected) {
         if (r.when && !r.when(state)) continue;
         const route = makeRoute();
         await handler(
@@ -250,6 +276,11 @@ function makeFakePage({
         if (r.after) r.after(state, route);
       }
     },
+    async goto(url, opts) {
+      calls.goto.push({ url, opts });
+      page._url = url;
+      await page._dispatch(requests.filter((r) => r.phase === undefined));
+    },
     async evaluate(fn, arg) {
       const src = fn.toString();
       calls.evaluate.push({ src, arg });
@@ -259,13 +290,24 @@ function makeFakePage({
         // data-screen-label/querySelectorAll
         return typeof compAuthoredProbes === 'function' ? compAuthoredProbes(arg) : compAuthoredProbes;
       }
-      if (src.includes('.ready')) return undefined; // document.fonts.ready
+      if (src.includes('.ready')) {
+        // document.fonts.ready — lazily-requested font sub-resources fire here
+        await page._dispatch(requests.filter((r) => r.phase === 'fonts'));
+        return undefined;
+      }
+      if (src.includes('scrollWidth')) {
+        // the FR-38 canvas probe (document canvas the fullPage shot can cover)
+        return typeof canvas === 'function' ? canvas(page) : canvas;
+      }
       if (src.includes('f.family')) return [...fonts];
       if (src.includes('script[src]')) return externals;
       if (src.includes('data-screen-label')) {
         if (measurement === null) throw new Error('fake page: no measurement configured');
-        if (measurement.missing) return { missing: true, id: arg };
-        return { missing: false, figRect: measurement.figRect, capRect: measurement.capRect, docHeight: 2000 };
+        // Function form: measured per call with the screen id, so a test can
+        // model per-screen (or per-pass) geometry. Object form is static.
+        const m = typeof measurement === 'function' ? measurement(arg) : measurement;
+        if (m.missing) return { missing: true, id: arg };
+        return { missing: false, figRect: m.figRect, capRect: m.capRect, docHeight: 2000 };
       }
       if (src.includes('querySelectorAll')) {
         // the serialized probeMaskElements: arg is the
@@ -304,9 +346,17 @@ function makeFakePage({
     async waitForTimeout(ms) {
       calls.waitForTimeout.push(ms);
     },
+    async setViewportSize(size) {
+      calls.setViewportSize.push(size);
+      page._viewport = size;
+    },
     async screenshot(opts) {
       calls.screenshot.push(opts);
-      return screenshots ? screenshots(opts, shotIndex++, page) : solidPng(4, 2, [255, 0, 0, 255]);
+      // fonts can be requested (and aborted) while the shot is in flight
+      await page._dispatch(requests.filter((r) => r.phase === 'screenshot'));
+      // Default: a solid PNG of exactly the requested clip at DPR 2, so the
+      // delivered-frame gate (FR-38) sees a faithful render.
+      return screenshots ? screenshots(opts, shotIndex++, page) : clipSolid(opts);
     },
   };
   return page;
@@ -595,8 +645,10 @@ describe('external set merging (FR-8)', () => {
       [{ url: 'https://a.example/1.js', integrity: 'sha384-x' }],
     );
     assert.deepEqual(merged, [
-      { url: 'https://a.example/1.js', integrity: 'sha384-x' },
-      { url: 'https://cdn.example.invalid/x.css', integrity: undefined },
+      // the browser's resourceType classification survives the merge (and a
+      // duplicate abort record without one never clobbers it)
+      { url: 'https://a.example/1.js', integrity: 'sha384-x', kind: 'script' },
+      { url: 'https://cdn.example.invalid/x.css', integrity: undefined, kind: undefined },
     ]);
   });
 
@@ -644,7 +696,6 @@ const defaultPageOpts = () => ({
     { url: 'http://127.0.0.1:1/App.dc.html', isNavigationRequest: true, resourceType: 'document' },
     { url: EXTERNAL_URL, resourceType: 'script' },
   ],
-  screenshots: () => solidPng(6, 2, [10, 20, 30, 255]),
 });
 
 describe('importZip full pipeline', () => {
@@ -765,17 +816,19 @@ describe('importZip full pipeline', () => {
   test('a dimension mismatch between double-renders is recorded as floor 1 with a warning', async (t) => {
     const dir = makeProject(t);
     const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
-    let shot = 0;
+    let render = 0;
     const browser = makeFakeBrowser(() => makeFakePage({
       ...defaultPageOpts(),
-      // screen 01: pass 1 4x4, pass 2 2x2 (the double-render mismatch under
-      // test). screen 02 must stay at 4x4: the uniform-dimensions
-      // assertion compares each screen's first render across the comp.
-      screenshots: () => {
-        const n = shot++;
-        if (n === 1) return solidPng(2, 2, [0, 0, 0, 255]);
-        return solidPng(4, 4, [0, 0, 0, 255]);
-      },
+      // Renders measure in order (pass 1, pass 2 each): screen 01's pass 2
+      // measures a SHORTER frame than pass 1 (nondeterministic layout), so the
+      // two delivered PNGs disagree in size — the double-render mismatch under
+      // test. Every shot still matches its own measured frame, so the
+      // delivered-frame gate (FR-38) stays silent; screen 02 keeps the default
+      // frame on both passes (the uniform-dimensions assertion compares each
+      // screen's first render across the comp).
+      measurement: () => (render++ === 1
+        ? { figRect: { x: 10, y: 20, width: 393, height: 800 }, capRect: { x: 10, y: 786, width: 393, height: 34 } }
+        : DEFAULT_MEASUREMENT),
     }));
     const logs = [];
     await importZip(
@@ -885,12 +938,15 @@ describe('importZip full pipeline', () => {
   test('a screen with divergent device dimensions aborts the comp import', async (t) => {
     const dir = makeProject(t);
     const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
-    let shot = 0;
-    // screens render in order (pass 1, pass 2 each): 01-main gets 4x4,
-    // 02-detail gets 2x2 — the divergent screen
+    // Per-screen frames: 01-main measures 2x2 CSS (renders 4x4 device px),
+    // 02-detail measures 1x1 (renders 2x2) — the divergent screen. Each shot
+    // matches its own frame, so the delivered-frame gate (FR-38) stays silent
+    // and the uniform-dimensions assertion is what trips.
     const browser = makeFakeBrowser(() => makeFakePage({
       ...defaultPageOpts(),
-      screenshots: () => (shot++ < 2 ? solidPng(4, 4, [0, 0, 0, 255]) : solidPng(2, 2, [0, 0, 0, 255])),
+      measurement: (id) => (id === '01-main'
+        ? { figRect: { x: 0, y: 0, width: 2, height: 2 }, capRect: null }
+        : { figRect: { x: 0, y: 0, width: 1, height: 1 }, capRect: null }),
     }));
     await assert.rejects(
       importZip(
@@ -919,10 +975,13 @@ describe('importZip full pipeline', () => {
       { path: 'App.dc.html', data: annotated },
       ...IMPORTABLE_FILES.slice(1),
     ]);
-    let shot = 0;
+    // Same divergent per-screen frames as above — each shot matches its own
+    // frame, so only the (opted-out) uniform-dimensions assertion is at stake.
     const browser = makeFakeBrowser(() => makeFakePage({
       ...defaultPageOpts(),
-      screenshots: () => (shot++ < 2 ? solidPng(4, 4, [0, 0, 0, 255]) : solidPng(2, 2, [0, 0, 0, 255])),
+      measurement: (id) => (id === '01-main'
+        ? { figRect: { x: 0, y: 0, width: 2, height: 2 }, capRect: null }
+        : { figRect: { x: 0, y: 0, width: 1, height: 1 }, capRect: null }),
     }));
     const result = await importZip(
       { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
@@ -941,7 +1000,6 @@ describe('incremental re-import (FR-12)', () => {
       { url: 'http://127.0.0.1:1/App.dc.html', isNavigationRequest: true, resourceType: 'document' },
       { url: EXTERNAL_URL, resourceType: 'script' },
     ],
-    screenshots: () => solidPng(6, 2, [10, 20, 30, 255]),
   });
 
   test('re-importing an unchanged zip renders nothing and leaves references intact', async (t) => {
@@ -1093,7 +1151,6 @@ describe('incremental re-import (FR-12)', () => {
         { url: 'http://127.0.0.1:1/App.dc.html', isNavigationRequest: true, resourceType: 'document' },
         { url: EXTERNAL_URL, resourceType: 'script' },
       ],
-      screenshots: () => solidPng(6, 2, [10, 20, 30, 255]),
     });
     const importOnce = (env) => {
       const browser = makeFakeBrowser(() => makeFakePage(env));
@@ -1153,7 +1210,6 @@ describe('import error handling', () => {
         { url: EXTERNAL_URL, resourceType: 'script' },
         { url: B_URL, resourceType: 'script' },
       ],
-      screenshots: () => solidPng(6, 2, [10, 20, 30, 255]),
     }));
     // A fetches + verifies cleanly; B fails its declared SRI — the whole set
     // must stay unpublished, so vendorHashesFor() never sees a partial fetch.
@@ -1206,7 +1262,6 @@ describe('import error handling', () => {
         { url: B_URL, resourceType: 'script' },
         { url: C_URL, resourceType: 'script' },
       ],
-      screenshots: () => solidPng(6, 2, [10, 20, 30, 255]),
     }));
     const splitFetcher = async (url) => {
       const body = url === B_URL ? Buffer.from(EXTERNAL_CONTENT) : Buffer.from(COLLISION_CONTENT);
@@ -1371,12 +1426,467 @@ describe('import error handling', () => {
           when: (s) => s.aFulfilled === true,
         },
       ],
-      screenshots: () => solidPng(6, 2, [10, 20, 30, 255]),
     }));
     await assert.rejects(
       importZip({ projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir }, { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher }),
       (err) => err instanceof ImportError && err.code === 'render-defect' && err.exitCode === 3,
     );
+  });
+
+  test('a font aborted AFTER navigation during a reference render is fatal (render-defect naming the URL)', async (t) => {
+    // The field failure: a woff2 requests only during fonts.ready — after the
+    // reference render's entry-time abort check — so it used to be logged and
+    // then screenshotted into a tofu reference at noise floor. It must fail
+    // as loudly as an aborted stylesheet.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const fontUrl = 'https://fonts.gstatic.invalid/s/inter/v13/inter.woff2';
+    const browser = makeFakeBrowser((shared) => makeFakePage({
+      state: shared,
+      externals: [{ url: EXTERNAL_URL, integrity: EXTERNAL_INTEGRITY }],
+      measurement: DEFAULT_MEASUREMENT,
+      requests: [
+        {
+          url: 'http://127.0.0.1:1/App.dc.html',
+          isNavigationRequest: true,
+          resourceType: 'document',
+          after: (s) => { s.nav = (s.nav ?? 0) + 1; },
+        },
+        { url: EXTERNAL_URL, resourceType: 'script' },
+        // A late font sub-resource the discovery render never observes: it
+        // first fires during a reference render's fonts.ready.
+        { url: fontUrl, resourceType: 'font', phase: 'fonts', when: (s) => s.nav >= 2 },
+      ],
+    }));
+    await assert.rejects(
+      importZip({ projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir }, { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher }),
+      (err) =>
+        err instanceof ImportError &&
+        err.code === 'render-defect' &&
+        err.exitCode === 3 &&
+        err.message.includes(fontUrl),
+    );
+  });
+
+  test('a font revealed by a vendored stylesheet is discovered (no throw) and vendored on the FIRST import', async (t) => {
+    // A CSS sub-resource is not DOM-declared, and while its stylesheet is
+    // itself aborted the font never fires — so a single discovery pass cannot
+    // see it. Discovery re-runs after vendoring a stylesheet: the fulfilled
+    // stylesheet triggers the font request, the abort joins the discovered
+    // externals (treated as data, never fatal there), and the font is fetched
+    // on this first import — one import, one ground truth.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const cssUrl = 'https://cdn.example.invalid/theme/fonts.css';
+    const fontUrl = 'https://fonts.gstatic.invalid/s/inter/v13/inter.woff2';
+    const browser = makeFakeBrowser((shared) => makeFakePage({
+      state: shared,
+      externals: [{ url: EXTERNAL_URL, integrity: EXTERNAL_INTEGRITY }],
+      measurement: DEFAULT_MEASUREMENT,
+      requests: [
+        { url: 'http://127.0.0.1:1/App.dc.html', isNavigationRequest: true, resourceType: 'document' },
+        { url: EXTERNAL_URL, resourceType: 'script' },
+        {
+          url: cssUrl,
+          resourceType: 'stylesheet',
+          // Mark when vendoring actually fulfilled the stylesheet — only a
+          // parsed (fulfilled) stylesheet triggers its @font-face request.
+          after: (s, route) => {
+            if (route._calls.fulfill.length > 0) s.cssFulfilled = true;
+          },
+        },
+        { url: fontUrl, resourceType: 'font', phase: 'fonts', when: (s) => s.cssFulfilled === true },
+      ],
+    }));
+    const result = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    assert.deepEqual(result.summary.comps, ['app']);
+    const vendorManifest = JSON.parse(readFileSync(join(dir, '.visual-diff', 'vendor', 'vendor.json'), 'utf8'));
+    assert.ok(vendorManifest.entries[cssUrl], 'stylesheet vendored');
+    assert.match(vendorManifest.entries[cssUrl].file, /\.css$/);
+    assert.ok(vendorManifest.entries[fontUrl], 'font vendored on the first import');
+    assert.match(vendorManifest.entries[fontUrl].file, /\.woff2$/);
+    assert.ok(existsSync(join(dir, '.visual-diff', 'vendor', vendorManifest.entries[fontUrl].file)));
+  });
+
+  test('a font aborted DURING page.screenshot is still fatal (post-shot re-check)', async (t) => {
+    // Playwright's screenshot preparation itself waits on
+    // document.fonts.ready, so a font request can be aborted while the shot
+    // is in flight — after every pre-shot check. The render must fail before
+    // the returned PNG is used for anything.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const fontUrl = 'https://fonts.gstatic.invalid/s/inter/v13/inter.woff2';
+    const browser = makeFakeBrowser((shared) => makeFakePage({
+      state: shared,
+      externals: [{ url: EXTERNAL_URL, integrity: EXTERNAL_INTEGRITY }],
+      measurement: DEFAULT_MEASUREMENT,
+      requests: [
+        {
+          url: 'http://127.0.0.1:1/App.dc.html',
+          isNavigationRequest: true,
+          resourceType: 'document',
+          after: (s) => { s.nav = (s.nav ?? 0) + 1; },
+        },
+        { url: EXTERNAL_URL, resourceType: 'script' },
+        // fires inside the reference render's screenshot call, never earlier
+        { url: fontUrl, resourceType: 'font', phase: 'screenshot', when: (s) => s.nav >= 2 },
+      ],
+    }));
+    await assert.rejects(
+      importZip({ projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir }, { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher }),
+      (err) =>
+        err instanceof ImportError &&
+        err.code === 'render-defect' &&
+        err.exitCode === 3 &&
+        err.message.includes(fontUrl),
+    );
+  });
+
+  test('an EXTENSIONLESS stylesheet URL still triggers the discovery re-run and is fulfilled as text/css', async (t) => {
+    // https://fonts.googleapis.com/css2?family=Inter has no path extension:
+    // the re-run trigger must key on the browser's recorded resourceType (not
+    // the URL suffix), and fulfillment must serve the vendored bytes with the
+    // recorded text/css content type — application/octet-stream would make
+    // Chromium ignore the stylesheet entirely, with no font abort to fail on.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const cssUrl = 'https://fonts.googleapis.invalid/css2?family=Inter:wght@400;700';
+    const fontUrl = 'https://fonts.gstatic.invalid/s/inter/v13/inter.woff2';
+    const browser = makeFakeBrowser((shared) => makeFakePage({
+      state: shared,
+      externals: [{ url: EXTERNAL_URL, integrity: EXTERNAL_INTEGRITY }],
+      measurement: DEFAULT_MEASUREMENT,
+      requests: [
+        { url: 'http://127.0.0.1:1/App.dc.html', isNavigationRequest: true, resourceType: 'document' },
+        { url: EXTERNAL_URL, resourceType: 'script' },
+        {
+          url: cssUrl,
+          resourceType: 'stylesheet',
+          after: (s, route) => {
+            if (route._calls.fulfill.length > 0) {
+              s.cssFulfilled = true;
+              s.cssContentTypes ??= [];
+              s.cssContentTypes.push(route._calls.fulfill[0].headers['content-type']);
+            }
+          },
+        },
+        { url: fontUrl, resourceType: 'font', phase: 'fonts', when: (s) => s.cssFulfilled === true },
+      ],
+    }));
+    const result = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    assert.deepEqual(result.summary.comps, ['app']);
+    const vendorManifest = JSON.parse(readFileSync(join(dir, '.visual-diff', 'vendor', 'vendor.json'), 'utf8'));
+    const cssEntry = vendorManifest.entries[cssUrl];
+    assert.ok(cssEntry, 'extensionless stylesheet vendored');
+    assert.equal(cssEntry.contentType, 'text/css', 'recorded kind rides the vendor manifest');
+    assert.ok(vendorManifest.entries[fontUrl], 'its font vendored on the FIRST import — the re-run fired');
+    // every fulfillment of the extensionless stylesheet served the recorded type
+    assert.ok(browser._shared.cssContentTypes.length > 0, 'stylesheet was fulfilled from the vendor dir');
+    assert.ok(browser._shared.cssContentTypes.every((ct) => ct === 'text/css'), `served as text/css, got ${browser._shared.cssContentTypes}`);
+  });
+
+  test('a LEGACY vendor entry for an extensionless stylesheet is upgraded to text/css and its font discovered', async (t) => {
+    // A version-1 manifest written by 0.8.x records no contentType. Its
+    // extensionless stylesheet is never aborted (it is vendored, so
+    // discovery FULFILLS it — as application/octet-stream, which Chromium can
+    // ignore with no font abort left to fire), and with nothing new pending
+    // the vendor pass used to skip the manifest rewrite entirely — re-running
+    // import preserved the silent fallback reference forever. The kind
+    // observed at fulfillment must upgrade the entry, persist the manifest,
+    // and re-trigger discovery so the stylesheet parses and its font vendors.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const cssUrl = 'https://fonts.googleapis.invalid/css2?family=Inter';
+    const fontUrl = 'https://fonts.gstatic.invalid/s/inter/v13/inter.woff2';
+    // Seed the legacy manifest: stylesheet vendored, extensionless file,
+    // NO contentType recorded.
+    const vendorDir = join(dir, '.visual-diff', 'vendor');
+    mkdirSync(vendorDir, { recursive: true });
+    const cssSha = sha256(EXTERNAL_CONTENT);
+    writeFileSync(join(vendorDir, `sha256-${cssSha}`), EXTERNAL_CONTENT);
+    writeFileSync(
+      join(vendorDir, 'vendor.json'),
+      JSON.stringify({ version: 1, entries: { [cssUrl]: { file: `sha256-${cssSha}`, sha256: cssSha } } }, null, 2) + '\n',
+    );
+    const browser = makeFakeBrowser((shared) => makeFakePage({
+      state: shared,
+      externals: [{ url: EXTERNAL_URL, integrity: EXTERNAL_INTEGRITY }],
+      measurement: DEFAULT_MEASUREMENT,
+      requests: [
+        { url: 'http://127.0.0.1:1/App.dc.html', isNavigationRequest: true, resourceType: 'document' },
+        { url: EXTERNAL_URL, resourceType: 'script' },
+        {
+          url: cssUrl,
+          resourceType: 'stylesheet',
+          // Chromium's MIME gating: the stylesheet only parses (and its
+          // @font-face only fires) when it is served as text/css.
+          after: (s, route) => {
+            const f = route._calls.fulfill[0];
+            if (f !== undefined) {
+              s.cssContentTypes ??= [];
+              s.cssContentTypes.push(f.headers['content-type']);
+              if (f.headers['content-type'] === 'text/css') s.cssParsed = true;
+            }
+          },
+        },
+        { url: fontUrl, resourceType: 'font', phase: 'fonts', when: (s) => s.cssParsed === true },
+      ],
+    }));
+    const result = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    assert.deepEqual(result.summary.comps, ['app']);
+    const vendorManifest = JSON.parse(readFileSync(join(vendorDir, 'vendor.json'), 'utf8'));
+    const cssEntry = vendorManifest.entries[cssUrl];
+    assert.equal(cssEntry.contentType, 'text/css', 'legacy entry upgraded and the manifest rewritten');
+    assert.equal(cssEntry.sha256, cssSha, 'the vendored bytes are untouched');
+    assert.equal(cssEntry.file, `sha256-${cssSha}`, 'the vendored file is untouched');
+    assert.ok(vendorManifest.entries[fontUrl], 'the stylesheet parsed after the upgrade and its font vendored');
+    // first fulfillment served the legacy octet-stream; every one after the
+    // upgrade serves the recorded type
+    assert.ok(browser._shared.cssContentTypes.length >= 2, 'discovery re-ran after the upgrade');
+    assert.equal(browser._shared.cssContentTypes[0], 'application/octet-stream');
+    assert.ok(browser._shared.cssContentTypes.slice(1).every((ct) => ct === 'text/css'), `got ${browser._shared.cssContentTypes}`);
+  });
+});
+
+// =============================================================================
+// Delivered-frame gate (FR-38): a screenshot clip clamped by the document
+// scroll box must fail the import loud — a clamped reference is a false
+// ground truth (both compare sides clamp identically, so nothing downstream
+// can see the missing bottom).
+// =============================================================================
+
+describe('delivered-frame gate (FR-38)', () => {
+  test('a render delivering a SHORTER PNG than the frame requires fails the import (exit 3, frame-truncated)', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    // Chromium's clamp simulated: the frame is 393x852 CSS px (786x1704
+    // device px at DPR 2), but the delivered PNG stops short.
+    const browser = makeFakeBrowser(() => makeFakePage({
+      ...defaultPageOpts(),
+      screenshots: () => solidPng(786, 1200, [255, 0, 0, 255]),
+    }));
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+      ),
+      (err) => {
+        assert.ok(err instanceof ImportError);
+        assert.equal(err.code, 'frame-truncated');
+        assert.equal(err.exitCode, 3);
+        assert.match(err.message, /delivered 786x1200 device px but the screen frame requires 786x1704/);
+        assert.match(err.message, /clamped to the document scroll box/);
+        assert.match(err.message, /scrolls in an inner container/);
+        assert.match(err.message, /Let the document itself scroll, or size the scroll container to its content/);
+        return true;
+      },
+    );
+    // fail loud means no reference artifacts for the truncated comp
+    assert.ok(!existsSync(join(dir, '.visual-diff', 'references', 'app#01-main.png')));
+  });
+
+  test('an undecodable delivery is the same trust failure', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const browser = makeFakeBrowser(() => makeFakePage({
+      ...defaultPageOpts(),
+      screenshots: () => Buffer.from('not-a-png'),
+    }));
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+      ),
+      (err) => err instanceof ImportError && err.code === 'frame-truncated' && err.exitCode === 3
+        && /delivered an undecodable buffer/.test(err.message),
+    );
+  });
+
+  test('a faithful render records inputs.frame and inputs.delivered in the reference provenance', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const browser = makeFakeBrowser(() => makeFakePage(defaultPageOpts()));
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    for (const screen of ['01-main', '02-detail']) {
+      const prov = JSON.parse(readFileSync(join(dir, '.visual-diff', 'references', `app#${screen}.provenance.json`), 'utf8'));
+      // Informational FR-38 evidence — the FR-23 gate never reads either.
+      assert.deepEqual(prov.inputs.frame, EXPECTED_FRAME);
+      assert.deepEqual(prov.inputs.delivered, { width: 786, height: 1704 });
+    }
+  });
+});
+
+// =============================================================================
+// Canvas accommodation (FR-38): an inner-scroll comp (html,body at height:100%
+// + overflow:auto — the document canvas is exactly the viewport) is rendered
+// by growing the viewport to contain the frame, guarded by a frame-identity
+// re-measure. An unstable frame is a trust failure, never a silent reference.
+// =============================================================================
+
+describe('canvas accommodation (FR-38)', () => {
+  // The frame is 393x852 at (10,20) — bottom edge 872 — but the document
+  // canvas is only the 1502x818 viewport, as an inner-scroll app shell yields.
+  const SHELL_CANVAS = { width: 1502, height: 818 };
+  const GROWN = { width: 1502, height: 872 };
+
+  test('inner-scroll happy path: grow, re-measure identical, full reference delivered, canvasGrown recorded', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const browser = makeFakeBrowser(() => makeFakePage({
+      ...defaultPageOpts(),
+      canvas: SHELL_CANVAS,
+    }));
+    const result = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    assert.deepEqual(result.summary.comps, ['app']);
+    const refs = join(dir, '.visual-diff', 'references');
+    for (const screen of ['01-main', '02-detail']) {
+      assert.ok(existsSync(join(refs, `app#${screen}.png`)));
+      const prov = JSON.parse(readFileSync(join(refs, `app#${screen}.provenance.json`), 'utf8'));
+      // the grow is recorded, the DECLARED viewport is unchanged, and the
+      // GATED effective viewport carries the size actually shot under.
+      // Height-only overflow: the width axis keeps its declared 1502.
+      assert.deepEqual(prov.inputs.canvasGrown, GROWN);
+      assert.deepEqual(prov.inputs.effectiveViewport, GROWN);
+      assert.deepEqual(prov.inputs.viewport, { ...DEFAULT_VIEWPORT, fullPage: true });
+      assert.deepEqual(prov.inputs.frame, EXPECTED_FRAME);
+      assert.deepEqual(prov.inputs.delivered, { width: 786, height: 1704 });
+    }
+    // FR-11/FR-17 determinism: BOTH passes grew independently (fresh
+    // contexts, no leaked state) and delivered identical bytes — floor 0.
+    const shootingPages = browser._pages.filter((p) => p._calls.screenshot.length > 0);
+    assert.equal(shootingPages.length, 4, 'two screens, double-rendered');
+    for (const page of shootingPages) {
+      assert.deepEqual(page._calls.setViewportSize, [GROWN], 'each pass grew its own fresh context exactly once');
+    }
+    const manifest = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    for (const s of manifest.comps.app.screens) assert.equal(s.noiseFloor, 0);
+  });
+
+  test('reflow guard: a frame that shifts under the grown viewport fails the import (exit 3, frame-unstable), no artifact', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const browser = makeFakeBrowser(() => {
+      // Per-page measurement counter: the first measurement (at the declared
+      // viewport) sees the base geometry, the re-measure after the grow sees
+      // a reflowed, taller frame — a responsive comp.
+      let measures = 0;
+      return makeFakePage({
+        ...defaultPageOpts(),
+        canvas: SHELL_CANVAS,
+        measurement: () => (measures++ === 0
+          ? DEFAULT_MEASUREMENT
+          : { figRect: { x: 10, y: 20, width: 393, height: 950 }, capRect: { x: 10, y: 936, width: 393, height: 34 } }),
+      });
+    });
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+      ),
+      (err) => {
+        assert.ok(err instanceof ImportError);
+        assert.equal(err.code, 'frame-unstable');
+        assert.equal(err.exitCode, 3);
+        assert.match(err.message, /measured \{x:10,y:20,w:393,h:852\} at the declared viewport/);
+        assert.match(err.message, /but \{x:10,y:20,w:393,h:916\} after the viewport was grown to 1502x872/);
+        assert.match(err.message, /reflows responsively/);
+        assert.match(err.message, /Fix the comp to a static frame, or let the document itself scroll/);
+        return true;
+      },
+    );
+    // fail loud means no reference artifacts and no PNG ever shot
+    assert.ok(!existsSync(join(dir, '.visual-diff', 'references', 'app#01-main.png')));
+    assert.equal(browser._pages.flatMap((p) => p._calls.screenshot).length, 0);
+  });
+
+  test('no-grow path: a frame inside the document canvas never touches the viewport and records no canvasGrown', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const browser = makeFakeBrowser(() => makeFakePage(defaultPageOpts()));
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    for (const page of browser._pages) {
+      assert.deepEqual(page._calls.setViewportSize, [], 'no grow, no viewport mutation');
+    }
+    const prov = JSON.parse(readFileSync(join(dir, '.visual-diff', 'references', 'app#01-main.provenance.json'), 'utf8'));
+    assert.equal(prov.inputs.canvasGrown, undefined);
+    // the effective viewport is still recorded — equal to the declared one
+    assert.deepEqual(prov.inputs.effectiveViewport, { width: DEFAULT_VIEWPORT.width, height: DEFAULT_VIEWPORT.height });
+  });
+
+  test('width-only overflow grows ONLY the width axis; the declared height is preserved', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    // A wide caption-less frame: right edge 10+1600=1610 exceeds the canvas
+    // width, bottom edge 20+400=420 is well inside the canvas height.
+    const wide = { figRect: { x: 10, y: 20, width: 1600, height: 400 }, capRect: null };
+    const browser = makeFakeBrowser(() => makeFakePage({
+      ...defaultPageOpts(),
+      measurement: wide,
+      canvas: { width: 1502, height: 5000 },
+    }));
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    const expected = { width: 1610, height: DEFAULT_VIEWPORT.height };
+    const shootingPages = browser._pages.filter((p) => p._calls.screenshot.length > 0);
+    assert.ok(shootingPages.length > 0);
+    for (const page of shootingPages) {
+      assert.deepEqual(page._calls.setViewportSize, [expected], 'height stays declared — no height media queries fired');
+    }
+    const prov = JSON.parse(readFileSync(join(dir, '.visual-diff', 'references', 'app#01-main.provenance.json'), 'utf8'));
+    assert.deepEqual(prov.inputs.canvasGrown, expected);
+    assert.deepEqual(prov.inputs.effectiveViewport, expected);
+  });
+
+  test('cross-pass structural determinism: a canvas race (pass 1 grows, pass 2 does not) is a trust failure naming both decisions', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    // The canvas probe alternates across renders: the first reference pass
+    // sees the small shell canvas (grows), the second sees a tall document
+    // (does not grow). Pixels are identical either way (clip-sized solids) —
+    // only the structural check can see the race; no noise floor may absorb it.
+    const browser = makeFakeBrowser((shared) => makeFakePage({
+      ...defaultPageOpts(),
+      canvas: () => ((shared.canvasCalls = (shared.canvasCalls ?? 0) + 1) % 2 === 1
+        ? SHELL_CANVAS
+        : { width: 100000, height: 100000 }),
+    }));
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+      ),
+      (err) => {
+        assert.ok(err instanceof ImportError);
+        assert.equal(err.code, 'canvas-divergent');
+        assert.equal(err.exitCode, 3);
+        assert.match(err.message, /disagreed on the canvas accommodation/);
+        assert.match(err.message, /pass 1 grew the canvas to 1502x872, effective viewport 1502x872/);
+        assert.match(err.message, /pass 2 did not grow the canvas, effective viewport 1502x818/);
+        assert.match(err.message, /canvas race, not pixel jitter/);
+        return true;
+      },
+    );
+    assert.ok(!existsSync(join(dir, '.visual-diff', 'references', 'app#01-main.png')), 'no artifact for the divergent screen');
   });
 });
 
@@ -1564,8 +2074,8 @@ describe('import pin/discovery (FR-33/FR-34)', () => {
         ...defaultPageOpts(),
         // driven renders (which clicked) are blue; base renders are red —
         // the driven/base pair must mismatch well clear of the 0.01 bar.
-        screenshots: (_opts, _i, page) =>
-          solidPng(4, 2, page._calls.click.length > 0 ? [0, 0, 255, 255] : [255, 0, 0, 255]),
+        screenshots: (opts, _i, page) =>
+          clipSolid(opts, page._calls.click.length > 0 ? [0, 0, 255, 255] : [255, 0, 0, 255]),
       }),
     );
     const result = await importZip(
@@ -1627,8 +2137,8 @@ describe('import pin/discovery (FR-33/FR-34)', () => {
     const browser = makeFakeBrowser(() =>
       makeFakePage({
         ...defaultPageOpts(),
-        screenshots: (_opts, _i, page) =>
-          solidPng(4, 2, page._calls.click.length > 0 ? [0, 0, 255, 255] : [255, 0, 0, 255]),
+        screenshots: (opts, _i, page) =>
+          clipSolid(opts, page._calls.click.length > 0 ? [0, 0, 255, 255] : [255, 0, 0, 255]),
       }),
     );
     await importZip(
@@ -2503,6 +3013,247 @@ describe('comp-authored masks', () => {
     assert.equal(repairProbes.length, 0, 'no repair probe for already-probed records');
     const prov = JSON.parse(readFileSync(join(dir, '.visual-diff', 'references', 'app#01-main.provenance.json'), 'utf8'));
     assert.deepEqual(prov.inputs.compAuthoredMasks, {}, 'the recorded empty discovery stands');
+  });
+});
+
+// =============================================================================
+// Runtime-conditional screens: driven-only and empty-undriven skip (FR-10/FR-37)
+// =============================================================================
+
+describe('runtime-conditional screens (driven-only / empty-undriven)', () => {
+  // The reporter's comp shape: a real multi-screen SPA export is ONE app
+  // shell whose screens sit under sc-if wrappers — only the default screen
+  // renders at nonzero size undriven; the other six exist only after an
+  // interaction. The HTML enumerates all seven; the measurement
+  // fake below models which of them are visible undriven.
+  const SPA_LABELS = ['01 Home', '02 Sessions', '03 Library', '04 Profile', '05 Settings', '06 Help', '07 About'];
+  const SPA_IDS = ['01-home', '02-sessions', '03-library', '04-profile', '05-settings', '06-help', '07-about'];
+  const SPA_FILES = [
+    {
+      path: 'Spa.dc.html',
+      data: [
+        '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Spa</title></head><body>',
+        ...SPA_LABELS.map(
+          (l) => `<figure data-screen-label="${l}"><figcaption>${l}</figcaption><x-dc><div>x</div></x-dc></figure>`,
+        ),
+        '</body></html>',
+      ].join('\n'),
+    },
+  ];
+  const EMPTY_MEASUREMENT = { figRect: { x: 0, y: 0, width: 0, height: 0 }, capRect: null };
+  const PIN = { backend: 'playwright-managed', rung: 1, locator: { executablePath: '/fake/browser' }, browserRevision: '1234' };
+  const writeConfig = (dir, states) => {
+    mkdirSync(join(dir, '.visual-diff'), { recursive: true });
+    writeFileSync(join(dir, '.visual-diff', 'visual-diff.json'), JSON.stringify({ version: 1, browser: PIN, states }) + '\n');
+  };
+  // Undriven pages measure only 01-home at nonzero size; a page whose drive
+  // steps ran (click recorded) measures every screen — the sc-if condition
+  // now holds.
+  const spaBrowser = () =>
+    makeFakeBrowser(() => {
+      let page;
+      page = makeFakePage({
+        measurement: (id) =>
+          id === '01-home' || page._calls.click.length > 0 ? DEFAULT_MEASUREMENT : EMPTY_MEASUREMENT,
+      });
+      return page;
+    });
+
+  test('driven-only happy path: an empty-undriven screen mapped by a compDrive state renders only the driven reference', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    writeConfig(dir, {
+      'sessions-open': {
+        route: { url: 'http://127.0.0.1:5999/preview.html' },
+        comp: 'spa#02-sessions',
+        compDrive: [{ click: '.nav-sessions' }],
+        readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+        threshold: 1,
+      },
+    });
+    const logs = [];
+    const result = await importZip(
+      { projectDir: dir, zipPath, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(spaBrowser()), fetcher: goodFetcher, log: (l) => logs.push(l) },
+    );
+    assert.deepEqual(result.summary.comps, ['spa']);
+
+    const refs = join(dir, '.visual-diff', 'references');
+    const manifest = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    const screens = manifest.comps.spa.screens;
+
+    // the visible screen has an ordinary base reference
+    const home = screens.find((s) => s.id === '01-home');
+    assert.equal(home.noiseFloor, 0);
+    assert.equal(home.drivenOnly, undefined);
+    assert.ok(existsSync(join(refs, 'spa#01-home.png')));
+
+    // the driven-only screen: manifest flag + driven noise floor, NO base
+    // artifacts, driven reference written with provenance
+    const sessions = screens.find((s) => s.id === '02-sessions');
+    assert.equal(sessions.drivenOnly, true);
+    assert.equal(sessions.noiseFloor, 0, 'carries the driven pair noise floor');
+    assert.ok(!existsSync(join(refs, 'spa#02-sessions.png')), 'no base reference PNG');
+    assert.ok(!existsSync(join(refs, 'spa#02-sessions.provenance.json')), 'no base provenance');
+    const driven = screens.find((s) => s.id === '02-sessions@sessions-open');
+    assert.equal(driven.driven, true);
+    assert.equal(driven.noiseFloor, 0);
+    assert.ok(existsSync(join(refs, 'spa#02-sessions@sessions-open.png')));
+    assert.ok(existsSync(join(refs, 'spa#02-sessions@sessions-open.provenance.json')));
+
+    // the five unmapped conditional screens are skipped with a warning each
+    for (const id of SPA_IDS.slice(2)) {
+      const entry = screens.find((s) => s.id === id);
+      assert.equal(entry.skipped, 'empty-undriven');
+      assert.equal(entry.noiseFloor, undefined);
+      assert.ok(!existsSync(join(refs, `spa#${id}.png`)), `${id} writes no artifact`);
+    }
+    const warnings = logs.filter((l) => /renders empty undriven — likely a runtime-conditional screen/.test(l));
+    assert.equal(warnings.length, 5, 'one warning per skipped screen');
+    assert.match(warnings[0], /map it with a compDrive state to reference it, or ignore this warning/);
+
+    // an unchanged re-import (the repair path) keeps the manifest intact and
+    // must not stumble over the missing base records of skipped/driven-only
+    // screens
+    const again = await importZip(
+      { projectDir: dir, zipPath, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(spaBrowser()), fetcher: goodFetcher, log: () => {} },
+    );
+    assert.deepEqual(again.summary.skipped, ['spa'], 'content hash unchanged — comp skipped');
+    const manifest2 = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    assert.deepEqual(manifest2, manifest);
+  });
+
+  test('unmapped empty-undriven screens skip with a logged warning and the import exits 0', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    const s = mockStreams();
+    const code = await runImport(
+      { projectDir: dir, positionals: [zipPath], values: {}, bools: { 'auto-discover-browser': true }, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(spaBrowser()), fetcher: goodFetcher, streams: s },
+    );
+    assert.equal(code, 0, 'at least one screen produced a reference — the import succeeds');
+    assert.match(s.err(), /02-sessions renders empty undriven — likely a runtime-conditional screen/);
+    const refs = join(dir, '.visual-diff', 'references');
+    const manifest = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    assert.ok(existsSync(join(refs, 'spa#01-home.png')));
+    assert.deepEqual(
+      manifest.comps.spa.screens.filter((x) => x.skipped === 'empty-undriven').map((x) => x.id),
+      SPA_IDS.slice(1),
+    );
+  });
+
+  test('ALL screens empty stays a hard error naming the likely cause', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    const browser = makeFakeBrowser(() => makeFakePage({ measurement: EMPTY_MEASUREMENT }));
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher, log: () => {} },
+      ),
+      (err) =>
+        err instanceof ImportError &&
+        err.code === 'all-screens-empty' &&
+        err.exitCode === 2 &&
+        /every screen of comp spa renders empty undriven/.test(err.message) &&
+        /compDrive/.test(err.message),
+    );
+  });
+
+  test('an empty-undriven screen mapped WITHOUT compDrive is a hard error naming the driven-only remedy', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    writeConfig(dir, {
+      sessions: {
+        route: { url: 'http://127.0.0.1:5999/preview.html' },
+        comp: 'spa#02-sessions',
+        readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+        threshold: 1,
+      },
+    });
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(spaBrowser()), fetcher: goodFetcher, log: () => {} },
+      ),
+      (err) =>
+        err instanceof ImportError &&
+        err.code === 'empty-frame' &&
+        err.exitCode === 2 &&
+        /screen spa#02-sessions renders empty undriven, but state\(s\) "sessions" map it without compDrive/.test(err.message) &&
+        /compDrive that makes\s+.*the screen visible|compDrive/.test(err.message),
+    );
+  });
+
+  test('a WHOLE-COMP mapping never hardens the triage: conditional screens skip and the sole base imports (exit 0)', async (t) => {
+    // The reproduction: the SPA fixture plus a single state mapping the
+    // whole comp ("comp": "spa"). Compare resolves such a mapping to the
+    // sole ordinary base screen (excluding driven-only/skipped siblings),
+    // so import must NOT treat the whole-comp registration as an exact
+    // non-compDrive mapping of every conditional screen — they triage to
+    // skip exactly as if unmapped.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    writeConfig(dir, {
+      whole: {
+        route: { url: 'http://127.0.0.1:5999/preview.html' },
+        comp: 'spa',
+        readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+        threshold: 1,
+      },
+    });
+    const s = mockStreams();
+    const code = await runImport(
+      { projectDir: dir, positionals: [zipPath], values: {}, bools: {}, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(spaBrowser()), fetcher: goodFetcher, streams: s },
+    );
+    assert.equal(code, 0, 'the whole-comp mapping must not abort the import on a conditional screen');
+    const refs = join(dir, '.visual-diff', 'references');
+    assert.ok(existsSync(join(refs, 'spa#01-home.png')), 'the sole ordinary base reference rendered');
+    const manifest = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    assert.deepEqual(
+      manifest.comps.spa.screens.filter((x) => x.skipped === 'empty-undriven').map((x) => x.id),
+      SPA_IDS.slice(1),
+      'every conditional screen skipped, none hard-errored',
+    );
+    const warnings = (s.err().match(/renders empty undriven — likely a runtime-conditional screen/g) ?? []).length;
+    assert.equal(warnings, 6, 'one warning per skipped screen');
+  });
+
+  test('a screen transitioning to driven-only prunes its stale base artifacts', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    // first import: every screen visible undriven — plain base references
+    const allVisible = makeFakeBrowser(() => makeFakePage({ measurement: DEFAULT_MEASUREMENT }));
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(allVisible), fetcher: goodFetcher, log: () => {} },
+    );
+    const refs = join(dir, '.visual-diff', 'references');
+    assert.ok(existsSync(join(refs, 'spa#02-sessions.png')));
+
+    // the comp now renders 02-sessions empty undriven; a compDrive state maps
+    // it — --refresh re-renders and the old base artifacts must go
+    const config = JSON.parse(readFileSync(join(dir, '.visual-diff', 'visual-diff.json'), 'utf8'));
+    config.states = {
+      'sessions-open': {
+        route: { url: 'http://127.0.0.1:5999/preview.html' },
+        comp: 'spa#02-sessions',
+        compDrive: [{ click: '.nav-sessions' }],
+        readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+        threshold: 1,
+      },
+    };
+    writeFileSync(join(dir, '.visual-diff', 'visual-diff.json'), JSON.stringify(config) + '\n');
+    await importZip(
+      { projectDir: dir, zipPath, refresh: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(spaBrowser()), fetcher: goodFetcher, log: () => {} },
+    );
+    assert.ok(!existsSync(join(refs, 'spa#02-sessions.png')), 'stale base PNG pruned');
+    assert.ok(!existsSync(join(refs, 'spa#02-sessions.provenance.json')), 'stale base provenance pruned');
+    assert.ok(existsSync(join(refs, 'spa#02-sessions@sessions-open.png')), 'driven reference in its place');
+    assert.ok(!existsSync(join(refs, 'spa#03-library.png')), 'a screen transitioning to skipped is pruned too');
   });
 });
 

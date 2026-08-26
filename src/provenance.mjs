@@ -256,6 +256,60 @@ function validateServeInput(v, what, fail) {
   return { root, sha256: v.sha256 };
 }
 
+// Informational delivered-frame evidence (FR-38): the CSS-pixel rect the
+// render asked the browser to frame. Recorded, never gated —
+// incompatibleFields never reads it.
+function validateFrameInput(v, what, fail) {
+  if (v === undefined) return undefined;
+  if (!isPlainObject(v)) fail(`${what} must be an object { x, y, width, height }`);
+  for (const key of ['x', 'y', 'width', 'height']) {
+    if (typeof v[key] !== 'number' || !Number.isFinite(v[key])) fail(`${what}.${key} must be a finite number`);
+  }
+  return { x: v.x, y: v.y, width: v.width, height: v.height };
+}
+
+// Informational delivered-frame evidence (FR-38): the device-pixel dimensions
+// the renderer actually delivered. Recorded, never gated — incompatibleFields
+// never reads it.
+function validateDeliveredInput(v, what, fail) {
+  if (v === undefined) return undefined;
+  if (!isPlainObject(v)) fail(`${what} must be an object { width, height }`);
+  if (!Number.isInteger(v.width) || v.width < 1) fail(`${what}.width must be a positive integer`);
+  if (!Number.isInteger(v.height) || v.height < 1) fail(`${what}.height must be a positive integer`);
+  return { width: v.width, height: v.height };
+}
+
+// Informational FR-38 canvas accommodation evidence: the viewport the render
+// grew to so the document canvas contains the frame/clip (declared
+// inputs.viewport is unchanged). Recorded, never gated — the GATED effective
+// condition is inputs.effectiveViewport below; canvasGrown is the audit
+// evidence that a grow happened at all.
+function validateCanvasGrownInput(v, what, fail) {
+  if (v === undefined) return undefined;
+  if (!isPlainObject(v)) fail(`${what} must be an object { width, height }`);
+  if (!Number.isInteger(v.width) || v.width < 1) fail(`${what}.width must be a positive integer`);
+  if (!Number.isInteger(v.height) || v.height < 1) fail(`${what}.height must be a positive integer`);
+  return { width: v.width, height: v.height };
+}
+
+// GATED FR-38/FR-23 effective render condition: the viewport the render
+// ACTUALLY shot under — equal to the declared inputs.viewport when no canvas
+// grow happened, the grown size otherwise. The frame-identity re-measure
+// proves frame GEOMETRY only: a fixed-rect frame can still change internal
+// pixels under a taller viewport (viewport units, height media queries,
+// resize JS), so comparability requires effective-condition equality —
+// incompatibleFields gates on this field. Optional in the schema: a legacy
+// record written before the field existed rendered exactly at its declared
+// viewport (no grow path existed), so the gate reads a missing field as the
+// declared viewport.
+function validateEffectiveViewportInput(v, what, fail) {
+  if (v === undefined) return undefined;
+  if (!isPlainObject(v)) fail(`${what} must be an object { width, height }`);
+  if (!Number.isInteger(v.width) || v.width < 1) fail(`${what}.width must be a positive integer`);
+  if (!Number.isInteger(v.height) || v.height < 1) fail(`${what}.height must be a positive integer`);
+  return { width: v.width, height: v.height };
+}
+
 // sha256 hex of bytes or a utf8 string (node:crypto — no runtime deps).
 export function sha256Hex(input) {
   return createHash('sha256').update(input).digest('hex');
@@ -306,6 +360,14 @@ export function createRecord({ kind, artifactPath, artifactBytes, renderer, inpu
       ...(inputs.compAuthoredMasks !== undefined ? { compAuthoredMasks: inputs.compAuthoredMasks } : {}),
       ...(inputs.selfCheck !== undefined ? { selfCheck: inputs.selfCheck } : {}),
       ...(inputs.serve !== undefined ? { serve: inputs.serve } : {}),
+      // Delivered-frame evidence (FR-38): informational pass-through — the
+      // FR-23 gate (incompatibleFields) never reads any of the three.
+      ...(inputs.frame !== undefined ? { frame: inputs.frame } : {}),
+      ...(inputs.clipFrame !== undefined ? { clipFrame: inputs.clipFrame } : {}),
+      ...(inputs.delivered !== undefined ? { delivered: inputs.delivered } : {}),
+      ...(inputs.canvasGrown !== undefined ? { canvasGrown: inputs.canvasGrown } : {}),
+      // GATED (FR-38/FR-23): the effective viewport the render shot under.
+      ...(inputs.effectiveViewport !== undefined ? { effectiveViewport: inputs.effectiveViewport } : {}),
     },
   };
   return validateRecord(raw, failArgument);
@@ -411,6 +473,11 @@ function validateRecord(obj, fail) {
   const cleanCompAuthoredMasks = validateCompAuthoredMasksInput(i.compAuthoredMasks, 'inputs.compAuthoredMasks', fail);
   const cleanSelfCheck = validateSelfCheckInput(i.selfCheck, 'inputs.selfCheck', fail);
   const cleanServe = validateServeInput(i.serve, 'inputs.serve', fail);
+  const cleanFrame = validateFrameInput(i.frame, 'inputs.frame', fail);
+  const cleanClipFrame = validateFrameInput(i.clipFrame, 'inputs.clipFrame', fail);
+  const cleanDelivered = validateDeliveredInput(i.delivered, 'inputs.delivered', fail);
+  const cleanCanvasGrown = validateCanvasGrownInput(i.canvasGrown, 'inputs.canvasGrown', fail);
+  const cleanEffectiveViewport = validateEffectiveViewportInput(i.effectiveViewport, 'inputs.effectiveViewport', fail);
 
   return {
     schema: PROVENANCE_SCHEMA_VERSION,
@@ -429,6 +496,11 @@ function validateRecord(obj, fail) {
       ...(cleanCompAuthoredMasks !== undefined ? { compAuthoredMasks: cleanCompAuthoredMasks } : {}),
       ...(cleanSelfCheck !== undefined ? { selfCheck: cleanSelfCheck } : {}),
       ...(cleanServe !== undefined ? { serve: cleanServe } : {}),
+      ...(cleanFrame !== undefined ? { frame: cleanFrame } : {}),
+      ...(cleanClipFrame !== undefined ? { clipFrame: cleanClipFrame } : {}),
+      ...(cleanDelivered !== undefined ? { delivered: cleanDelivered } : {}),
+      ...(cleanCanvasGrown !== undefined ? { canvasGrown: cleanCanvasGrown } : {}),
+      ...(cleanEffectiveViewport !== undefined ? { effectiveViewport: cleanEffectiveViewport } : {}),
     },
   };
 }
@@ -528,6 +600,35 @@ export function incompatibleFields(reference, capture, { clipped = false } = {})
     if (rI.viewport.width !== cI.viewport.width) diffs.push('inputs.viewport.width');
     if (rI.viewport.height !== cI.viewport.height) diffs.push('inputs.viewport.height');
     if (rI.viewport.fullPage !== cI.viewport.fullPage) diffs.push('inputs.viewport.fullPage');
+    // FR-38: the EFFECTIVE viewport — the size the render actually shot
+    // under after any canvas accommodation — is gated alongside the declared
+    // one. The grow's frame-identity re-measure proves frame GEOMETRY only;
+    // a fixed-rect frame can still change internal pixels under a taller
+    // viewport (viewport units, height media queries, resize JS), and both
+    // passes of a double render see the same post-grow pixels — so a grown
+    // reference is only comparable to a capture that rendered under the
+    // identical effective viewport. Migration rule: a legacy record without
+    // the field predates the grow mechanism entirely and therefore rendered
+    // exactly at its declared viewport — a missing field reads as the
+    // declared viewport, never as a silent pass. Clipped states keep the
+    // viewport exemption above for the same documented reason (the two sides
+    // legitimately render different pages); FR-38 names the residual.
+    // Checked only when the DECLARED viewports agree (width, height, AND
+    // fullPage): a declared mismatch is already reported above, and
+    // re-reporting it through the fallback would blame the grow mechanism
+    // for a plain config mismatch.
+    if (rI.viewport.width === cI.viewport.width
+      && rI.viewport.height === cI.viewport.height
+      && rI.viewport.fullPage === cI.viewport.fullPage) {
+      const rEff = rI.effectiveViewport ?? { width: rI.viewport.width, height: rI.viewport.height };
+      const cEff = cI.effectiveViewport ?? { width: cI.viewport.width, height: cI.viewport.height };
+      if (rEff.width !== cEff.width || rEff.height !== cEff.height) {
+        diffs.push(
+          `inputs.effectiveViewport (reference rendered under ${rEff.width}x${rEff.height}, capture under ` +
+            `${cEff.width}x${cEff.height} — a grown canvas changes the effective render conditions, FR-38)`,
+        );
+      }
+    }
   }
   if (rI.deviceScaleFactor !== cI.deviceScaleFactor) diffs.push('inputs.deviceScaleFactor');
   if (rI.readiness.policy !== cI.readiness.policy) diffs.push('inputs.readiness.policy');

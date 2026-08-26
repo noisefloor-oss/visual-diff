@@ -62,6 +62,32 @@ noise visual-diff import --auto-discover-browser design-export.zip
 noise visual-diff import --refresh design-export.zip
 ```
 
+### Multi-screen SPA exports (runtime-conditional screens)
+
+A real multi-screen SPA export is often **one app shell**: every
+`data-screen-label` screen sits under a runtime conditional (`sc-if`), and
+only the default screen (the one whose condition holds undriven) renders at
+a visible size — the other screens exist only after an interaction. Import
+handles this without modifying the export:
+
+- The **first import** renders the visible screen's reference, **skips**
+  each screen that renders empty undriven with a logged warning, and records
+  it in the manifest as `{ "skipped": "empty-undriven" }` (no artifacts).
+  The import succeeds as long as at least one screen produced a reference;
+  every screen empty is a hard error.
+- To reference a conditional screen, map it with a state that declares
+  `compDrive` steps driving the comp into it (open the menu, click the tab),
+  then `import --refresh`. The screen becomes **driven-only**: no base
+  reference — the driven `@state` reference is the reference, its manifest
+  entry records `drivenOnly: true`, and its noise floor is measured from the
+  driven double render. Compare resolves it only through `compDrive` states;
+  mapping it without `compDrive` fails with the remedy named.
+
+Concretely, for an export with one visible screen and six conditional ones:
+import once (one reference, six warnings), read the manifest for the screen
+ids, author one `compDrive` state per conditional screen you intend to
+verify, and `import --refresh`.
+
 ### The hill-climb round (repeat until compare exits 0)
 
 ```sh
@@ -106,7 +132,9 @@ exit $code   # 0 = converged, 1 = keep climbing, 3 = STOP (gate)
 |---|---|---|
 | 1 | over threshold | normal loop iteration — parse `states.<name>.frame.mismatch`, look at `diffs/<run>/<state>.png`, fix the implementation, re-capture |
 | 2 | usage | bad flags or broken config — read stderr, fix, re-run; never retried blindly |
-| 3 (compare) | provenance gate | read the named fields in stderr. Almost always: config written/edited after import without `--refresh` → run `import --refresh`. Otherwise: renderer mismatch (imported and captured under different browsers/modes) → redo both in the same mode |
+| 3 (compare) | provenance gate | read the named fields in stderr. Almost always: config written/edited after import without `--refresh` → run `import --refresh`. Otherwise: renderer mismatch (imported and captured under different browsers/modes) → redo both in the same mode; or `inputs.effectiveViewport` (the reference's canvas was grown to fit its frame, FR-38, and the capture rendered under different effective conditions) → make both sides render under matching conditions (typically: let the implementation's document scroll, or clip the state so its element frames identically) |
+| 3 (frame-truncated) | screenshot clip clamped | the browser clamped the requested frame to the document scroll box, so the delivered PNG is short. The tool now grows the canvas automatically for the common inner-scroll case (`html,body` at `height:100%` with an `overflow:auto` region), so this is a residual failure: the grow could not bring the frame inside the document canvas. Let the document itself scroll, or size the scroll container to its content, then re-import / re-capture. Stderr (and provenance `inputs.frame`/`inputs.clipFrame` + `inputs.delivered`) carries both the requested and delivered dimensions (see FR-38, [docs/DESIGN.md](docs/DESIGN.md)) |
+| 3 (frame-unstable) | comp reflows under the grown canvas | the frame extended past the document canvas, the tool grew the viewport to fit it, and the re-measured frame changed — the comp/page reflows responsively with viewport size, so extending the canvas would change the very pixels being compared. Fix the comp/page to a static frame (fixed dimensions independent of viewport), or let the document itself scroll instead of an inner container, then re-import / re-capture. Stderr names both measured rects (see FR-38, [docs/DESIGN.md](docs/DESIGN.md)) |
 | 3 (browser) | no working browser | native: no pin yet → run any import/capture once with `--auto-discover-browser`; stale pin (binary moved/upgraded) → re-run with `--auto-discover-browser` to re-pin. If every ladder rung fails, read the probe report on stderr and run the printed fix command. On a service host, check `NOISE_BROWSER_WS` is set and the browser service is up — it never falls back silently |
 | 4 | capture nondeterministic | discard and re-capture from a fresh context — transient load can cause this. If the SAME state fails repeatedly when the host is quiet, the page itself is nondeterministic: freeze clocks/animations, await webfonts, raise `readiness.settle` |
 
@@ -125,7 +153,8 @@ exit $code   # 0 = converged, 1 = keep climbing, 3 = STOP (gate)
   PR reviewer actually wants to see.
 - **A pass is only meaningful through the gate.** Exit 0 means the pixels
   matched AND the reference/capture were provably rendered under the same
-  browser, viewport, DPR, readiness, fonts, and config. If you find yourself
+  browser, DPR, readiness policy, vendored dependencies, and config (plus
+  viewport, for unclipped states). If you find yourself
   wanting to bypass the gate, the correct move is `import --refresh`, never
   an edit to `.provenance.json`.
 
@@ -330,8 +359,12 @@ fraction), and a run-level `diff` summary
   (`.visual-diff/references/manifest.json`). States without `comp` are
   capture-only.
 - The provenance gate (exit 3) requires reference and capture to agree on
-  viewport, device scale factor, readiness, fonts, vendor hashes, and the
-  config hash. This is what makes a "pass" mean "same renderer, same
+  renderer identity (browser build, client version, mode, backend), device
+  scale factor, readiness policy/timeout/settle, vendor hashes, and the
+  per-state config hash; viewport (width/height/fullPage) is gated for
+  unclipped states only — a clipped state frames one element, and its output
+  dimensions are checked by the pixel path instead. Fonts are recorded in
+  provenance for diagnosis but are not gated. This is what makes a "pass" mean "same renderer, same
   conditions" rather than a coincidence. Keep the state viewport at the
   reference default (1502×818, fullPage, DSF 2). The config hash is compared
   **per state**: every record carries `inputs.stateConfigHash`, the
@@ -469,17 +502,30 @@ show implemented-vs-reference visually, round by round.
 
 ## Running it
 
-**From a release artifact** (recommended): download the single-file
-`noise-visual-diff` executable from the GitHub release, verify it against
-the `SHA256SUMS` file attached to the same release, mark it executable, and
-run it directly — it bundles Node and every npm dependency (a browser is
-still required; see Dependencies below).
+**From a release artifact**: download the single-file executable for your
+platform from the GitHub release (assets are named
+`noise-visual-diff-<platform>-<arch>`; releases ship **linux-x64**,
+**darwin-arm64**, and **darwin-x64**, built from the tagged source by the
+public release workflow — `.github/workflows/release.yml`). An honest
+caveat: only linux-x64 is exercised by the full test suite; the macOS
+binaries are smoke-tested (version/help plus a best-effort worked-example
+run) at build time. Windows binaries are **not shipped** (untested);
+building from a checkout may work there, but is unverified. Verify your
+download against the release's `SHA256SUMS`, mark it executable, and run
+it directly — it bundles Node and every npm dependency (a browser is still
+required; see Dependencies below).
 
 ```sh
-sha256sum -c SHA256SUMS          # verify the download
+sha256sum -c SHA256SUMS                          # verify the download
+mv noise-visual-diff-linux-x64 noise-visual-diff # take the local name
 chmod +x noise-visual-diff
 ./noise-visual-diff help
 ```
+
+On macOS, download via the terminal (`curl -LO` or `gh release download`) so
+no Gatekeeper quarantine attribute is set; if you downloaded through a
+browser instead, `xattr -d com.apple.quarantine noise-visual-diff-darwin-<arch>`
+is the remedy (the binaries are ad-hoc signed, not notarized).
 
 **From a checkout:**
 
@@ -492,7 +538,7 @@ node src/cli.mjs <verb> ...
 npm run build:sea
 
 # suite version (deployment gates compare this verbatim)
-noise visual-diff version    # -> noise-visual-diff 0.8.1
+noise visual-diff version    # -> noise-visual-diff 0.9.0
 ```
 
 **Uninstall / data retention:** the tool writes `.visual-diff/` inside the

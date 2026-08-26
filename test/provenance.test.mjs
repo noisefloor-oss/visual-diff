@@ -560,3 +560,127 @@ test('inputs.masks and inputs.selfCheck are informational: never part of the FR-
   const checked = makeRecord({ inputs: { ...INPUTS, selfCheck: { maxDiffPixels: 64, differingPixels: 12 } } });
   assert.deepEqual(incompatibleFields(a, checked), [], 'inputs.selfCheck is recorded, never gated');
 });
+
+test('inputs.frame / inputs.clipFrame / inputs.delivered: FR-38 evidence round-trips; malformed entries rejected', async () => {
+  await withProject(async (proj) => {
+    const frame = { x: 10, y: 20, width: 393, height: 852 };
+    const clipFrame = { x: 100, y: 200, width: 300, height: 600 };
+    const delivered = { width: 786, height: 1704 };
+    const record = makeRecord({ inputs: { ...INPUTS, frame, delivered } });
+    assert.deepEqual(record.inputs.frame, frame);
+    assert.deepEqual(record.inputs.delivered, delivered);
+    const capture = makeRecord({ inputs: { ...INPUTS, clipFrame, delivered: { width: 600, height: 1200 } } });
+    assert.deepEqual(capture.inputs.clipFrame, clipFrame);
+    const recordPath = join(proj, 'records', 'f.provenance.json');
+    await writeRecord(recordPath, record);
+    assert.deepEqual(await readRecord(recordPath), record);
+
+    const bad = (inputs) => assert.throws(
+      () => makeRecord({ inputs: { ...INPUTS, ...inputs } }),
+      (err) => err instanceof ProvenanceError && err.code === 'PROVENANCE_ARGUMENT',
+    );
+    bad({ frame: 'nope' });
+    bad({ frame: { x: 0, y: 0, width: Infinity, height: 1 } });
+    bad({ clipFrame: { x: 0, y: 0, width: 1 } });
+    bad({ delivered: { width: 0, height: 10 } });
+    bad({ delivered: { width: 1.5, height: 10 } });
+    assert.equal(makeRecord().inputs.frame, undefined, 'absent stays absent');
+    assert.equal(makeRecord().inputs.delivered, undefined, 'absent stays absent');
+  });
+});
+
+test('inputs.frame / inputs.clipFrame / inputs.delivered are informational: never part of the FR-23 gate', () => {
+  const a = makeRecord();
+  const framed = makeRecord({ inputs: { ...INPUTS, frame: { x: 10, y: 20, width: 393, height: 852 }, delivered: { width: 786, height: 1704 } } });
+  assert.deepEqual(incompatibleFields(a, framed), [], 'a record pair differing only in FR-38 evidence passes FR-23');
+  const clipped = makeRecord({ inputs: { ...INPUTS, clipFrame: { x: 1, y: 2, width: 3, height: 4 }, delivered: { width: 6, height: 8 } } });
+  assert.deepEqual(incompatibleFields(framed, clipped), [], 'different evidence is still informational');
+});
+
+test('inputs.canvasGrown: FR-38 accommodation round-trips; malformed entries rejected', async () => {
+  await withProject(async (proj) => {
+    const canvasGrown = { width: 1502, height: 872 };
+    const record = makeRecord({ inputs: { ...INPUTS, canvasGrown } });
+    assert.deepEqual(record.inputs.canvasGrown, canvasGrown);
+    const recordPath = join(proj, 'records', 'g.provenance.json');
+    await writeRecord(recordPath, record);
+    assert.deepEqual(await readRecord(recordPath), record);
+
+    const bad = (inputs) => assert.throws(
+      () => makeRecord({ inputs: { ...INPUTS, ...inputs } }),
+      (err) => err instanceof ProvenanceError && err.code === 'PROVENANCE_ARGUMENT',
+    );
+    bad({ canvasGrown: 'nope' });
+    bad({ canvasGrown: { width: 0, height: 10 } });
+    bad({ canvasGrown: { width: 1.5, height: 10 } });
+    bad({ canvasGrown: { width: 1502 } });
+    assert.equal(makeRecord().inputs.canvasGrown, undefined, 'absent stays absent');
+  });
+});
+
+test('inputs.canvasGrown is informational: never part of the FR-23 gate', () => {
+  const a = makeRecord();
+  const grown = makeRecord({ inputs: { ...INPUTS, canvasGrown: { width: 1502, height: 872 } } });
+  assert.deepEqual(incompatibleFields(a, grown), [], 'a record pair differing only in inputs.canvasGrown passes FR-23');
+  const other = makeRecord({ inputs: { ...INPUTS, canvasGrown: { width: 2000, height: 3000 } } });
+  assert.deepEqual(incompatibleFields(grown, other), [], 'a different grown viewport is still informational');
+});
+
+test('inputs.effectiveViewport: round-trips; malformed entries rejected', async () => {
+  await withProject(async (proj) => {
+    const effectiveViewport = { width: 1502, height: 872 };
+    const record = makeRecord({ inputs: { ...INPUTS, effectiveViewport } });
+    assert.deepEqual(record.inputs.effectiveViewport, effectiveViewport);
+    const recordPath = join(proj, 'records', 'ev.provenance.json');
+    await writeRecord(recordPath, record);
+    assert.deepEqual(await readRecord(recordPath), record);
+
+    const bad = (inputs) => assert.throws(
+      () => makeRecord({ inputs: { ...INPUTS, ...inputs } }),
+      (err) => err instanceof ProvenanceError && err.code === 'PROVENANCE_ARGUMENT',
+    );
+    bad({ effectiveViewport: 'nope' });
+    bad({ effectiveViewport: { width: 0, height: 10 } });
+    bad({ effectiveViewport: { width: 1.5, height: 10 } });
+    bad({ effectiveViewport: { width: 1502 } });
+    assert.equal(makeRecord().inputs.effectiveViewport, undefined, 'legacy records carry no field');
+  });
+});
+
+test('inputs.effectiveViewport is GATED (FR-38/FR-23), with the legacy migration rule', () => {
+  const legacy = makeRecord(); // no effectiveViewport: predates the grow mechanism
+  // Legacy rule: a missing field reads as the declared viewport — a legacy
+  // record against a new ungrown record (field equal to declared) passes.
+  const declaredEff = makeRecord({ inputs: { ...INPUTS, effectiveViewport: { width: 1502, height: 818 } } });
+  assert.deepEqual(incompatibleFields(legacy, declaredEff), [], 'legacy record reads as its declared viewport');
+  assert.deepEqual(incompatibleFields(declaredEff, legacy), [], 'symmetric');
+  // A grown record against an ungrown/legacy one fails the gate with a
+  // diagnostic naming both effective sizes — the grown-vs-ungrown false
+  // agreement becomes a loud provenance failure.
+  const grownEff = makeRecord({ inputs: { ...INPUTS, canvasGrown: { width: 1502, height: 872 }, effectiveViewport: { width: 1502, height: 872 } } });
+  const diffs = incompatibleFields(grownEff, legacy);
+  assert.equal(diffs.length, 1);
+  assert.match(diffs[0], /^inputs\.effectiveViewport /);
+  assert.match(diffs[0], /reference rendered under 1502x872, capture under 1502x818/);
+  assert.match(diffs[0], /FR-38/);
+  // Two records grown to the SAME effective viewport are comparable.
+  const grownEff2 = makeRecord({ inputs: { ...INPUTS, effectiveViewport: { width: 1502, height: 872 } } });
+  assert.deepEqual(incompatibleFields(grownEff, grownEff2), [], 'identical effective conditions pass');
+  // Clipped states keep the documented viewport exemption (the two sides
+  // legitimately render different pages; FR-38 names the residual).
+  assert.deepEqual(incompatibleFields(grownEff, legacy, { clipped: true }), [], 'clipped keeps the exemption');
+});
+
+test('a declared viewport mismatch plus a grow reports ONE incompatibility, never double-blame', () => {
+  // The effective-viewport check runs only when the DECLARED viewports agree
+  // on width, height, AND fullPage — a declared mismatch is already reported
+  // as its own field, and re-reporting it through the effective fallback
+  // would blame the grow mechanism for a plain config mismatch.
+  const grownRef = makeRecord({
+    inputs: { ...INPUTS, canvasGrown: { width: 1502, height: 872 }, effectiveViewport: { width: 1502, height: 872 } },
+  });
+  const fullPageCap = makeRecord({ inputs: { ...INPUTS, viewport: { ...INPUTS.viewport, fullPage: true } } });
+  assert.deepEqual(incompatibleFields(grownRef, fullPageCap), ['inputs.viewport.fullPage']);
+  const widthCap = makeRecord({ inputs: { ...INPUTS, viewport: { ...INPUTS.viewport, width: 800 } } });
+  assert.deepEqual(incompatibleFields(grownRef, widthCap), ['inputs.viewport.width']);
+});

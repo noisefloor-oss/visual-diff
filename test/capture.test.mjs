@@ -36,6 +36,7 @@ import {
   captureState,
   runCapture,
   newRunId,
+  CaptureError,
 } from '../src/capture.mjs';
 import { createRecord, hashFile, readRecord, writeRecord } from '../src/provenance.mjs';
 import { BrowserResolutionError } from '../src/browser.mjs';
@@ -68,6 +69,33 @@ function sink() {
   return fn;
 }
 
+// A deterministic header-valid PNG (signature + IHDR + IEND, no pixel data):
+// enough for the delivered-frame gate (FR-38) to read dimensions, and nothing
+// in this suite decodes capture buffers. Same inputs -> identical bytes, so
+// the FR-17 double-render byte-equality holds.
+function headerPng(w, h) {
+  const buf = Buffer.alloc(45);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0);
+  buf.writeUInt32BE(13, 8);
+  buf.write('IHDR', 12, 'ascii');
+  buf.writeUInt32BE(w, 16);
+  buf.writeUInt32BE(h, 20);
+  buf[24] = 8; // bit depth
+  buf[25] = 6; // color type RGBA
+  buf.writeUInt32BE(0, 33); // IEND length
+  buf.write('IEND', 37, 'ascii');
+  return buf;
+}
+
+// Clip-aware default screenshot: clipped states must deliver exactly the clip
+// at DPR 2 or the delivered-frame gate (FR-38) fails the run; unclipped
+// states are not gated and keep the historic opaque bytes.
+function defaultShot(opts) {
+  return opts && opts.clip !== undefined
+    ? headerPng(Math.round(opts.clip.width * 2), Math.round(opts.clip.height * 2))
+    : Buffer.from('fake-png');
+}
+
 // A scriptable fake page. goto/waitForLoadState may be injected; screenshot
 // returns the given Buffer; evaluate answers the two document.fonts queries the
 // capture stack makes (fonts.ready -> resolved; enumeration -> the fonts list).
@@ -75,7 +103,7 @@ function makeFakePage({
   gotoImpl,
   waitForLoadStateImpl,
   waitForSelectorImpl,
-  screenshotImpl = () => Buffer.from('fake-png'),
+  screenshotImpl = defaultShot,
   fonts = [],
   evaluateImpl,
   elements = {},
@@ -86,6 +114,7 @@ function makeFakePage({
     waitForLoadState: [],
     waitForSelector: [],
     waitForTimeout: [],
+    setViewportSize: [],
     screenshot: [],
     evaluate: [],
     $$: [],
@@ -118,6 +147,9 @@ function makeFakePage({
     async waitForTimeout(ms) {
       calls.waitForTimeout.push(ms);
     },
+    async setViewportSize(size) {
+      calls.setViewportSize.push(size);
+    },
     async $$(selector) {
       calls.$$.push(selector);
       return elements[selector] ?? [];
@@ -128,6 +160,9 @@ function makeFakePage({
       const src = String(fn);
       if (src.includes('document.fonts.ready')) return undefined;
       if (src.includes('document.fonts')) return fonts;
+      // the FR-38 canvas probe: default huge, so scenarios never grow
+      if (src.includes('scrollWidth')) return { width: 100000, height: 100000 };
+      if (src.includes('window.scrollX')) return { x: 0, y: 0 };
       return undefined;
     },
     async screenshot(opts) {
@@ -143,7 +178,7 @@ function makeFakePage({
 
 // A fake browser with fresh contexts per newContext (FR-15). `shot(ctxIndex)`
 // supplies the screenshot bytes for that context's page.
-function makeFakeBrowser({ shot = () => Buffer.from('fake-png'), fonts = [], gotoImpl, waitForLoadStateImpl, evaluateImpl, elements } = {}) {
+function makeFakeBrowser({ shot = (_idx, opts) => defaultShot(opts), fonts = [], gotoImpl, waitForLoadStateImpl, evaluateImpl, elements } = {}) {
   let count = 0;
   const contexts = [];
   const browser = {
@@ -151,7 +186,7 @@ function makeFakeBrowser({ shot = () => Buffer.from('fake-png'), fonts = [], got
     _closed: false,
     async newContext(opts) {
       const idx = count++;
-      const page = makeFakePage({ gotoImpl, waitForLoadStateImpl, screenshotImpl: () => shot(idx), fonts, evaluateImpl, elements });
+      const page = makeFakePage({ gotoImpl, waitForLoadStateImpl, screenshotImpl: (opts) => shot(idx, opts), fonts, evaluateImpl, elements });
       const ctx = {
         _idx: idx,
         _opts: opts,
@@ -655,6 +690,140 @@ describe('captureState', () => {
     assert.equal(rec.inputs.configHash, 'ab'.repeat(32));
   });
 
+  // A gotoImpl that drives the context-scope isolation handler renderPage
+  // installed with one simulated sub-resource request, so the FR-9 policy in
+  // render.mjs really classifies (and aborts) it.
+  function isolationRequestGoto(getCtx, { url, resourceType }) {
+    return async () => {
+      const ctx = getCtx();
+      const handler = ctx._routes[0].handler;
+      const calls = { abort: [], fulfill: [], continue: [] };
+      await handler(
+        {
+          _calls: calls,
+          async abort(code) { calls.abort.push(code); },
+          async fulfill(opts) { calls.fulfill.push(opts); },
+          async continue() { calls.continue.push(1); },
+        },
+        {
+          url: () => url,
+          resourceType: () => resourceType,
+          method: () => 'GET',
+          isNavigationRequest: () => false,
+          frame: () => ({}),
+        },
+      );
+    };
+  }
+
+  test('an aborted external FONT request fails the capture closed (render-defect)', async () => {
+    const dir = await project({ home: state });
+    const layout = layoutFor(dir);
+    const fontUrl = 'https://fonts.gstatic.invalid/s/inter/v13/inter.woff2';
+    let browser;
+    browser = makeFakeBrowser({
+      shot: () => Buffer.from('png-bytes-1'),
+      gotoImpl: isolationRequestGoto(() => browser._contexts[browser._contexts.length - 1], {
+        url: fontUrl,
+        resourceType: 'font',
+      }),
+    });
+    const renderer = provenanceRenderer(FAKE_BACKEND);
+    await assert.rejects(
+      captureState({
+        browser,
+        state,
+        stateName: 'home',
+        url: 'http://localhost:5173/',
+        projectDir: dir,
+        layout,
+        runId: 'r-000001',
+        configHash: 'ab'.repeat(32),
+        vendorDir: layout.vendorDir,
+        renderer,
+        log: sink(),
+      }),
+      (err) => {
+        assert.equal(err.name, 'CaptureError');
+        assert.equal(err.code, 'render-defect');
+        assert.match(err.message, /fonts\.gstatic\.invalid\/s\/inter\/v13\/inter\.woff2/);
+        return true;
+      },
+    );
+  });
+
+  test('a font aborted DURING page.screenshot still fails the capture closed (post-shot re-check)', async () => {
+    // Playwright's screenshot preparation waits on document.fonts.ready, so
+    // a font request can abort while the shot is in flight — after every
+    // pre-shot check. The capture must fail before the PNG is used.
+    const dir = await project({ home: state });
+    const layout = layoutFor(dir);
+    const fontUrl = 'https://fonts.gstatic.invalid/s/inter/v13/inter.woff2';
+    let browser;
+    const dispatchFontAbort = isolationRequestGoto(
+      () => browser._contexts[browser._contexts.length - 1],
+      { url: fontUrl, resourceType: 'font' },
+    );
+    browser = makeFakeBrowser({
+      shot: async () => {
+        await dispatchFontAbort();
+        return Buffer.from('png-bytes-1');
+      },
+    });
+    const renderer = provenanceRenderer(FAKE_BACKEND);
+    await assert.rejects(
+      captureState({
+        browser,
+        state,
+        stateName: 'home',
+        url: 'http://localhost:5173/',
+        projectDir: dir,
+        layout,
+        runId: 'r-000001',
+        configHash: 'ab'.repeat(32),
+        vendorDir: layout.vendorDir,
+        renderer,
+        log: sink(),
+      }),
+      (err) => {
+        assert.equal(err.name, 'CaptureError');
+        assert.equal(err.code, 'render-defect');
+        assert.match(err.message, /inter\.woff2/);
+        return true;
+      },
+    );
+  });
+
+  test('a non-font aborted external keeps the current logged-only capture behavior', async () => {
+    const dir = await project({ home: state });
+    const layout = layoutFor(dir);
+    let browser;
+    browser = makeFakeBrowser({
+      shot: () => Buffer.from('png-bytes-1'),
+      gotoImpl: isolationRequestGoto(() => browser._contexts[browser._contexts.length - 1], {
+        url: 'https://cdn.example.invalid/analytics.js',
+        resourceType: 'script',
+      }),
+    });
+    const renderer = provenanceRenderer(FAKE_BACKEND);
+    const out = await captureState({
+      browser,
+      state,
+      stateName: 'home',
+      url: 'http://localhost:5173/',
+      projectDir: dir,
+      layout,
+      runId: 'r-000001',
+      configHash: 'ab'.repeat(32),
+      vendorDir: layout.vendorDir,
+      renderer,
+      log: sink(),
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.isolation.aborted.length, 1);
+    assert.equal(out.isolation.aborted[0].resourceType, 'script');
+  });
+
   // Capture-time fixture injection (config `capture` block) — the
   // flags ride the init stylesheet AND are re-asserted right before the
   // screenshot, so a bootstrap that strips init style nodes cannot re-enable
@@ -1047,10 +1216,11 @@ describe('runCapture', () => {
 // is the name -> selector map) plus the two document.fonts queries the
 // capture stack makes. `probes` maps mask name -> probe result; `scroll` is
 // the answer to the window.scrollX/scrollY query (document scroll offset).
-function probeAnswering(probes, scroll = { x: 0, y: 0 }) {
+function probeAnswering(probes, scroll = { x: 0, y: 0 }, canvas = { width: 100000, height: 100000 }) {
   return (fn, arg) => {
     const src = String(fn);
     if (src.includes('querySelectorAll')) return typeof probes === 'function' ? probes(arg) : probes;
+    if (src.includes('scrollWidth')) return typeof canvas === 'function' ? canvas() : canvas;
     if (src.includes('window.scrollX')) return scroll;
     if (src.includes('document.fonts.ready')) return undefined;
     if (src.includes('document.fonts')) return [];
@@ -1164,7 +1334,7 @@ describe('anchored masks at capture time (FR-36)', () => {
       radii: { tl: { rx: 0, ry: 0 }, tr: { rx: 0, ry: 0 }, br: { rx: 0, ry: 0 }, bl: { rx: 0, ry: 0 } },
       border: { top: 0, right: 0, bottom: 0, left: 0 },
     };
-    const browser = makeFakeBrowser({ shot: () => Buffer.from('png'), evaluateImpl: probeAnswering({ bezel: probe }), elements });
+    const browser = makeFakeBrowser({ evaluateImpl: probeAnswering({ bezel: probe }), elements }); // default clip-aware shot: the gate (FR-38) requires the clip at DPR 2
     const s = mockStreams();
     const r = await runCapture(
       { projectDir: dir, values: {} },
@@ -1180,6 +1350,11 @@ describe('anchored masks at capture time (FR-36)', () => {
     });
     // the screenshot really was clipped to the element's box
     assert.deepEqual(browser._contexts[0]._page._calls.screenshot[0].clip, clipBox);
+    // FR-38 delivered-frame evidence: the record carries the clip rect the
+    // capture framed and the device-pixel dimensions the renderer delivered
+    // (informational — the FR-23 gate never reads either).
+    assert.deepEqual(rec.inputs.clipFrame, clipBox);
+    assert.deepEqual(rec.inputs.delivered, { width: 600, height: 1200 });
   });
 
   test('a scrolled clipped state normalizes clip and probe into document coordinates', async () => {
@@ -1208,7 +1383,7 @@ describe('anchored masks at capture time (FR-36)', () => {
       radii: { tl: { rx: 0, ry: 0 }, tr: { rx: 0, ry: 0 }, br: { rx: 0, ry: 0 }, bl: { rx: 0, ry: 0 } },
       border: { top: 0, right: 0, bottom: 0, left: 0 },
     };
-    const browser = makeFakeBrowser({ shot: () => Buffer.from('png'), evaluateImpl: probeAnswering({ bezel: probe }, scroll), elements });
+    const browser = makeFakeBrowser({ evaluateImpl: probeAnswering({ bezel: probe }, scroll), elements }); // default clip-aware shot (FR-38)
     const s = mockStreams();
     const r = await runCapture(
       { projectDir: dir, values: {} },
@@ -1229,6 +1404,290 @@ describe('anchored masks at capture time (FR-36)', () => {
       // (110-105)*2, (240-207)*2 — document clip origin, not the raw viewport box
       region: { x: 10, y: 66, width: 100, height: 60 },
     });
+  });
+});
+
+// ===========================================================================
+// Delivered-frame gate (FR-38): a clip clamped by the document scroll box
+// must fail loud, never silently exempt the clipped-away region.
+// ===========================================================================
+
+describe('delivered-frame gate (FR-38)', () => {
+  const clippedState = {
+    ...BASE_STATE,
+    viewport: { width: 1502, height: 818, fullPage: false },
+    clip: '[data-phone]',
+  };
+  const clipBox = { x: 100, y: 200, width: 300, height: 600 };
+  const elements = { '[data-phone]': [{ boundingBox: async () => clipBox }] };
+
+  test('a clipped capture whose delivered PNG is short of the clip frame fails the run (exit 3)', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: { ...BASE_STATE, clip: '[data-phone]' } } });
+    // Chromium's clamp simulated: the PNG is shorter than clip x DPR requires.
+    const browser = makeFakeBrowser({ shot: () => headerPng(600, 900), evaluateImpl: probeAnswering({}), elements });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-truncated', log: sink() },
+    );
+    assert.equal(r.code, EXIT.TRUST);
+    assert.equal(s.out(), '');
+    assert.match(s.err(), /delivered 600x900 device px but the clip rect requires 600x1200/);
+    assert.match(s.err(), /clamped to the document scroll box/);
+    assert.match(s.err(), /Let the document itself scroll, or size the scroll container to its content/);
+    // fail loud means no artifact for the truncated state
+    await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-truncated', 'home.png')), /ENOENT/);
+  });
+
+  test('captureState surfaces the truncation as a CaptureError named frame-truncated', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    const layout = layoutFor(dir);
+    const browser = makeFakeBrowser({ shot: () => headerPng(600, 900), evaluateImpl: probeAnswering({}), elements });
+    await assert.rejects(
+      captureState({
+        browser,
+        state: clippedState,
+        stateName: 'home',
+        url: 'http://localhost:5173/',
+        projectDir: dir,
+        layout,
+        runId: 'r-000001',
+        configHash: 'ab'.repeat(32),
+        vendorDir: layout.vendorDir,
+        renderer: provenanceRenderer(FAKE_BACKEND),
+        log: sink(),
+      }),
+      (err) => {
+        assert.ok(err instanceof CaptureError);
+        assert.equal(err.code, 'frame-truncated');
+        assert.equal(err.exitCode, EXIT.TRUST);
+        assert.match(err.message, /delivered 600x900 device px but the clip rect requires 600x1200/);
+        return true;
+      },
+    );
+  });
+
+  test('an undecodable clipped delivery is the same trust failure', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: { ...BASE_STATE, clip: '[data-phone]' } } });
+    const browser = makeFakeBrowser({ shot: () => Buffer.from('not-a-png'), evaluateImpl: probeAnswering({}), elements });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-undecodable', log: sink() },
+    );
+    assert.equal(r.code, EXIT.TRUST);
+    assert.match(s.err(), /delivered an undecodable buffer but the clip rect requires 600x1200/);
+  });
+
+  test('an unclipped capture is not gated and records no clipFrame', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: BASE_STATE } });
+    const browser = makeFakeBrowser({ shot: () => Buffer.from('short-but-unclipped') });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-unclipped', log: sink() },
+    );
+    assert.equal(r.code, EXIT.OK, s.err());
+    const rec = await readRecord(join(dir, '.visual-diff', 'captures', 'r-unclipped', 'home.provenance.json'));
+    assert.equal(rec.inputs.clipFrame, undefined);
+    assert.equal(rec.inputs.delivered, undefined, 'an undecodable unclipped buffer records no delivered dims');
+  });
+});
+
+// ===========================================================================
+// Canvas accommodation (FR-38): a clipped state whose element extends past
+// the document canvas (inner-scroll app shell) grows the viewport to contain
+// the clip, guarded by a clip-box identity re-probe.
+// ===========================================================================
+
+describe('canvas accommodation (FR-38)', () => {
+  const clippedState = {
+    ...BASE_STATE,
+    viewport: { width: 1502, height: 818, fullPage: false },
+    clip: '[data-phone]',
+  };
+  // clip bottom edge 200+700=900 exceeds the shell's 1502x818 document canvas
+  const clipBox = { x: 100, y: 200, width: 300, height: 700 };
+  const SHELL_CANVAS = { width: 1502, height: 818 };
+  const GROWN = { width: 1502, height: 900 };
+
+  test('inner-scroll happy path: grow, re-probe identical, full clip delivered, canvasGrown recorded', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    const elements = { '[data-phone]': [{ boundingBox: async () => ({ ...clipBox }) }] };
+    const browser = makeFakeBrowser({ evaluateImpl: probeAnswering({}, { x: 0, y: 0 }, SHELL_CANVAS), elements });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-grown', log: sink() },
+    );
+    assert.equal(r.code, EXIT.OK, s.err());
+    const rec = await readRecord(join(dir, '.visual-diff', 'captures', 'r-grown', 'home.provenance.json'));
+    // Height-only overflow: the width axis keeps its declared 1502; the
+    // GATED effective viewport carries the size actually shot under.
+    assert.deepEqual(rec.inputs.canvasGrown, GROWN);
+    assert.deepEqual(rec.inputs.effectiveViewport, GROWN);
+    // the DECLARED viewport is unchanged: the grow is a mechanical canvas
+    // accommodation, not a change of the FR-23 render conditions
+    assert.deepEqual(rec.inputs.viewport, clippedState.viewport);
+    assert.deepEqual(rec.inputs.clipFrame, clipBox);
+    assert.deepEqual(rec.inputs.delivered, { width: 600, height: 1400 });
+    // FR-17: primary AND verification re-capture each grew their own fresh
+    // context — no state leaks between the passes.
+    assert.equal(browser._contexts.length, 2);
+    for (const ctx of browser._contexts) {
+      assert.deepEqual(ctx._page._calls.setViewportSize, [GROWN]);
+    }
+  });
+
+  test('reflow guard: a clip box that shifts under the grown viewport is a CaptureError frame-unstable, no artifact', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    const layout = layoutFor(dir);
+    // The element reflows: the re-probe after the grow reports a taller box.
+    let probes = 0;
+    const elements = {
+      '[data-phone]': [{
+        boundingBox: async () => (probes++ === 0 ? { ...clipBox } : { x: 100, y: 200, width: 300, height: 780 }),
+      }],
+    };
+    const browser = makeFakeBrowser({ evaluateImpl: probeAnswering({}, { x: 0, y: 0 }, SHELL_CANVAS), elements });
+    await assert.rejects(
+      captureState({
+        browser,
+        state: clippedState,
+        stateName: 'home',
+        url: 'http://localhost:5173/',
+        projectDir: dir,
+        layout,
+        runId: 'r-unstable',
+        configHash: 'ab'.repeat(32),
+        vendorDir: layout.vendorDir,
+        renderer: provenanceRenderer(FAKE_BACKEND),
+        log: sink(),
+      }),
+      (err) => {
+        assert.ok(err instanceof CaptureError);
+        assert.equal(err.code, 'frame-unstable');
+        assert.equal(err.exitCode, EXIT.TRUST);
+        assert.match(err.message, /framed \{x:100,y:200,w:300,h:700\} at the declared viewport/);
+        assert.match(err.message, /measured \{x:100,y:200,w:300,h:780\}/);
+        assert.match(err.message, /grown to 1502x900/);
+        assert.match(err.message, /reflows responsively/);
+        return true;
+      },
+    );
+    // fail loud means nothing shot and no artifact staged
+    assert.equal(browser._contexts[0]._page._calls.screenshot.length, 0);
+    await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-unstable', 'home.png')), /ENOENT/);
+  });
+
+  test('the reflow guard surfaces through runCapture as a trust failure (exit 3)', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    let probes = 0;
+    const elements = {
+      '[data-phone]': [{
+        boundingBox: async () => (probes++ % 2 === 0 ? { ...clipBox } : { x: 100, y: 200, width: 300, height: 780 }),
+      }],
+    };
+    const browser = makeFakeBrowser({ evaluateImpl: probeAnswering({}, { x: 0, y: 0 }, SHELL_CANVAS), elements });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-unstable-run', log: sink() },
+    );
+    assert.equal(r.code, EXIT.TRUST);
+    assert.equal(s.out(), '');
+    assert.match(s.err(), /reflows responsively/);
+  });
+
+  test('no-grow path: a clip inside the document canvas never touches the viewport and records no canvasGrown', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    const smallClip = { x: 100, y: 200, width: 300, height: 600 };
+    const elements = { '[data-phone]': [{ boundingBox: async () => ({ ...smallClip }) }] };
+    const browser = makeFakeBrowser({ evaluateImpl: probeAnswering({}), elements });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-ungrown', log: sink() },
+    );
+    assert.equal(r.code, EXIT.OK, s.err());
+    const rec = await readRecord(join(dir, '.visual-diff', 'captures', 'r-ungrown', 'home.provenance.json'));
+    assert.equal(rec.inputs.canvasGrown, undefined);
+    // the effective viewport is still recorded — equal to the declared one
+    assert.deepEqual(rec.inputs.effectiveViewport, { width: 1502, height: 818 });
+    for (const ctx of browser._contexts) {
+      assert.deepEqual(ctx._page._calls.setViewportSize, []);
+    }
+  });
+
+  test('width-only overflow grows ONLY the width axis; the declared height is preserved', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    // right edge 1300+400=1700 exceeds the canvas width; bottom 500 is inside
+    const wideClip = { x: 1300, y: 200, width: 400, height: 300 };
+    const elements = { '[data-phone]': [{ boundingBox: async () => ({ ...wideClip }) }] };
+    const browser = makeFakeBrowser({ evaluateImpl: probeAnswering({}, { x: 0, y: 0 }, SHELL_CANVAS), elements });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-wide', log: sink() },
+    );
+    assert.equal(r.code, EXIT.OK, s.err());
+    const expected = { width: 1700, height: 818 };
+    for (const ctx of browser._contexts) {
+      assert.deepEqual(ctx._page._calls.setViewportSize, [expected], 'height stays declared — no height media queries fired');
+    }
+    const rec = await readRecord(join(dir, '.visual-diff', 'captures', 'r-wide', 'home.provenance.json'));
+    assert.deepEqual(rec.inputs.canvasGrown, expected);
+    assert.deepEqual(rec.inputs.effectiveViewport, expected);
+  });
+
+  test('cross-pass structural determinism: a canvas race between primary and verification is exit 4 naming both decisions', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    const elements = { '[data-phone]': [{ boundingBox: async () => ({ ...clipBox }) }] };
+    // The canvas probe alternates: the primary capture sees the small shell
+    // (grows), the verification sees a tall document (does not grow). The
+    // delivered bytes are identical (clip-aware default shot) — only the
+    // structural check can see the race.
+    let canvasCalls = 0;
+    const browser = makeFakeBrowser({
+      evaluateImpl: probeAnswering({}, { x: 0, y: 0 }, () => (++canvasCalls === 1
+        ? SHELL_CANVAS
+        : { width: 100000, height: 100000 })),
+      elements,
+    });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-race', log: sink() },
+    );
+    assert.equal(r.code, EXIT.DETERMINISM);
+    assert.equal(s.out(), '');
+    assert.match(s.err(), /determinism self-check FAILED for home/);
+    assert.match(s.err(), /canvas accommodation diverged between the primary and verification captures/);
+    assert.match(s.err(), /pass 1 grew the canvas to 1502x900, effective viewport 1502x900/);
+    assert.match(s.err(), /pass 2 did not grow the canvas, effective viewport 1502x818/);
+    await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-race', 'home.png')), /ENOENT/);
+  });
+
+  test('a declared selfCheck.maxDiffPixels budget never absorbs the structural divergence', async () => {
+    const dir = await projWithConfig({
+      version: 1,
+      states: { home: { ...clippedState, selfCheck: { maxDiffPixels: 1000000 } } },
+    });
+    const elements = { '[data-phone]': [{ boundingBox: async () => ({ ...clipBox }) }] };
+    let canvasCalls = 0;
+    const browser = makeFakeBrowser({
+      evaluateImpl: probeAnswering({}, { x: 0, y: 0 }, () => (++canvasCalls === 1
+        ? SHELL_CANVAS
+        : { width: 100000, height: 100000 })),
+      elements,
+    });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-race-budget', log: sink() },
+    );
+    assert.equal(r.code, EXIT.DETERMINISM, 'structural nondeterminism is outside every pixel budget');
+    assert.match(s.err(), /never within a selfCheck budget|no selfCheck pixel budget may absorb/);
   });
 });
 

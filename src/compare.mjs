@@ -912,7 +912,9 @@ function resolveReference(manifest, compRef) {
   } else {
     // FR-37: driven entries are reachable only through the state that
     // declared them — whole-comp resolution counts base screens only.
-    const base = comp.screens.filter((s) => s.driven !== true);
+    // Driven-only and skipped (empty-undriven) screens have no undriven
+    // reference either, so they never resolve through a whole-comp mapping.
+    const base = comp.screens.filter((s) => s.driven !== true && s.drivenOnly !== true && s.skipped === undefined);
     if (base.length === 0) throw usageError('no-screen', `comp ${compRef.comp} has no screens`);
     if (base.length > 1) {
       throw usageError(
@@ -995,6 +997,29 @@ export async function stageState({ layout, runId, state, stateName, manifest, ma
   // keep the plain screen id.
   const driven = state.compDrive !== undefined ? stateName : undefined;
   const { comp, screen } = resolveReference(manifest, compRef);
+  // A screen the import skipped (rendered empty undriven, unmapped at import
+  // time) has NO reference artifacts at all — a config that maps it after the
+  // fact needs a re-import, not a hunt for a missing PNG.
+  if (screen.skipped !== undefined) {
+    throw usageError(
+      'screen-skipped',
+      `state ${stateName} maps ${comp.name}#${screen.id}, but import skipped that screen ` +
+        `(${screen.skipped}: it renders empty undriven and no state mapped it at import time) — ` +
+        (driven !== undefined
+          ? 're-run import --refresh so its driven-only reference is rendered for this state'
+          : 'it can only be referenced driven-only: give this state a compDrive that makes the screen visible, then re-run import --refresh'),
+    );
+  }
+  // A driven-only screen has no undriven reference — only compDrive states
+  // can compare against it (FR-37 driven-only semantics).
+  if (screen.drivenOnly === true && driven === undefined) {
+    throw usageError(
+      'driven-only',
+      `state ${stateName} maps ${comp.name}#${screen.id} without compDrive, but that screen is ` +
+        'driven-only (it renders empty undriven, so no undriven reference exists) — ' +
+        'declare a compDrive on this state to compare against its driven reference',
+    );
+  }
   const screenId = driven !== undefined ? `${screen.id}@${driven}` : screen.id;
   const refPngPath = layout.referencePng(comp.name, screen.id, driven);
   const refProvPath = layout.referenceProvenance(comp.name, screen.id, driven);

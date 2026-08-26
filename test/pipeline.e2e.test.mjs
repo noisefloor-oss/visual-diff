@@ -174,8 +174,10 @@ const PIPE_COMP = {
 };
 
 // Deterministic screenshot bytes shared by import and capture, so reference and
-// capture pixels are byte-identical and the compare diff is 0.
-const SHOT_PNG = makePng(400, 766, (x, y) => [(x * 3 + y * 7) & 0xff, (x * 5 + y * 11) & 0xff, (x * 13 + y * 17) & 0xff, 255]);
+// capture pixels are byte-identical and the compare diff is 0. Sized to the
+// screen frame (400x766 CSS px below) at DPR 2, so the delivered-frame gate
+// (FR-38) sees a faithful render on the import side.
+const SHOT_PNG = makePng(800, 1532, (x, y) => [(x * 3 + y * 7) & 0xff, (x * 5 + y * 11) & 0xff, (x * 13 + y * 17) & 0xff, 255]);
 
 const MEASUREMENT = {
   figRect: { x: 10, y: 20, width: 400, height: 800 },
@@ -229,6 +231,7 @@ function makeFakePage() {
       if (src.includes('.ready')) return undefined; // document.fonts.ready
       if (src.includes('f.family')) return ['Inter', 'Roboto']; // import fontsOf + capture collectFonts
       if (src.includes('script[src]')) return []; // no declared externals
+      if (src.includes('scrollWidth')) return { width: 100000, height: 100000 }; // FR-38 canvas probe: never grow
       if (src.includes('data-screen-label')) return MEASUREMENT;
       throw new Error(`fake page: unknown evaluate function ${src.slice(0, 60)}...`);
     },

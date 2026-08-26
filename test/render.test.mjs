@@ -624,6 +624,22 @@ describe('renderPage with faked page/routing', () => {
     assert.deepEqual(render.result.aborted, []);
   });
 
+  test("an external FONT sub-resource is aborted and recorded with resourceType 'font' (the fatality seam)", async () => {
+    // A CSS @font-face sub-resource is not DOM-declared, so the record here —
+    // reason 'external', resourceType 'font', the exact URL — is the ONLY
+    // signal both the import discovery pass (vendor it) and the reference/
+    // capture fatality checks (fail closed) key on.
+    const { handler, render, log } = await runFakes({});
+    const route = makeRoute();
+    await handler(route, makeRequest({ url: 'https://fonts.gstatic.com/s/inter/v13/inter.woff2', resourceType: 'font' }));
+    assert.deepEqual(route._calls.abort, ['blockedbyclient']);
+    assert.equal(render.result.aborted.length, 1);
+    assert.equal(render.result.aborted[0].reason, 'external');
+    assert.equal(render.result.aborted[0].resourceType, 'font');
+    assert.equal(render.result.aborted[0].url, 'https://fonts.gstatic.com/s/inter/v13/inter.woff2');
+    assert.ok(log.lines.some((l) => l.includes('abort font https://fonts.gstatic.com/s/inter/v13/inter.woff2 (external)')));
+  });
+
   test("the render entry URL's own main-frame navigation passes interception (FR-32)", async () => {
     const { frame, handler, render } = await runFakes({ url: 'https://example.com/app' });
     const route = makeRoute();

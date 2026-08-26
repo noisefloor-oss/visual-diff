@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>App Shell</title>
+</head>
+<body>
+  <x-dc>
+    <main>
+      <sc-if test="{{ screen === 'dashboard' }}">
+        <div data-screen-label="01 Dashboard">
+          <h1>Dashboard</h1>
+        </div>
+      </sc-if>
+      <sc-if test="{{ screen === 'settings' }}">
+        <div data-screen-label="02 Settings">
+          <h1>Settings</h1>
+        </div>
+      </sc-if>
+    </main>
+  </x-dc>
+</body>
+</html>

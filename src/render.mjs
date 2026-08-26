@@ -328,7 +328,7 @@ function validateVendorManifest(parsed, vendorDir, manifestPath) {
     if (!isPlainObject(raw)) {
       throw manifestError(at, 'entry must be an object { file, sha256, integrity? }');
     }
-    const allowed = new Set(['file', 'sha256', 'integrity']);
+    const allowed = new Set(['file', 'sha256', 'integrity', 'contentType']);
     const unknown = Object.keys(raw).filter((k) => !allowed.has(k));
     if (unknown.length > 0) {
       throw manifestError(at, `unknown entry key: ${unknown[0]}`);
@@ -347,7 +347,19 @@ function validateVendorManifest(parsed, vendorDir, manifestPath) {
       }
       integrity = raw.integrity;
     }
-    entries.set(url, { file, relFile: raw.file, sha256: raw.sha256.toLowerCase(), integrity });
+    // Optional recorded content type — import writes it when the URL alone
+    // cannot name the resource kind (an extensionless stylesheet like
+    // https://fonts.googleapis.com/css2?family=Inter): without it fulfillment
+    // would infer application/octet-stream and Chromium can ignore the
+    // stylesheet entirely — silently, with no font abort to fail on.
+    let contentType;
+    if (raw.contentType !== undefined) {
+      if (typeof raw.contentType !== 'string' || !/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(raw.contentType)) {
+        throw manifestError(at, 'entry "contentType" must be a MIME type string (e.g. "text/css")');
+      }
+      contentType = raw.contentType;
+    }
+    entries.set(url, { file, relFile: raw.file, sha256: raw.sha256.toLowerCase(), integrity, contentType });
   }
   return entries;
 }

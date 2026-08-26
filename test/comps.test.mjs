@@ -239,27 +239,42 @@ test('screens: figures may sit under a layout wrapper inside x-dc', () => {
   ]);
 });
 
-test('screens: a figure nested inside another screen still fails', () => {
+test('screens: a screen nested inside another screen still fails', () => {
   const html = '<html><body><x-dc><div>' +
     '<figure data-screen-label="Outer"><figure data-screen-label="Inner">x</figure></figure>' +
     '</div></x-dc></body></html>';
   assert.throws(() => enumerateScreens(html, { path: 'inner.dc.html' }), (err) => {
     assert.ok(err instanceof ScreenStructureError);
-    assert.match(err.message, /screen element not a supported direct child/);
+    assert.equal(err.code, 'comp-screen-structure');
+    assert.match(err.message, /nested inside another screen/);
+    assert.match(err.message, /screens may not nest/);
+    assert.match(err.message, /inner\.dc\.html/);
     return true;
   });
 });
 
-test('screens: dynamic labels must be direct x-dc children', () => {
-  const html = '<html><body><x-dc><section><div data-screen-label="Nested">x</div></section></x-dc></body></html>';
-  assert.throws(() => enumerateScreens(html, { path: 'dynamic.dc.html' }), (err) => {
+test('screens: a non-figure screen nested inside another screen also fails', () => {
+  const html = '<html><body><x-dc>' +
+    '<div data-screen-label="Outer"><section><div data-screen-label="Inner">x</div></section></div>' +
+    '</x-dc></body></html>';
+  assert.throws(() => enumerateScreens(html, { path: 'inner.dc.html' }), (err) => {
     assert.ok(err instanceof ScreenStructureError);
-    assert.match(err.message, /screen element not a supported direct child/);
-    assert.match(err.message, /sits under a <section>/);
-    assert.match(err.message, /directly under <x-dc>/);
-    assert.match(err.message, /dynamic\.dc\.html/);
+    assert.match(err.message, /nested inside another screen/);
     return true;
   });
+});
+
+test('screens: dynamic labels may sit under layout wrappers inside x-dc', () => {
+  const html = '<html><body><x-dc><section><div data-screen-label="Nested">x</div></section></x-dc></body></html>';
+  assert.deepEqual(enumerateScreens(html), [{ label: 'Nested', id: 'nested' }]);
+});
+
+test('screens: app-shell export shape (x-dc > main > sc-if > div) enumerates', () => {
+  const html = readFixture('samples/app-shell.dc.html');
+  assert.deepEqual(enumerateScreens(html), [
+    { label: '01 Dashboard', id: '01-dashboard' },
+    { label: '02 Settings', id: '02-settings' },
+  ]);
 });
 
 test('screens: data-screen-label on a non-figure fails', () => {

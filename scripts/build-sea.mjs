@@ -20,7 +20,11 @@
 //   4. Copy the pinned node binary and inject the blob with postject
 //      --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2.
 //   5. Write dist/manifest.json (version, node version, sha256) and verify the
-//      result is a genuine ELF executable, not a shebang bundle.
+//      result is a genuine native executable for the build platform (ELF on
+//      linux, Mach-O on darwin), not a shebang bundle. On darwin the existing
+//      code signature is stripped before injection and the binary is ad-hoc
+//      re-signed afterwards — macOS refuses to execute a binary whose
+//      signature no longer covers its contents.
 //
 // The pinned node binary is copied into the output tree; the copy is
 // cached in <out>/.build/node-pristine so repeat builds
@@ -152,6 +156,31 @@ if (!pristineReady) {
   writeFileSync(pristineMarker, nodeHash);
 }
 copyFileSync(pristinePath, binPath);
+
+// Run a codesign step on darwin, failing loud with the exact remedy rather
+// than continuing into a postject/verify step that would produce (or hash
+// into the manifest) a binary macOS will refuse to execute.
+function codesignDarwin(args, why) {
+  try {
+    execFileSync('codesign', [...args, binPath], { stdio: 'inherit' });
+  } catch (err) {
+    throw new Error(
+      `codesign ${args.join(' ')} failed while ${why}; the staged binary at ` +
+        `${binPath} must not ship — install the Xcode command line tools ` +
+        `(xcode-select --install) and re-run the build`,
+      { cause: err },
+    );
+  }
+}
+
+// macOS ships node with a valid code signature; injecting the SEA blob into
+// a still-signed Mach-O invalidates that signature and the OS kills the
+// binary on exec. Strip the signature first, inject, then ad-hoc re-sign
+// (Node SEA's documented darwin sequence). postject additionally needs the
+// Mach-O segment name for the blob section on darwin.
+if (process.platform === 'darwin') {
+  codesignDarwin(['--remove-signature'], 'stripping the pinned node signature before injection');
+}
 execFileSync(
   process.execPath,
   [
@@ -161,9 +190,13 @@ execFileSync(
     join(buildDir, 'sea-prep.blob'),
     '--sentinel-fuse',
     'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
+    ...(process.platform === 'darwin' ? ['--macho-segment-name', 'NODE_SEA'] : []),
   ],
   { stdio: 'inherit' },
 );
+if (process.platform === 'darwin') {
+  codesignDarwin(['--sign', '-'], 're-signing the injected binary (ad-hoc)');
+}
 
 console.log(`[6/6] writing dist/manifest.json`);
 const binBuf = readFileSync(binPath);
@@ -174,6 +207,10 @@ const distManifest = {
   name: pkgJson.name,
   version: pkgJson.version,
   entry: 'noise-visual-diff',
+  // The SEA binary is platform-specific (it embeds a node build): record
+  // where it runs so a release asset is identifiable after download.
+  platform: process.platform,
+  arch: process.arch,
   nodeVersion,
   clientVersion: playwrightPkg.version,
   size: binBuf.length,
@@ -181,12 +218,35 @@ const distManifest = {
 };
 writeFileSync(join(outDir, 'manifest.json'), JSON.stringify(distManifest, null, 2));
 
-// The payload is a genuine single-file ELF executable, not a shebang bundle
-// (DESIGN §7) — guard the first bytes.
-const magic = binBuf.subarray(0, 4).toString('latin1');
-if (magic !== '\x7fELF') {
+// The payload is a genuine single-file native executable, not a shebang
+// bundle (DESIGN §7) — guard the first bytes, per platform: ELF on linux,
+// Mach-O on darwin (thin 64-bit or universal). Any other build platform is
+// unsupported and fails loud rather than shipping an unverified format.
+const FORMAT_CHECKS = {
+  linux: {
+    name: 'ELF',
+    ok: (buf) => buf.subarray(0, 4).toString('latin1') === '\x7fELF',
+  },
+  darwin: {
+    name: 'Mach-O',
+    // MH_MAGIC_64 little-endian on disk (cf fa ed fe) for thin arm64/x64
+    // node builds, or the big-endian FAT_MAGIC (ca fe ba be) for a
+    // universal binary.
+    ok: (buf) =>
+      buf.readUInt32LE(0) === 0xfeedfacf || buf.readUInt32BE(0) === 0xcafebabe,
+  },
+};
+const formatCheck = FORMAT_CHECKS[process.platform];
+if (!formatCheck) {
   throw new Error(
-    `built binary is not an ELF executable (magic ${JSON.stringify(magic)}); ` +
+    `no executable-format verification for platform ${process.platform}; ` +
+      `refusing to ship an unverified binary (DESIGN §7)`,
+  );
+}
+if (!formatCheck.ok(binBuf)) {
+  throw new Error(
+    `built binary is not a ${formatCheck.name} executable ` +
+      `(first bytes ${binBuf.subarray(0, 4).toString('hex')}); ` +
       `a shebang/JS bundle is rejected (DESIGN §7)`,
   );
 }

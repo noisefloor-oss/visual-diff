@@ -96,11 +96,31 @@ servers, any hard-coded knowledge of a specific design or project
   provenance defect.
 - **FR-10** It enumerates each comp's screens via `[data-screen-label]` using
   the supported static (`<figure>` directly under `<body>`) and dynamic (any
-  element directly under `<x-dc>`) shapes, then renders each screen frame as
+  element inside `<x-dc>`, possibly under layout wrappers, that is not nested
+  in another screen) shapes, then renders each screen frame as
   one reference PNG per screen. A static figure's caption row is excluded;
-  caption-free dynamic elements use their whole frame.
+  caption-free dynamic elements use their whole frame. Each render is subject
+  to the FR-38 delivered-frame check. A screen whose undriven frame is empty
+  (a runtime-conditional screen — e.g. an `sc-if` wrapper in a multi-screen
+  SPA export that renders nothing until driven) is triaged, not failed
+  unconditionally: mapped by a `compDrive` state it becomes **driven-only**
+  (FR-37); named exactly (`<comp>#<screen>`) by a non-`compDrive` state it is
+  a hard usage error naming the driven-only remedy (that state demands the
+  screen's undriven reference, which cannot exist) — a whole-comp mapping
+  never hardens the triage (compare resolves it to the sole ordinary base
+  screen, excluding driven-only/skipped siblings, so under it a conditional
+  screen triages as if unmapped); unmapped it is skipped with a logged
+  warning and recorded in
+  the manifest as `{ id, label, skipped: "empty-undriven" }` — no reference
+  artifact, excluded from the uniform-dimensions contract and from compare
+  resolution (compare names the re-import remedy if a config maps it later).
+  The import succeeds while at least one screen of the comp produced a
+  reference; every screen empty is a hard error naming the likely cause.
 - **FR-11** It renders each screen twice and records the disagreement as the
-  measured noise floor in the reference manifest.
+  measured noise floor in the reference manifest. A driven-only screen has no
+  undriven pair: its base manifest entry records the noise floor measured
+  from its first driven state's double render (each `@state` entry still
+  carries its own floor); a skipped screen records none.
 - **FR-12** Re-importing a zip revision replaces exactly the comps whose
   content hash changed; `--refresh` re-renders references (e.g. after a
   legitimate renderer change) with new provenance.
@@ -148,6 +168,56 @@ servers, any hard-coded knowledge of a specific design or project
   only after *all* run artifacts — including `report.json` — are complete,
   so an interrupted run never becomes "latest" and a published run is always
   consumable in full.
+- **FR-38** The delivered screenshot must equal the requested frame at the
+  recorded device scale factor: Chromium clamps a screenshot clip to the
+  document scroll box without error, so a page that scrolls in an inner
+  container would otherwise yield a reference or capture missing its bottom —
+  and both compare sides clamp identically, so the truncation is invisible
+  downstream. The render first *accommodates* the canvas: when the measured
+  frame (or clip rect) extends past the document canvas, the viewport is
+  grown **per axis** — only an overflowing axis grows to contain the frame
+  edge, the other keeps its declared size (a width-only overflow must not
+  raise the viewport height and fire height media queries the declared
+  conditions never would) — with an inner-scroll shell (`html,body` at
+  `height:100%` + an `overflow:auto` region) the inner container grows with
+  the viewport, bringing the whole frame inside the document canvas — and the
+  frame is then re-measured. Identity of the re-measured rect guards the
+  frame **geometry only**: a frame that shifts under the taller viewport
+  means the comp/page reflows responsively, and that is a trust failure
+  (exit 3, `frame-unstable`). Rect identity is *not* proof the internal
+  pixels are viewport-independent (viewport units, height media queries,
+  resize-driven JS can change pixels inside a fixed-rect frame, and both
+  passes of a double render see the same post-grow pixels) — what guards
+  *comparability* is effective-viewport gating: every record carries
+  `inputs.effectiveViewport`, the viewport the render actually shot under
+  (equal to the declared viewport when no grow happened; the grown size
+  otherwise), and the FR-23 predicate gates on it, so a grown reference only
+  ever passes against a capture that rendered under the identical effective
+  viewport — a grown-vs-ungrown pair is a provenance gate failure naming
+  both sizes. Accepted residual, by contract: a comp whose internals depend
+  on viewport size produces a reference *of those grown conditions* — now
+  visible in provenance — and clipped states keep FR-23's viewport exemption
+  (the two sides legitimately render different pages; the frame-size and
+  pixel comparisons remain the guard there). Whenever either pass grew, the
+  two passes of the FR-11 double render and the FR-17 self-check must also
+  have made the **identical structural accommodation decision** (grow
+  decision, effective viewport, re-measured frame rect) — a divergence is a
+  canvas race, checked outside any pixel budget: import fails exit 3
+  (`canvas-divergent`) naming both passes' decisions; capture fails exit 4,
+  never absorbable by `selfCheck.maxDiffPixels`. (With no grow on either
+  pass there is no accommodation decision to diverge; plain layout
+  nondeterminism keeps its FR-11 floor-1 / FR-17 handling.) Only after accommodation does the
+  delivered-frame equality apply: a residual clamped or short delivery is a
+  trust failure (exit 3, `frame-truncated`) on both verbs (import's FR-10
+  screen renders and capture's clipped states). The requested frame plus
+  delivered dimensions are recorded in provenance (`inputs.frame` /
+  `inputs.clipFrame` and `inputs.delivered`, informational), a grow records
+  the grown viewport as `inputs.canvasGrown` (informational evidence), and
+  the declared `inputs.viewport` stays the state's/FR-14 default;
+  `inputs.effectiveViewport` is the gated field. A legacy record without
+  `effectiveViewport` predates the grow mechanism and rendered exactly at
+  its declared viewport, so the gate reads the missing field as the declared
+  viewport.
 
 ### 4.4 `compare` and `report`
 
@@ -173,8 +243,10 @@ servers, any hard-coded knowledge of a specific design or project
   unless `--force` is passed.
 - **FR-23** `compare` fails closed (exit 3) on incompatible provenance via a
   **field-wise** predicate: renderer build, client version, mode,
-  viewport/DPR, capture policy, config hash, and vendor hashes must each
-  match. A content hash identity-protects its own artifact against its
+  viewport/DPR, effective viewport (FR-38 — the size the render actually
+  shot under after any canvas accommodation; a record without the field
+  predates the grow mechanism and reads as its declared viewport), capture
+  policy, config hash, and vendor hashes must each match. A content hash identity-protects its own artifact against its
   manifest; reference and capture content hashes are *expected to differ*
   and are never cross-compared.
 - **FR-24** `report [--json]` prints the latest published run: per-state and
@@ -256,7 +328,15 @@ servers, any hard-coded knowledge of a specific design or project
   not alter the comp content hash), and pruned when the state disappears.
   `compDrive` is reference-side only (capture drives the implementation via
   `route.params`/`setupScript`) and is semantic configuration: it enters
-  `configHash`. A capture-only state may not declare it.
+  `configHash`. A capture-only state may not declare it. **Driven-only
+  screens:** a screen whose undriven frame is empty (FR-10) and which is
+  mapped only by `compDrive` state(s) skips its base reference entirely —
+  the driven reference(s) are its only references, failing loudly through
+  the ordinary driven-render machinery when the drive cannot produce a
+  visible frame. Its manifest entry records `drivenOnly: true` (noise floor
+  per FR-11); compare refuses to resolve it undriven — whole-comp resolution
+  excludes it, and a non-`compDrive` state mapping it fails with the
+  compDrive remedy named.
 - **FR-31** `visual-diff.json` maps each state to: route (URL, or static
   directory to serve on loopback, with optional URL params or setup script),
   comp/screen mapping (optional — a state may be capture-only), viewport or

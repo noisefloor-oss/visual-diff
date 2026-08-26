@@ -1,0 +1,204 @@
+name: release
+
+# Tag-triggered multi-platform release builds.
+#
+# This workflow ships in the public snapshot and runs ONLY in the public
+# mirror (noisefloor-oss/visual-diff), on free hosted runners: every job is
+# guarded on github.repository, so pushing a v* tag anywhere else (the
+# private development repo, a fork) is a no-op. Building releases in the
+# public repo gives public provenance — anyone can follow a release asset
+# back to the tagged source and the logged run that produced it.
+#
+# Actions are pinned by commit SHA (repo convention).
+
+on:
+  push:
+    tags: ['v*']
+
+# Least privilege by default; jobs opt in below. Only the two jobs that
+# talk to the GitHub release (create it, attach assets to it) hold
+# `contents: write` — the jobs that check out and execute repository code
+# (npm ci, the build, the walkthrough) run read-only and without a
+# persisted git credential, so nothing that runs during a build holds
+# release-writing authority.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # Public-mirror-only guard (see the header comment). Creates the GitHub
+    # release for the tag up front. If the release was already created by
+    # hand (e.g. drafted with curated notes), this is a no-op and the
+    # hand-written notes are preserved. No checkout: this job runs no
+    # repository code while holding write authority.
+    if: github.repository == 'noisefloor-oss/visual-diff'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure the release for the tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && exit 0
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "noise-visual-diff $GITHUB_REF_NAME — binaries and SHA256SUMS attached by the release workflow."
+
+  build:
+    # Public-mirror-only guard (see the header comment). Read-only: build
+    # jobs execute repository code, so they never hold release-writing
+    # authority — they only upload workflow artifacts, and the publish job
+    # below attaches everything to the release after the whole matrix
+    # succeeds.
+    if: github.repository == 'noisefloor-oss/visual-diff'
+    needs: release
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+          # macos-13, the last plain macos-NN Intel image, was retired by
+          # GitHub; macos-15-intel is the currently offered Intel label.
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Do not leave the (read-only) token on disk for the build and
+          # walkthrough steps that follow.
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install
+        run: npm ci
+      - name: Build the SEA payload
+        # On darwin, build-sea.mjs strips the pinned node's code signature
+        # before postject injection and ad-hoc re-signs the result
+        # (`codesign --remove-signature` / `codesign --sign -`) — macOS
+        # refuses to execute a binary whose signature no longer covers its
+        # contents. The script fails loud if codesign is unavailable.
+        run: npm run build:sea
+      - name: Name the assets from the manifest platform/arch
+        id: assets
+        run: |
+          platform=$(node -p "require('./dist/manifest.json').platform")
+          arch=$(node -p "require('./dist/manifest.json').arch")
+          # The manifest records where the binary actually runs; it must
+          # agree with the platform this matrix leg claims to build.
+          if [ "$platform" != "${{ matrix.platform }}" ] || [ "$arch" != "${{ matrix.arch }}" ]; then
+            echo "manifest says $platform-$arch but this job builds ${{ matrix.platform }}-${{ matrix.arch }}" >&2
+            exit 1
+          fi
+          bin="noise-visual-diff-$platform-$arch"
+          manifest="manifest-$platform-$arch.json"
+          mv "dist/noise-visual-diff" "$bin"
+          cp dist/manifest.json "$manifest"
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+      - name: Smoke-run version and help
+        run: |
+          expected="noise-visual-diff ${GITHUB_REF_NAME#v}"
+          actual=$("./${{ steps.assets.outputs.bin }}" version)
+          if [ "$actual" != "$expected" ]; then
+            echo "version smoke failed: got '$actual', want '$expected'" >&2
+            exit 1
+          fi
+          "./${{ steps.assets.outputs.bin }}" help
+      - name: Install playwright managed browser
+        # Best-effort on macos for the same reason as the walkthrough below.
+        continue-on-error: ${{ startsWith(matrix.os, 'macos') }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            npx playwright install --with-deps chromium-headless-shell
+          else
+            npx playwright install chromium-headless-shell
+          fi
+      - name: Walkthrough smoke (examples/hello-screen)
+        # The complete import -> capture -> compare(fail) -> fix ->
+        # compare(pass) loop from examples/hello-screen/README.md, driven
+        # through the built binary with --auto-discover-browser picking up
+        # playwright's managed browser installed above.
+        #
+        # Hard-required on linux-x64 — the platform the full test suite
+        # exercises. Best-effort (continue-on-error) on the macos legs: the
+        # version/help smoke above already proves the darwin SEA binary
+        # boots and dispatches, while this step additionally depends on a
+        # browser download + first-launch on hosted macos runners, which
+        # fails for environmental reasons unrelated to the binary often
+        # enough that it should report — visibly, in the run log — rather
+        # than block a release. A darwin regression in the binary itself
+        # would still surface in the mandatory smoke above.
+        continue-on-error: ${{ startsWith(matrix.os, 'macos') }}
+        run: |
+          bin="$GITHUB_WORKSPACE/${{ steps.assets.outputs.bin }}"
+          cd examples/hello-screen
+          (cd design && zip -qr ../design-export.zip .)
+          mkdir -p .visual-diff
+          cp visual-diff.json .visual-diff/visual-diff.json
+          "$bin" import --auto-discover-browser design-export.zip
+          "$bin" capture
+          # The deliberate defect must produce exactly exit 1 — the
+          # over-threshold verdict. Any other nonzero status (2 usage,
+          # 3 trust/determinism, ...) is a real failure, not the expected
+          # mismatch, and fails the smoke.
+          status=0
+          "$bin" compare --json || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "compare must exit 1 (mismatch verdict) on the deliberate defect; got $status" >&2
+            exit 1
+          fi
+          # Fix the deliberate defect (the button color) and converge.
+          perl -pi -e 's/#a78bfa/#7c3aed/' implementation/index.html
+          "$bin" capture
+          "$bin" compare --json
+          "$bin" report
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            ${{ steps.assets.outputs.bin }}
+            ${{ steps.assets.outputs.manifest }}
+          if-no-files-found: error
+
+  publish:
+    # Public-mirror-only guard (see the header comment). The only job that
+    # attaches assets to the release: it downloads the matrix artifacts,
+    # builds one SHA256SUMS over every binary and manifest (hashing exactly
+    # the bytes the build jobs produced), and uploads everything. Holding
+    # the sole `contents: write` here — with no checkout, so no repository
+    # code runs under it — and gating on the FULL matrix via `needs` means
+    # no partial asset set ever reaches the release: either every platform
+    # built and smoked, or nothing is attached.
+    if: github.repository == 'noisefloor-oss/visual-diff'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+      - name: Attach binaries, manifests, and SHA256SUMS to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum noise-visual-diff-* manifest-*.json > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" \
+            noise-visual-diff-* manifest-*.json SHA256SUMS \
+            --clobber
