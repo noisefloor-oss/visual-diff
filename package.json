@@ -1,6 +1,6 @@
 {
   "name": "noise-visual-diff",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Design-fidelity hill-climbing tool for the noise CLI suite",
   "license": "MIT",
   "type": "module",

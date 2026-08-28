@@ -119,6 +119,11 @@ function makeFakePage({
     evaluate: [],
     $$: [],
     addStyleTag: [],
+    click: [],
+    hover: [],
+    focus: [],
+    press: [],
+    mouseMove: [],
   };
   return {
     _calls: calls,
@@ -146,6 +151,24 @@ function makeFakePage({
     },
     async waitForTimeout(ms) {
       calls.waitForTimeout.push(ms);
+    },
+    // FR-39 drive seams (the same set the import fake records).
+    async click(selector) {
+      calls.click.push(selector);
+    },
+    async hover(selector) {
+      calls.hover.push(selector);
+    },
+    async focus(selector) {
+      calls.focus.push(selector);
+    },
+    async press(selector, key) {
+      calls.press.push({ selector, key });
+    },
+    mouse: {
+      async move(x, y) {
+        calls.mouseMove.push({ x, y });
+      },
     },
     async setViewportSize(size) {
       calls.setViewportSize.push(size);
@@ -451,6 +474,101 @@ describe('waitReady (FR-16)', () => {
       },
     );
     assert.deepEqual(page._calls.waitForTimeout, [], 'settle is never reached after a selector timeout');
+  });
+
+  test('FR-39 drive: steps run in order, after the policy wait and BEFORE readiness.selector', async () => {
+    const order = [];
+    const page = makeFakePage({
+      waitForLoadStateImpl: async () => order.push('networkidle'),
+      waitForSelectorImpl: async (selector) => order.push(`wait:${selector}`),
+    });
+    const drive = [
+      { click: '.nav-menu' },
+      { hover: '.row' },
+      { mouse: 'away' },
+      { focus: '.item' },
+      { press: { selector: '.item', key: 'Enter' } },
+    ];
+    const origClick = page.click;
+    page.click = async (s) => { order.push(`click:${s}`); return origClick.call(page, s); };
+    const origHover = page.hover;
+    page.hover = async (s) => { order.push(`hover:${s}`); return origHover.call(page, s); };
+    const origFocus = page.focus;
+    page.focus = async (s) => { order.push(`focus:${s}`); return origFocus.call(page, s); };
+    const origPress = page.press;
+    page.press = async (s, k) => { order.push(`press:${s}:${k}`); return origPress.call(page, s, k); };
+    const origMove = page.mouse.move;
+    page.mouse.move = async (x, y) => { order.push(`mouse:${x},${y}`); return origMove.call(page.mouse, x, y); };
+
+    const r = await waitReady(
+      page,
+      { policy: 'networkidle', timeout: 5000, settle: 10, selector: '.menu-open' },
+      { drive },
+    );
+    assert.equal(r.pathFired, 'networkidle');
+    assert.equal(r.selectorFired, true);
+    assert.deepEqual(order, [
+      'networkidle',
+      'wait:.nav-menu', 'click:.nav-menu',
+      'wait:.row', 'hover:.row',
+      'mouse:-1,-1',
+      'wait:.item', 'focus:.item',
+      'wait:.item', 'press:.item:Enter',
+      // the readiness selector is waited only AFTER the whole drive, so it
+      // asserts the state the drive produced (mirrors the comp side)
+      'wait:.menu-open',
+    ]);
+    assert.deepEqual(page._calls.click, ['.nav-menu']);
+    assert.deepEqual(page._calls.hover, ['.row']);
+    assert.deepEqual(page._calls.focus, ['.item']);
+    assert.deepEqual(page._calls.press, [{ selector: '.item', key: 'Enter' }]);
+    assert.deepEqual(page._calls.mouseMove, [{ x: -1, y: -1 }], 'pointer parked outside the viewport');
+    // one pre-drive settle + one per step + the post-selector settle
+    assert.deepEqual(page._calls.waitForTimeout, [10, 10, 10, 10, 10, 10, 10]);
+  });
+
+  test('FR-39 drive: a target that never becomes visible fails loudly (exit 3) naming the step', async () => {
+    const page = makeFakePage({
+      waitForSelectorImpl: async (selector) => {
+        if (selector === '.never-there') {
+          const e = new Error('Timeout 5000ms exceeded.');
+          e.name = 'TimeoutError';
+          throw e;
+        }
+      },
+    });
+    await assert.rejects(
+      () => waitReady(
+        page,
+        { policy: 'domcontentloaded', timeout: 5000, settle: 10, selector: '.menu-open' },
+        { drive: [{ click: '.present' }, { click: '.never-there' }] },
+      ),
+      (err) => {
+        assert.equal(err.name, 'CaptureError');
+        assert.equal(err.exitCode, 3);
+        assert.equal(err.code, 'drive-target-missing');
+        assert.match(err.message, /drive step 1 \(click "\.never-there"\) never became visible within 5000ms/);
+        return true;
+      },
+    );
+    assert.deepEqual(page._calls.click, ['.present'], 'the failing step never acted');
+    assert.equal(
+      page._calls.waitForSelector.some(({ selector }) => selector === '.menu-open'),
+      false,
+      'the readiness selector is never reached — no frame of the wrong state',
+    );
+  });
+
+  test('FR-39 drive: a NON-timeout page failure propagates unchanged', async () => {
+    const page = makeFakePage({
+      waitForSelectorImpl: async () => {
+        throw new Error('net::ERR_CONNECTION_REFUSED');
+      },
+    });
+    await assert.rejects(
+      () => waitReady(page, { policy: 'domcontentloaded', timeout: 1000, settle: 0 }, { drive: [{ click: '.a' }] }),
+      /ERR_CONNECTION_REFUSED/,
+    );
   });
 
   test('no selector: behavior is unchanged and selectorFired is absent', async () => {
@@ -1006,7 +1124,7 @@ describe('runCapture', () => {
     );
     assert.equal(r.code, EXIT.USAGE);
     assert.equal(s.out(), '');
-    assert.match(s.err(), /unknown state\(s\): nope/);
+    assert.match(s.err(), /^noise visual-diff capture \[unknown-state\]: unknown state\(s\): nope/m);
     assert.match(s.err(), /home, settings/);
   });
 
@@ -1015,6 +1133,7 @@ describe('runCapture', () => {
     const s = mockStreams();
     const r = await runCapture({ projectDir: dir, values: {} }, { stdout: s.stdout, stderr: s.stderr });
     assert.equal(r.code, EXIT.USAGE);
+    assert.match(s.err(), /^noise visual-diff capture \[CONFIG_ERROR\]: /m);
     assert.match(s.err(), /config file not found/);
   });
 
@@ -1048,6 +1167,7 @@ describe('runCapture', () => {
     );
     assert.equal(r.code, EXIT.TRUST);
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff capture \[SERVICE_ENDPOINT_REFUSED\]: /m);
     assert.match(s.err(), /service endpoint refused/);
   });
 
@@ -1068,6 +1188,7 @@ describe('runCapture', () => {
     );
     assert.equal(r.code, EXIT.TRUST);
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff capture \[NAVIGATION_FAILED\]: /m);
     assert.match(s.err(), /render navigation failed/);
   });
 
@@ -1109,7 +1230,7 @@ describe('runCapture', () => {
     );
     assert.equal(r.code, EXIT.DETERMINISM);
     assert.equal(s.out(), '', 'a failed run keeps stdout empty');
-    assert.match(s.err(), /determinism self-check FAILED for home/);
+    assert.match(s.err(), /^noise visual-diff capture \[determinism-failed\]: determinism self-check FAILED for home/m);
     assert.match(s.err(), /differing bytes/);
     // The untrusted capture is not published.
     await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-000016', 'home.png')), /ENOENT/);
@@ -1204,6 +1325,129 @@ describe('runCapture', () => {
     );
     assert.equal(r.code, EXIT.OK);
     assert.equal(browser._contexts[0]._page.__setupRan, true, 'setup ran in the capture page');
+  });
+
+  test('FR-39 drive: a capture-only state drives the implementation and records inputs.drive', async () => {
+    const dir = tmpDir('vd-capture');
+    await init(dir);
+    const drive = [{ click: '.nav-menu' }, { mouse: 'away' }];
+    await writeFile(
+      join(dir, '.visual-diff', 'visual-diff.json'),
+      JSON.stringify({
+        version: 1,
+        states: {
+          // capture-only (no comp mapping) — an SPA screen reached by a nav
+          // click, not by a URL
+          menu: {
+            route: { url: 'http://localhost:5173/' },
+            readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+            threshold: 1,
+            drive,
+          },
+        },
+      }),
+    );
+    const browser = makeFakeBrowser({ shot: () => Buffer.from('png') });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-000031', log: sink() },
+    );
+    assert.equal(r.code, EXIT.OK);
+    // both the primary and the verification render drove the page (FR-17)
+    for (const ctx of browser._contexts) {
+      assert.deepEqual(ctx._page._calls.click, ['.nav-menu']);
+      assert.deepEqual(ctx._page._calls.mouseMove, [{ x: -1, y: -1 }]);
+    }
+    const record = JSON.parse(
+      await readFile(join(dir, '.visual-diff', 'captures', 'r-000031', 'menu.provenance.json'), 'utf8'),
+    );
+    assert.deepEqual(record.inputs.drive, drive, 'the executed steps are recorded in provenance');
+    assert.ok(/^[0-9a-f]{64}$/.test(record.inputs.stateConfigHash));
+  });
+
+  test('FR-39 drive and setupScript coexist: setup first (page setup), drive after readiness', async () => {
+    const dir = tmpDir('vd-capture');
+    await init(dir);
+    await writeFile(
+      join(dir, 'setup.mjs'),
+      'export default async function setup(page) { page.__order = ["setup"]; }',
+    );
+    await writeFile(
+      join(dir, '.visual-diff', 'visual-diff.json'),
+      JSON.stringify({
+        version: 1,
+        states: {
+          both: {
+            route: { url: 'http://localhost:5173/', setupScript: 'setup.mjs' },
+            readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+            threshold: 1,
+            drive: [{ click: '.nav-menu' }],
+          },
+        },
+      }),
+    );
+    const browser = makeFakeBrowser({ shot: () => Buffer.from('png') });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-000032', log: sink() },
+    );
+    assert.equal(r.code, EXIT.OK);
+    const page = browser._contexts[0]._page;
+    // setupScript ran (it stamped the page) BEFORE the drive click, which is
+    // recorded after it in the page's own order list.
+    assert.deepEqual(page.__order, ['setup']);
+    assert.deepEqual(page._calls.click, ['.nav-menu']);
+    const record = JSON.parse(
+      await readFile(join(dir, '.visual-diff', 'captures', 'r-000032', 'both.provenance.json'), 'utf8'),
+    );
+    assert.deepEqual(record.inputs.drive, [{ click: '.nav-menu' }]);
+  });
+
+  test('FR-39 drive: a never-visible target fails the run at exit 3 naming the step', async () => {
+    const dir = tmpDir('vd-capture');
+    await init(dir);
+    await writeFile(
+      join(dir, '.visual-diff', 'visual-diff.json'),
+      JSON.stringify({
+        version: 1,
+        states: {
+          menu: {
+            route: { url: 'http://localhost:5173/' },
+            readiness: { policy: 'domcontentloaded', timeout: 1500, settle: 0 },
+            threshold: 1,
+            drive: [{ click: '.never-there' }],
+          },
+        },
+      }),
+    );
+    const browser = makeFakeBrowser({ shot: () => Buffer.from('png') });
+    const s = mockStreams();
+    // every waitForSelector times out: the drive target never appears
+    const origNewContext = browser.newContext.bind(browser);
+    browser.newContext = async (opts) => {
+      const ctx = await origNewContext(opts);
+      const page = ctx._page;
+      page.waitForSelector = async () => {
+        const e = new Error('Timeout 1500ms exceeded.');
+        e.name = 'TimeoutError';
+        throw e;
+      };
+      return ctx;
+    };
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-000033', log: sink() },
+    );
+    assert.equal(r.code, EXIT.TRUST);
+    assert.match(s.err(), /^noise visual-diff capture \[drive-target-missing\]: /m);
+    assert.match(s.err(), /drive step 0 \(click "\.never-there"\) never became visible within 1500ms/);
+    await assert.rejects(
+      () => readFile(join(dir, '.visual-diff', 'captures', 'r-000033', 'menu.png')),
+      /ENOENT/,
+      'no screenshot of the wrong state is published',
+    );
   });
 });
 
@@ -1310,6 +1554,7 @@ describe('anchored masks at capture time (FR-36)', () => {
     );
     assert.equal(r.code, EXIT.TRUST, s.err());
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff capture \[MASK_SELECTOR_MATCH\]: /m);
     assert.match(s.err(), /mask "bezel" selector .*data-phone-frame.* matched 1 elements \(0 visible\) — it must match exactly one visible element/);
     await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-anchor-hidden', 'home.png')), /ENOENT/);
   });
@@ -1432,6 +1677,7 @@ describe('delivered-frame gate (FR-38)', () => {
     );
     assert.equal(r.code, EXIT.TRUST);
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff capture \[frame-truncated\]: /m);
     assert.match(s.err(), /delivered 600x900 device px but the clip rect requires 600x1200/);
     assert.match(s.err(), /clamped to the document scroll box/);
     assert.match(s.err(), /Let the document itself scroll, or size the scroll container to its content/);
@@ -1596,6 +1842,7 @@ describe('canvas accommodation (FR-38)', () => {
     );
     assert.equal(r.code, EXIT.TRUST);
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff capture \[frame-unstable\]: /m);
     assert.match(s.err(), /reflows responsively/);
   });
 
@@ -1661,7 +1908,7 @@ describe('canvas accommodation (FR-38)', () => {
     );
     assert.equal(r.code, EXIT.DETERMINISM);
     assert.equal(s.out(), '');
-    assert.match(s.err(), /determinism self-check FAILED for home/);
+    assert.match(s.err(), /^noise visual-diff capture \[determinism-failed\]: determinism self-check FAILED for home/m);
     assert.match(s.err(), /canvas accommodation diverged between the primary and verification captures/);
     assert.match(s.err(), /pass 1 grew the canvas to 1502x900, effective viewport 1502x900/);
     assert.match(s.err(), /pass 2 did not grow the canvas, effective viewport 1502x818/);
@@ -1730,7 +1977,7 @@ describe('selfCheck budget (FR-17)', () => {
     );
     assert.equal(r.code, EXIT.DETERMINISM);
     assert.equal(s.out(), '');
-    assert.match(s.err(), /determinism self-check FAILED for home/);
+    assert.match(s.err(), /^noise visual-diff capture \[determinism-failed\]: determinism self-check FAILED for home/m);
     assert.match(s.err(), /2 px differ/);
     assert.match(s.err(), /Declared selfCheck budget: 1 px/);
     await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-sc-2', 'home.png')), /ENOENT/);
@@ -1750,7 +1997,7 @@ describe('selfCheck budget (FR-17)', () => {
       { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-sc-3', log: sink() },
     );
     assert.equal(r.code, EXIT.DETERMINISM);
-    assert.match(s.err(), /determinism self-check FAILED for home/);
+    assert.match(s.err(), /^noise visual-diff capture \[determinism-failed\]: determinism self-check FAILED for home/m);
     assert.match(s.err(), /Declared selfCheck budget: 1000 px/);
     await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-sc-3', 'home.png')), /ENOENT/);
   });
@@ -2061,6 +2308,7 @@ describe('runCapture pin behavior (FR-34)', () => {
     );
     assert.equal(r.code, EXIT.TRUST);
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff capture \[NO_BROWSER_PIN\]: /m);
     assert.match(s.err(), /no browser pinned — re-run with --auto-discover-browser/);
     assert.match(s.err(), /visual-diff\.json/);
   });
@@ -2086,7 +2334,7 @@ describe('runCapture pin behavior (FR-34)', () => {
     );
     assert.equal(r.code, EXIT.USAGE);
     assert.equal(s.out(), '');
-    assert.match(s.err(), /no states defined — author \.visual-diff\/visual-diff\.json/);
+    assert.match(s.err(), /^noise visual-diff capture \[no-states\]: no states defined — author \.visual-diff\/visual-diff\.json/m);
     assert.doesNotMatch(s.err(), /browser/, 'no browser diagnostic — nothing probed');
   });
 
@@ -2364,6 +2612,7 @@ describe('capture --serve', () => {
       { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(makeFakeBrowser()), runId: 'r-serve-7', log: sink() },
     );
     assert.equal(r.code, EXIT.USAGE);
+    assert.match(s.err(), /^noise visual-diff capture \[CONFIG_ERROR\]: /m);
     assert.match(s.err(), /--serve: directory does not exist/);
   });
 

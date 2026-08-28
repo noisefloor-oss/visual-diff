@@ -56,10 +56,12 @@ import { ConfigError, effectiveMasks, loadConfig, stateConfigHash } from './conf
 import { resolveBrowser } from './browser.mjs';
 import { acquireBrowser } from './discover.mjs';
 import { renderPage, isTimeoutError } from './render.mjs';
+import { runDriveSteps } from './drive.mjs';
 import { createRecord, sha256Hex, vendorHashesFor, writeRecord } from './provenance.mjs';
 import { initRunDir, newRunId } from './run.mjs';
 import { probeMaskElements, probeToRegion } from './masks.mjs';
 import { accommodationDivergence, frameShortfall, pngDimensions } from './png.mjs';
+import { codedLine, errorLine } from './cli-error.mjs';
 
 export const EXIT = Object.freeze({
   OK: 0,
@@ -123,12 +125,40 @@ export function buildContextOptions(state, deviceScaleFactor = DEVICE_SCALE_FACT
 }
 
 // The determinism tail shared by every capture and re-capture: policy wait,
-// fonts settled, the optional implementation-side readiness selector, then
-// the configured settle delay. Returns the readiness path that fired and
-// whether the selector fired. The comp-side `compSelector` is NOT waited
-// here — it belongs to import's driven render (FR-16/FR-37);
-// base renders must never apply implementation selectors to the comp.
-export async function waitReady(page, readiness, { gotoTimedOut = false } = {}) {
+// fonts settled, the optional FR-39 `drive` steps, the optional
+// implementation-side readiness selector, then the configured settle delay.
+// Returns the readiness path that fired and whether the selector fired. The
+// comp-side `compSelector` is NOT waited here — it belongs to import's driven
+// render (FR-16/FR-37); base renders must never apply implementation
+// selectors to the comp.
+//
+// FR-39 ordering MIRRORS the comp side (src/import.mjs renderCompScreen),
+// step for step AND settle for settle. With a drive declared:
+//
+//   comp:    policy wait + fonts -> settle -> [wait target, act, settle] xN
+//            -> `readiness.compSelector` (if declared) -> settle
+//            -> measure + screenshot
+//   capture: policy wait + fonts -> settle -> [wait target, act, settle] xN
+//            -> `readiness.selector` (if declared) -> settle -> screenshot
+//
+// Both sides therefore sample after 2 + N settle intervals for the same
+// drive list, and after exactly 1 with no drive (comp: the settle inside
+// waitForReferenceReady; capture: the trailing settle below). The counts do
+// not depend on whether a side declares its optional selector — the settles
+// are the sampling contract, not selector bookkeeping. Equal counts are what
+// make the shared grammar mean one shared TIMING too: a timer-driven or
+// asynchronously evolving UI sampled at different moments on the two sides is
+// a false pair (matching drive lists, matching hashes, different sample
+// moments), and no hash would catch it. The final settle also keeps the
+// capture-side invariant that a settle immediately precedes the shot, so the
+// screenshot never races a just-fired selector — the comp side now shares it.
+//
+// `route.setupScript` stays strictly BEFORE all of it (see renderCapture): a
+// setup script is page SETUP — it runs against a page that has not even
+// reached readiness and may navigate, seed storage, or scroll — while `drive`
+// is post-readiness INTERACTION with a settled UI. Both may be declared on
+// one state.
+export async function waitReady(page, readiness, { gotoTimedOut = false, drive } = {}) {
   const { policy, timeout, settle } = readiness;
   let pathFired = 'domcontentloaded';
   if (gotoTimedOut) {
@@ -145,6 +175,27 @@ export async function waitReady(page, readiness, { gotoTimedOut = false } = {}) 
     }
   }
   await page.evaluate(() => document.fonts.ready);
+  if (drive !== undefined) {
+    // Let the page settle once before the first step, exactly as the comp
+    // side's policy-only waitReady does before compDrive runs.
+    if (settle > 0) await page.waitForTimeout(settle);
+    await runDriveSteps(page, drive, {
+      timeout,
+      settle,
+      onTargetMissing: (i, action, selector) => {
+        // The capture-side equivalent of import's `drive-target-missing`
+        // trust error (exit 3), naming the step index, action, and selector:
+        // a target that never appears means the state never opened, and
+        // recording it would screenshot the WRONG state.
+        throw new CaptureError(
+          `drive step ${i} (${action} ${JSON.stringify(selector)}) never became visible within ${timeout}ms — ` +
+            'the implementation cannot be driven into this state; refusing to record a frame of the wrong ' +
+            'state (FR-39)',
+          { code: 'drive-target-missing' },
+        );
+      },
+    });
+  }
   let selectorFired;
   if (readiness.selector !== undefined) {
     try {
@@ -621,8 +672,12 @@ async function renderCapture({
     if (state.route.setupScript !== undefined) {
       await runSetupScript(page, resolve(projectDir, state.route.setupScript), stateName);
     }
+    // FR-39: `drive` runs INSIDE the readiness tail — after the policy wait,
+    // before `readiness.selector` — mirroring the comp side's
+    // drive -> selector -> settle -> screenshot ordering (see waitReady).
     const { pathFired, selectorFired } = await waitReady(page, state.readiness, {
       gotoTimedOut: Boolean(result.navigation && result.navigation.timedOut),
+      drive: state.drive,
     });
     // FR-9: an aborted external FONT is fatal, exactly like an unvendored
     // stylesheet at import time. A font requests lazily — only after its
@@ -939,6 +994,13 @@ export async function captureState({
       // FR-38 canvas accommodation evidence (informational): the viewport
       // the render grew to so the document canvas contains the clip rect.
       ...(first.canvasGrown !== undefined ? { canvasGrown: first.canvasGrown } : {}),
+      // FR-39 drive evidence (informational): the ordered steps this capture
+      // actually executed to reach the state. The reference side records
+      // compDrive the same way — through the per-state hash, not through the
+      // FR-23 field predicate — so `drive` is GATED via stateConfigHash
+      // (which projects it) and recorded here so the interaction that
+      // produced the frame is auditable from the record alone.
+      ...(state.drive !== undefined ? { drive: state.drive } : {}),
       // GATED (FR-38/FR-23): the effective viewport the render shot under —
       // the state's declared viewport, or the grown size.
       effectiveViewport: first.effectiveViewport,
@@ -1094,18 +1156,18 @@ export async function runCapture(options, ctx = {}) {
     ({ config, hash, layout } = await loadConfig(options.projectDir));
   } catch (err) {
     if (err instanceof ConfigError) {
-      stderr.write(`noise visual-diff capture: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff capture', err));
       return { code: EXIT.USAGE, runId: null, captures: [] };
     }
     throw err;
   }
   const selected = selectStates(config, options.values.state);
   if (selected.error) {
-    stderr.write(`noise visual-diff capture: ${selected.error}\n`);
+    stderr.write(codedLine('noise visual-diff capture', 'unknown-state', selected.error));
     return { code: EXIT.USAGE, runId: null, captures: [] };
   }
   if (selected.names.length === 0) {
-    stderr.write('noise visual-diff capture: no states defined — author .visual-diff/visual-diff.json\n');
+    stderr.write(codedLine('noise visual-diff capture', 'no-states', 'no states defined — author .visual-diff/visual-diff.json'));
     return { code: EXIT.USAGE, runId: null, captures: [] };
   }
 
@@ -1130,7 +1192,7 @@ export async function runCapture(options, ctx = {}) {
         serve = await startServeServer(layout.projectDir, serveDir, config, selected.names, { log });
       } catch (err) {
         if (err instanceof ConfigError) {
-          stderr.write(`noise visual-diff capture: ${err.message}\n`);
+          stderr.write(errorLine('noise visual-diff capture', err));
           return { code: EXIT.USAGE, runId, captures };
         }
         throw err;
@@ -1162,7 +1224,7 @@ export async function runCapture(options, ctx = {}) {
             });
           } catch (err) {
             if (err instanceof ConfigError) {
-              stderr.write(`noise visual-diff capture: ${err.message}\n`);
+              stderr.write(errorLine('noise visual-diff capture', err));
               return { code: EXIT.USAGE, runId, captures };
             }
             throw err;
@@ -1204,10 +1266,10 @@ export async function runCapture(options, ctx = {}) {
     // usage error the acquire step can raise (--auto-discover-browser under an
     // effective service mode, FR-33) keeps the exit-2 contract.
     if (err instanceof ConfigError) {
-      stderr.write(`noise visual-diff capture: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff capture', err));
       return { code: EXIT.USAGE, runId, captures };
     }
-    stderr.write(`noise visual-diff capture: ${err && err.message ? err.message : String(err)}\n`);
+    stderr.write(errorLine('noise visual-diff capture', err));
     return { code: EXIT.TRUST, runId, captures };
   } finally {
     for (const srv of servers) {
@@ -1228,9 +1290,13 @@ export async function runCapture(options, ctx = {}) {
           : `${c.differingBytes} differing bytes`;
       const budgetNote = c.selfCheckBudget === undefined ? '' : ` Declared selfCheck budget: ${c.selfCheckBudget} px.`;
       stderr.write(
-        `noise visual-diff capture: determinism self-check FAILED for ${c.stateName} ` +
-          `(${detail}) — re-capture from a fresh context differed (FR-17/NFR-1).${budgetNote} ` +
-          `The capture is not trusted and the run is not published.\n`,
+        codedLine(
+          'noise visual-diff capture',
+          'determinism-failed',
+          `determinism self-check FAILED for ${c.stateName} ` +
+            `(${detail}) — re-capture from a fresh context differed (FR-17/NFR-1).${budgetNote} ` +
+            'The capture is not trusted and the run is not published.',
+        ),
       );
     }
     return { code: EXIT.DETERMINISM, runId, captures };

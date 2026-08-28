@@ -17,6 +17,11 @@
 //     sections: { <name>: { x, y, width, height, threshold? } }   // fractions
 //     masks:    { <name>: { x, y, width, height, reason? }        // fractions
 //                        | { selector, compSelector?, shape?, reason? } }
+//     compDrive: [ <drive step>, ... ]   // FR-37: drives the COMP (import)
+//     drive:     [ <drive step>, ... ]   // FR-39: drives the IMPLEMENTATION
+//       (capture). Both keys share one grammar, one validator, one error
+//       vocabulary: { click|hover|focus: selector } | { press: { selector,
+//       key } } | { mouse: "away" }.
 //     selfCheck: { maxDiffPixels }   // FR-17 budget; absent ≡ byte-exact
 //   }
 // A top-level `masks` block shares one declaration across every state (the
@@ -56,7 +61,7 @@ const SUPPORTED_VERSION = 1;
 const DEFAULT_VIEWPORT = Object.freeze({ width: 1502, height: 818, fullPage: false });
 
 const TOP_LEVEL_KEYS = new Set(['version', 'states', 'browser', 'masks', 'capture']);
-const STATE_KEYS = new Set(['route', 'comp', 'viewport', 'readiness', 'threshold', 'sections', 'masks', 'compDrive', 'clip', 'selfCheck']);
+const STATE_KEYS = new Set(['route', 'comp', 'viewport', 'readiness', 'threshold', 'sections', 'masks', 'compDrive', 'drive', 'clip', 'selfCheck']);
 const ROUTE_KEYS = new Set(['url', 'staticDir', 'params', 'setupScript']);
 const VIEWPORT_KEYS = new Set(['width', 'height', 'fullPage']);
 const READINESS_KEYS = new Set(['policy', 'timeout', 'settle', 'selector', 'compSelector']);
@@ -468,36 +473,34 @@ function validateReadiness(v, path) {
   return readiness;
 }
 
-// FR-37: compDrive drives the comp into a runtime state before the reference
-// screenshot — reference-side only, so it requires a comp mapping. Each step
-// is exactly one action:
+// The shared drive grammar (FR-37 reference side, FR-39 implementation side).
+// ONE step grammar, ONE validator, ONE error vocabulary for both keys:
+// `compDrive` (drives the comp, import) and `drive` (drives the
+// implementation, capture). The two sides must never drift — a state that
+// drives both sides authors the same shapes in the same language, and the
+// only difference in an error message is which key it names.
+// Each step is exactly one action:
 //   { click: selector } | { hover: selector } | { focus: selector }
 //   { press: { selector, key } }   — keyboard activation (page.press)
 //   { mouse: "away" }              — park the pointer outside the viewport,
 //     clearing :hover where a full-viewport click-catcher keeps it set
 //     (e.g. capturing the unhovered menu-open frame)
-function validateCompDrive(v, path, hasComp, hasScreen) {
-  if (v === undefined) {
-    return undefined;
-  }
-  if (!hasComp) {
-    fail(path, 'compDrive requires a comp mapping — a capture-only state has no reference to drive (FR-37)');
-  }
-  if (!hasScreen) {
-    fail(path, 'compDrive requires an explicit <comp>#<screen> mapping — a whole-comp mapping names no single state surface (FR-37)');
-  }
+const DRIVE_GRAMMAR = '{ click|hover|focus: selector } | { press: { selector, key } } | { mouse: "away" }';
+const DRIVE_ACTIONS = ['click', 'hover', 'focus', 'press', 'mouse'];
+
+function validateDriveSteps(v, path, key) {
   if (!Array.isArray(v) || v.length === 0) {
-    fail(path, 'compDrive must be a non-empty array of steps { click|hover|focus: selector } | { press: { selector, key } } | { mouse: "away" }');
+    fail(path, `${key} must be a non-empty array of steps ${DRIVE_GRAMMAR}`);
   }
   const steps = v.map((step, i) => {
     const spath = `${path}[${i}]`;
     if (!isPlainObject(step)) {
-      fail(spath, 'compDrive step must be an object { click|hover|focus: selector } | { press: { selector, key } } | { mouse: "away" }');
+      fail(spath, `${key} step must be an object ${DRIVE_GRAMMAR}`);
     }
     const keys = Object.keys(step);
     const action = keys[0];
-    if (keys.length !== 1 || !['click', 'hover', 'focus', 'press', 'mouse'].includes(action)) {
-      fail(spath, 'compDrive step must have exactly one key: "click", "hover", "focus", "press", or "mouse"');
+    if (keys.length !== 1 || !DRIVE_ACTIONS.includes(action)) {
+      fail(spath, `${key} step must have exactly one key: "click", "hover", "focus", "press", or "mouse"`);
     }
     if (action === 'press') {
       const p = step.press;
@@ -519,6 +522,35 @@ function validateCompDrive(v, path, hasComp, hasScreen) {
     return { [action]: selector };
   });
   return steps;
+}
+
+// FR-37: compDrive drives the COMP into a runtime state before the reference
+// screenshot — reference-side only, so it requires an explicit comp#screen
+// mapping. The grammar itself is the shared one above.
+function validateCompDrive(v, path, hasComp, hasScreen) {
+  if (v === undefined) {
+    return undefined;
+  }
+  if (!hasComp) {
+    fail(path, 'compDrive requires a comp mapping — a capture-only state has no reference to drive (FR-37)');
+  }
+  if (!hasScreen) {
+    fail(path, 'compDrive requires an explicit <comp>#<screen> mapping — a whole-comp mapping names no single state surface (FR-37)');
+  }
+  return validateDriveSteps(v, path, 'compDrive');
+}
+
+// FR-39: drive drives the IMPLEMENTATION into a runtime state before the
+// capture screenshot. Same grammar, same validator, same vocabulary as
+// compDrive — and no mapping precondition: an SPA export's screens are nav
+// clicks rather than URLs, so a capture-only state drives just as freely as
+// one paired with a comp screen (the pairing is the point: compDrive drives
+// the reference side, drive the implementation side, in one language).
+function validateDrive(v, path) {
+  if (v === undefined) {
+    return undefined;
+  }
+  return validateDriveSteps(v, path, 'drive');
 }
 
 
@@ -864,10 +896,11 @@ export function validateConfig(raw, { projectDir } = {}) {
     const threshold = validateThreshold(s.threshold, `${spath}.threshold`);
     const sections = validateSections(s.sections, `${spath}.sections`, threshold);
     const compDrive = validateCompDrive(s.compDrive, `${spath}.compDrive`, comp !== null, compRef !== null && compRef.screen !== undefined);
+    const drive = validateDrive(s.drive, `${spath}.drive`);
     const masks = validateMasks(s.masks, `${spath}.masks`);
     const clip = validateClip(s.clip, `${spath}.clip`);
     const selfCheck = validateSelfCheck(s.selfCheck, `${spath}.selfCheck`);
-    states[stateName] = { route, compRef, comp, viewport, readiness, threshold, sections, compDrive, masks, clip, selfCheck };
+    states[stateName] = { route, compRef, comp, viewport, readiness, threshold, sections, compDrive, drive, masks, clip, selfCheck };
   }
   // Top-level shared masks (FR-36): device chrome is a category — the
   // same masks every state repeats are declared once at the root and merged
@@ -911,7 +944,10 @@ export function canonicalStringify(value) {
 // the identical browser causes zero churn. `readiness.compSelector` is
 // consumed only by import's DRIVEN render (FR-16/FR-37), so on a state with
 // no compDrive it drives nothing and is projected out too.
-const RENDER_STATE_KEYS = ['route', 'compRef', 'comp', 'viewport', 'readiness', 'compDrive', 'clip'];
+// `drive` is semantic configuration exactly like `compDrive` (FR-39): it
+// decides WHICH state the capture shows, so changing it must invalidate the
+// pair through the FR-23 gate.
+const RENDER_STATE_KEYS = ['route', 'compRef', 'comp', 'viewport', 'readiness', 'compDrive', 'drive', 'clip'];
 
 function renderStateProjection(s) {
   const out = Object.fromEntries(RENDER_STATE_KEYS.filter((k) => s[k] !== undefined).map((k) => [k, s[k]]));
@@ -1040,6 +1076,7 @@ export function configToDocument(config) {
     state.sections = st.sections;
     if (Object.keys(st.masks).length > 0) state.masks = st.masks;
     if (st.compDrive !== undefined) state.compDrive = st.compDrive;
+    if (st.drive !== undefined) state.drive = st.drive;
     if (st.selfCheck !== undefined) state.selfCheck = st.selfCheck;
     // clip decides what a capture frames, so dropping it here would rewrite a
     // clipped state into an unclipped one — silently, on any path that

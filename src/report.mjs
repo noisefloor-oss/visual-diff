@@ -75,6 +75,7 @@ import { readFile } from 'node:fs/promises';
 import { LayoutError, layoutFor } from './artifact-layout.mjs';
 import { readCurrentRun, RunError } from './run.mjs';
 import { computeRunDiff, loadRunReportForDiff, renderRunDiff } from './run-diff.mjs';
+import { codedLine, errorLine } from './cli-error.mjs';
 
 export const REPORT_OUTPUT_SCHEMA = 1;
 
@@ -268,7 +269,7 @@ export async function runReport(options, deps = {}) {
     layout = layoutFor(options.projectDir);
   } catch (err) {
     if (err instanceof LayoutError) {
-      stderr.write(`noise visual-diff report: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff report', err));
       return { code: err.exitCode, runId: null, report: null };
     }
     throw err;
@@ -281,7 +282,13 @@ export async function runReport(options, deps = {}) {
   const positionals = options.positionals || [];
   if (values.diff !== undefined || positionals.length > 0) {
     if (values.diff === undefined || positionals.length !== 1) {
-      stderr.write('noise visual-diff report: --diff requires exactly two run ids: report --diff <runIdA> <runIdB>\n');
+      stderr.write(
+        codedLine(
+          'noise visual-diff report',
+          'bad-diff-args',
+          '--diff requires exactly two run ids: report --diff <runIdA> <runIdB>',
+        ),
+      );
       return { code: 2, runId: null, report: null };
     }
     let diff;
@@ -291,7 +298,7 @@ export async function runReport(options, deps = {}) {
       diff = computeRunDiff(reportA, reportB);
     } catch (err) {
       if (err instanceof ReportError) {
-        stderr.write(`noise visual-diff report: ${err.message}\n`);
+        stderr.write(errorLine('noise visual-diff report', err));
         return { code: err.exitCode, runId: null, report: null };
       }
       throw err;
@@ -310,7 +317,7 @@ export async function runReport(options, deps = {}) {
     current = await readCurrentRun(layout);
   } catch (err) {
     if (err instanceof RunError) {
-      stderr.write(`noise visual-diff report: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff report', err));
       return { code: err.exitCode, runId: null, report: null };
     }
     throw err;
@@ -332,7 +339,7 @@ export async function runReport(options, deps = {}) {
     published = await loadPublishedReport(layout, current.runId);
   } catch (err) {
     if (err instanceof ReportError) {
-      stderr.write(`noise visual-diff report: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff report', err));
       return { code: err.exitCode, runId: null, report: null };
     }
     throw err;

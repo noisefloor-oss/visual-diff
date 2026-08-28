@@ -290,6 +290,7 @@ describe('trust failures (exit 3)', () => {
       assert.equal(res.code, 3);
       assert.equal(res.report, null);
       assert.equal(res.streams.out(), '', 'a refusal leaves stdout empty');
+      assert.match(res.streams.err(), /^noise visual-diff report \[REPORT_JSON_UNREADABLE\]: /m);
       assert.match(res.streams.err(), /no readable report\.json/);
       assert.match(res.streams.err(), new RegExp(RUN));
     });
@@ -303,6 +304,7 @@ describe('trust failures (exit 3)', () => {
       await writeFile(layout.currentRunFile, `${RUN}\n`);
       const res = await reportAt(dir);
       assert.equal(res.code, 3);
+      assert.match(res.streams.err(), /^noise visual-diff report \[REPORT_JSON_INVALID\]: /m);
       assert.match(res.streams.err(), /corrupt report\.json/);
       assert.equal(res.streams.out(), '');
     });
@@ -594,6 +596,7 @@ describe('report --diff', () => {
       await stageReportOnly(dir, 'rb', diffableReport('rb', { home: diffState(0, 'pass') }));
       const res = await diffAt(dir, 'ra', 'rb');
       assert.equal(res.code, 2);
+      assert.match(res.streams.err(), /^noise visual-diff report \[no-such-run\]: /m);
       assert.match(res.streams.err(), /no stored report for run "ra" — looked for diffs\/ra\/report\.json/);
     });
   });
@@ -602,7 +605,7 @@ describe('report --diff', () => {
     await withProject(async (dir) => {
       const res = await diffAt(dir, 'ra', 'rb', { positionals: [] });
       assert.equal(res.code, 2);
-      assert.match(res.streams.err(), /--diff requires exactly two run ids/);
+      assert.match(res.streams.err(), /^noise visual-diff report \[bad-diff-args\]: --diff requires exactly two run ids/m);
       const extra = await diffAt(dir, 'ra', 'rb', { positionals: ['rb', 'rc'] });
       assert.equal(extra.code, 2);
     });

@@ -37,6 +37,7 @@ import { runCompare } from './compare.mjs';
 import { runImport } from './import.mjs';
 import { runReport } from './report.mjs';
 import { runVerifyNeutral } from './verify-neutral.mjs';
+import { codedLine, errorLine } from './cli-error.mjs';
 
 export const EXIT = Object.freeze({
   OK: 0,
@@ -101,7 +102,16 @@ export const VERB_SPECS = {
 
 const VERBS = Object.keys(VERB_SPECS);
 
-class UsageError extends Error {}
+// Usage failures carry a code like every other typed failure, so the exit-2
+// bucket is not a single undifferentiated blob at the boundary (FR-4a).
+class UsageError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'UsageError';
+    this.code = code;
+    this.exitCode = EXIT.USAGE;
+  }
+}
 
 // Parse argv into { verb, positionals, values, bools }. Throws UsageError on
 // an unknown verb, an unknown flag for a verb, a value flag missing its
@@ -111,7 +121,7 @@ class UsageError extends Error {}
 // for that verb (parse() stays single-pass) — help is first-position only.
 export function parse(argv) {
   if (argv.length === 0) {
-    throw new UsageError('missing verb');
+    throw new UsageError('no-verb', 'missing verb');
   }
   const verb = argv[0] === '--version'
     ? 'version'
@@ -120,7 +130,7 @@ export function parse(argv) {
       : argv[0];
   const spec = VERB_SPECS[verb];
   if (!spec) {
-    throw new UsageError(`unknown verb: ${verb}`);
+    throw new UsageError('unknown-verb', `unknown verb: ${verb}`);
   }
 
   const positionals = [];
@@ -146,7 +156,7 @@ export function parse(argv) {
 
     if (spec.bool.has(name)) {
       if (inline !== undefined) {
-        throw new UsageError(`flag --${name} takes no value`);
+        throw new UsageError('flag-unexpected-value', `flag --${name} takes no value`);
       }
       bools[name] = true;
       continue;
@@ -156,7 +166,7 @@ export function parse(argv) {
       if (val === undefined) {
         const next = argv[i + 1];
         if (next === undefined || next.startsWith('--')) {
-          throw new UsageError(`flag --${name} requires a value`);
+          throw new UsageError('flag-missing-value', `flag --${name} requires a value`);
         }
         val = argv[++i];
       }
@@ -164,7 +174,7 @@ export function parse(argv) {
       else values[name] = val;
       continue;
     }
-    throw new UsageError(`unknown flag for ${verb}: --${name}`);
+    throw new UsageError('unknown-flag', `unknown flag for ${verb}: --${name}`);
   }
 
   return { verb, positionals, values, bools };
@@ -183,6 +193,7 @@ export function resolveProjectDir(env, cwd) {
 
   if (!unset && !isAbsolute(input)) {
     throw new UsageError(
+      'bad-project-dir',
       `NOISE_PROJECT_DIR must be an absolute directory: ${input}`,
     );
   }
@@ -192,6 +203,7 @@ export function resolveProjectDir(env, cwd) {
     real = realpathSync(input);
   } catch {
     throw new UsageError(
+      'bad-project-dir',
       unset
         ? `cannot resolve current directory: ${input}`
         : `NOISE_PROJECT_DIR does not exist: ${input}`,
@@ -200,6 +212,7 @@ export function resolveProjectDir(env, cwd) {
 
   if (!statSync(real).isDirectory()) {
     throw new UsageError(
+      'bad-project-dir',
       unset
         ? `current directory is not a directory: ${input}`
         : `NOISE_PROJECT_DIR is not a directory: ${input}`,
@@ -410,7 +423,8 @@ const HELP_FULL = [
   '  diffs/<runId>/report.json compare output. Important fields:',
   '                            states[].frame.mismatch (0..1 fraction),',
   '                            states[].verdict (pass|fail), states[].attribution',
-  '                            (failing states: rowBands, dominantColorPair,',
+  '                            (failing states, plus passing states whose',
+  '                            delta is uniform: rowBands, dominantColorPair,',
   '                            distinctColorPairs), states[].vs (with --against),',
   '                            summary, diff (run-level --against rollup)',
   '  current-run               published pointer — managed by the tool;',
@@ -501,7 +515,7 @@ const DEFAULT_HANDLERS = {
     }
     const text = HELP_VERBS[topic];
     if (!text) {
-      ctx.stderr.write(`noise visual-diff: unknown help topic: ${topic}\n`);
+      ctx.stderr.write(codedLine('noise visual-diff', 'unknown-help-topic', `unknown help topic: ${topic}`));
       usage(ctx.stderr);
       return EXIT.USAGE;
     }
@@ -534,7 +548,7 @@ export function run(
       : resolveProjectDir(env, cwd);
   } catch (e) {
     if (!(e instanceof UsageError)) throw e;
-    stderr.write(`noise visual-diff: ${e.message}\n`);
+    stderr.write(errorLine('noise visual-diff', e));
     usage(stderr);
     return EXIT.USAGE;
   }
@@ -565,7 +579,7 @@ async function main() {
   } catch (err) {
     // A verb handler that throws (e.g. an unexpected capture failure) lands in
     // the trust bucket; typed capture failures already returned their code.
-    streams.stderr.write(`noise visual-diff: ${err && err.message ? err.message : String(err)}\n`);
+    streams.stderr.write(errorLine('noise visual-diff', err));
     code = EXIT.TRUST;
   }
   process.exit(code);

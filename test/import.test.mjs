@@ -1921,6 +1921,7 @@ describe('runImport CLI boundary', () => {
     );
     assert.equal(code, 3);
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff import \[sri-mismatch\]: /m);
     assert.match(s.err(), /SRI/);
   });
 
@@ -2044,6 +2045,7 @@ describe('import pin/discovery (FR-33/FR-34)', () => {
     assert.equal(code, 3);
     assert.equal(probed.length, 0, 'zero probes');
     assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff import \[NO_BROWSER_PIN\]: /m);
     assert.match(s.err(), /no browser pinned — re-run with --auto-discover-browser/);
     assert.match(s.err(), /set browser in \.visual-diff\/visual-diff\.json/);
     assert.ok(!existsSync(join(dir, '.visual-diff')), 'fresh project: nothing written at all (FR-33)');
@@ -2161,6 +2163,90 @@ describe('import pin/discovery (FR-33/FR-34)', () => {
     }
   });
 
+  // FR-39 cross-side timing contract: one shared drive language is only one
+  // contract if BOTH sides sample the page after the same number of settle
+  // intervals. A comp driven with N steps that samples after 1+N intervals
+  // while the capture samples after 2+N is a FALSE PAIR waiting to happen on
+  // any timer-driven or asynchronously evolving UI — matching drive lists,
+  // matching hashes, different sample moments, and no hash catches it.
+  test('FR-39: comp and capture apply the SAME number of settle intervals for one drive list', async (t) => {
+    const SETTLE = 100;
+    const drive = [{ click: '.open-menu' }, { mouse: 'away' }, { focus: '.item' }];
+    const readiness = {
+      policy: 'domcontentloaded',
+      timeout: 5000,
+      settle: SETTLE,
+      // both side-bound selectors declared: the comp path waits compSelector,
+      // the capture path waits selector, and neither may change the count
+      selector: '.impl-menu',
+      compSelector: '.comp-menu',
+    };
+
+    // --- comp side: the driven reference render inside a full import -------
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    mkdirSync(join(dir, '.visual-diff'), { recursive: true });
+    writeFileSync(
+      join(dir, '.visual-diff', 'visual-diff.json'),
+      JSON.stringify({
+        version: 1,
+        browser: { backend: 'playwright-managed', rung: 1, locator: { executablePath: '/fake/browser' }, browserRevision: '1234' },
+        states: {
+          menu: {
+            route: { url: 'http://127.0.0.1:5999/preview.html' },
+            comp: 'app#01-main',
+            compDrive: drive,
+            readiness,
+            threshold: 1,
+          },
+        },
+      }) + '\n',
+    );
+    const browser = makeFakeBrowser(() =>
+      makeFakePage({
+        ...defaultPageOpts(),
+        screenshots: (opts, _i, page) =>
+          clipSolid(opts, page._calls.click.length > 0 ? [0, 0, 255, 255] : [255, 0, 0, 255]),
+      }),
+    );
+    await importZip(
+      { projectDir: dir, zipPath, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher, log: () => {} },
+    );
+    const drivenPages = browser._pages.filter((p) => p._calls.click.length > 0);
+    assert.equal(drivenPages.length, 2, 'both driven double-renders drove the comp');
+    const compSettles = drivenPages.map((p) => p._calls.waitForTimeout);
+
+    // --- capture side: the same drive through capture's readiness tail -----
+    const { waitReady } = await import('../src/capture.mjs');
+    const capturePage = makeFakePage(defaultPageOpts());
+    const r = await waitReady(capturePage, readiness, { drive });
+    assert.equal(r.selectorFired, true);
+    const captureSettles = capturePage._calls.waitForTimeout;
+
+    // 1 pre-drive + one per step + 1 pre-sample, on BOTH sides
+    const expected = Array(2 + drive.length).fill(SETTLE);
+    assert.deepEqual(captureSettles, expected, 'capture samples after 2 + N settle intervals');
+    for (const settles of compSettles) {
+      assert.deepEqual(settles, expected, 'comp samples after 2 + N settle intervals');
+      assert.deepEqual(
+        settles,
+        captureSettles,
+        'settle timing diverged between the comp and capture drive paths (FR-39 false-pair risk)',
+      );
+    }
+
+    // An UNDRIVEN render keeps the historic single settle on both sides.
+    const undrivenComp = browser._pages.filter((p) => p._calls.click.length === 0);
+    assert.ok(undrivenComp.length > 0);
+    // (unmapped screens render under the hydration default, so compare the
+    // COUNT of intervals, not the configured duration)
+    for (const p of undrivenComp) assert.equal(p._calls.waitForTimeout.length, 1);
+    const plainCapture = makeFakePage(defaultPageOpts());
+    await waitReady(plainCapture, readiness);
+    assert.deepEqual(plainCapture._calls.waitForTimeout, [SETTLE]);
+  });
+
   test('compDrive failures are loud trust errors naming the step or selector', async (t) => {
     const dir = makeProject(t);
     const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
@@ -2224,6 +2310,7 @@ describe('import pin/discovery (FR-33/FR-34)', () => {
     );
     assert.equal(code, 2);
     assert.equal(probed.length, 0, 'preflight fails before any probe');
+    assert.match(s.err(), /^noise visual-diff import \[CONFIG_ERROR\]: /m);
     assert.match(s.err(), /not valid JSON/);
   });
   test('removing a driven state prunes its @state artifacts on the next --refresh', async (t) => {
@@ -2345,6 +2432,7 @@ describe('import pin/discovery (FR-33/FR-34)', () => {
       },
     );
     assert.equal(code, 2);
+    assert.match(s.err(), /^noise visual-diff import \[no-comps\]: /m);
     assert.match(s.err(), /no \.dc\.html comps/);
     assert.ok(!existsSync(join(dir, '.visual-diff')), 'fresh project: nothing written at all (FR-33)');
   });
@@ -3021,7 +3109,7 @@ describe('comp-authored masks', () => {
 // =============================================================================
 
 describe('runtime-conditional screens (driven-only / empty-undriven)', () => {
-  // The reporter's comp shape: a real multi-screen SPA export is ONE app
+  // The shape a real multi-screen SPA export takes: ONE app
   // shell whose screens sit under sc-if wrappers — only the default screen
   // renders at nonzero size undriven; the other six exist only after an
   // interaction. The HTML enumerates all seven; the measurement
@@ -3219,6 +3307,69 @@ describe('runtime-conditional screens (driven-only / empty-undriven)', () => {
     );
     const warnings = (s.err().match(/renders empty undriven — likely a runtime-conditional screen/g) ?? []).length;
     assert.equal(warnings, 6, 'one warning per skipped screen');
+  });
+
+  // Some hydration engines UNMOUNT a runtime-conditional (sc-if) subtree
+  // instead of collapsing it to zero size — the screen is absent from the
+  // post-hydration DOM, not empty. That is the same triage input: the
+  // empty-undriven triage must handle missing screens identically.
+  const MISSING_MEASUREMENT = { missing: true };
+  const unmountingSpaBrowser = () =>
+    makeFakeBrowser(() => {
+      let page;
+      page = makeFakePage({
+        measurement: (id) =>
+          id === '01-home' || page._calls.click.length > 0 ? DEFAULT_MEASUREMENT : MISSING_MEASUREMENT,
+      });
+      return page;
+    });
+
+  test('unmounted (sc-if) screens unmapped: skipped empty-undriven with a warning, import exits 0', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    const s = mockStreams();
+    const code = await runImport(
+      { projectDir: dir, positionals: [zipPath], values: {}, bools: { 'auto-discover-browser': true }, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(unmountingSpaBrowser()), fetcher: goodFetcher, streams: s },
+    );
+    assert.equal(code, 0, 'an unmounted conditional screen must not fail the import');
+    assert.match(s.err(), /02-sessions renders empty undriven — likely a runtime-conditional screen/);
+    const refs = join(dir, '.visual-diff', 'references');
+    const manifest = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    assert.ok(existsSync(join(refs, 'spa#01-home.png')));
+    assert.deepEqual(
+      manifest.comps.spa.screens.filter((x) => x.skipped === 'empty-undriven').map((x) => x.id),
+      SPA_IDS.slice(1),
+    );
+  });
+
+  test('an unmounted screen mapped by a compDrive state renders driven-only', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', SPA_FILES);
+    writeConfig(dir, {
+      'sessions-open': {
+        route: { url: 'http://127.0.0.1:5999/preview.html' },
+        comp: 'spa#02-sessions',
+        compDrive: [{ click: '.nav-sessions' }],
+        readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+        threshold: 1,
+      },
+    });
+    const result = await importZip(
+      { projectDir: dir, zipPath, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(unmountingSpaBrowser()), fetcher: goodFetcher, log: () => {} },
+    );
+    assert.deepEqual(result.summary.comps, ['spa']);
+    const refs = join(dir, '.visual-diff', 'references');
+    const manifest = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    const screens = manifest.comps.spa.screens;
+    const sessions = screens.find((s) => s.id === '02-sessions');
+    assert.equal(sessions.drivenOnly, true);
+    assert.ok(!existsSync(join(refs, 'spa#02-sessions.png')), 'no base reference PNG');
+    assert.ok(existsSync(join(refs, 'spa#02-sessions@sessions-open.png')), 'driven reference written');
+    for (const id of SPA_IDS.slice(2)) {
+      assert.equal(screens.find((s) => s.id === id).skipped, 'empty-undriven');
+    }
   });
 
   test('a screen transitioning to driven-only prunes its stale base artifacts', async (t) => {

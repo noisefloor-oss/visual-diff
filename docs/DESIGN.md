@@ -69,6 +69,32 @@ servers, any hard-coded knowledge of a specific design or project
   3 provenance/trust failure, 4 determinism self-check failure.
 - **FR-4** Every read command supports `--json`; JSON output is stable and
   documented.
+- **FR-4a** Every failure the CLI reports carries that failure's stable code,
+  on the first line of the report, in the one form every verb uses:
+  `noise visual-diff <verb> [<code>]: <message>`. The code sits inside the
+  prefix, before the colon that introduces the message, and a report that runs
+  to several lines (the FR-28 probe report) has every line after the first
+  indented by the renderer. Those two facts together are what make the token
+  unforgeable: the message begins after `: `, and no line of it begins at
+  column 0, so no message — however worded, however hostile, newlines included
+  — can produce a line that parses as a coded head. The guarantee is about
+  that anchored grammar, not about the token in isolation: a fixed-string
+  search for `[frame-truncated]` is not column-anchored and also matches the
+  token quoted inside a message body, so a consumer matches the head pattern
+  rather than a substring. A code is lexically constrained to the two families
+  in use, kebab (`png-decode`) and SCREAMING_SNAKE (`PROVENANCE_TAMPER`, and
+  Node errnos such as `EACCES`); a value that does not fit renders as no code
+  at all rather than as a malformed one that could break the grammar.
+  Refusals are coded too, including those raised without an error object —
+  bad invocation, unknown state, no states defined, no captured run, no
+  published run, the determinism self-check. Only an unexpected internal
+  failure, which carries no code, heads its report `<prefix>: <message>` —
+  byte-identical to the line it printed before codes existed, for every
+  message. Three kinds of stderr output are not failure reports and are
+  unchanged: progress and summary lines, advisory `WARNING` diagnostics (the
+  run continues), and the usage block printed after a usage error. stdout is
+  not involved: `--json` documents are byte-identical, and a refusal under
+  `--json` still leaves stdout empty (there is no JSON error surface).
 
 ### 4.2 `import`
 
@@ -101,10 +127,12 @@ servers, any hard-coded knowledge of a specific design or project
   one reference PNG per screen. A static figure's caption row is excluded;
   caption-free dynamic elements use their whole frame. Each render is subject
   to the FR-38 delivered-frame check. A screen whose undriven frame is empty
-  (a runtime-conditional screen — e.g. an `sc-if` wrapper in a multi-screen
-  SPA export that renders nothing until driven) is triaged, not failed
-  unconditionally: mapped by a `compDrive` state it becomes **driven-only**
-  (FR-37); named exactly (`<comp>#<screen>`) by a non-`compDrive` state it is
+  or MISSING (a runtime-conditional screen — e.g. an `sc-if` wrapper in a
+  multi-screen SPA export; depending on the hydration engine it collapses to
+  zero size or UNMOUNTS the subtree entirely, leaving the screen absent from
+  the DOM) is triaged, not failed unconditionally: mapped by a `compDrive`
+  state it becomes **driven-only** (FR-37); named exactly
+  (`<comp>#<screen>`) by a non-`compDrive` state it is
   a hard usage error naming the driven-only remedy (that state demands the
   screen's undriven reference, which cannot exist) — a whole-comp mapping
   never hardens the triage (compare resolves it to the sole ordinary base
@@ -144,9 +172,10 @@ servers, any hard-coded knowledge of a specific design or project
   harness proceeds and records which path fired. Comp rendering always waits
   for dc-runtime hydration (`<x-dc>` replaced) before fonts + settle.
   Readiness may declare two optional, side-bound selectors: `selector`
-  (implementation side — waited visible by `capture` after the policy wait
-  and before settle) and `compSelector` (comp side — waited visible by
-  `import`'s driven render after its FR-37 steps). A selector that never
+  (implementation side — waited visible by `capture` after the policy wait,
+  after any FR-39 `drive` steps, and before settle) and `compSelector`
+  (comp side — waited visible by `import`'s driven render after its FR-37
+  steps). A selector that never
   appears fails the render loudly (exit 3) naming it — proceeding would
   record a frame of the wrong state. Provenance records each declared
   selector and whether it fired (`selectorFired` / `compSelectorFired`,
@@ -218,6 +247,45 @@ servers, any hard-coded knowledge of a specific design or project
   `effectiveViewport` predates the grow mechanism and rendered exactly at
   its declared viewport, so the gate reads the missing field as the declared
   viewport.
+
+- **FR-39** A state may declare `drive`: an ordered step list that `capture`
+  executes against the **implementation** page to put it into the runtime
+  state the capture must show. It is the capture-side twin of FR-37's
+  `compDrive` and shares its grammar **exactly** — one step is one action,
+  `{ click|hover|focus: selector }`, `{ press: { selector, key } }`, or
+  `{ mouse: "away" }` (park the pointer outside the viewport) — validated by
+  a single shared implementation with a single error vocabulary, so the two
+  keys can never drift into different languages for the same UI state. The
+  motivating case is an SPA export, where every screen is a nav click rather
+  than a distinct URL: one state then drives **both** sides — `compDrive`
+  opens the surface on the comp, `drive` navigates to it in the
+  implementation. Ordering **mirrors the comp side**: `route.setupScript`
+  first (page setup — it may navigate, seed storage, or scroll a page that
+  has not reached readiness), then the readiness policy wait and
+  `document.fonts.ready`, then the settle delay, then the drive steps (each
+  waiting for its target to become visible, acting, then settling), then
+  `readiness.selector`, then the settle delay, then the screenshot; `drive`
+  and `setupScript` may coexist on one state and neither replaces the other.
+  The mirror is settle-for-settle, not merely step-for-step: import's driven
+  render settles once after `readiness.compSelector` too, so for the same
+  drive list **both sides sample after the same number of settle intervals**
+  (2 + N with a drive, 1 without), independently of whether either side
+  declares its optional selector. Unequal sampling moments on a timer-driven
+  or asynchronously evolving UI would produce a false pair — matching drive
+  lists, matching hashes, different sample moments — that no hash can catch;
+  the final settle also keeps the shot from racing a just-fired selector on
+  both sides. A step whose target
+  never becomes visible fails the run loudly (exit 3, `drive-target-missing`,
+  naming the step index, action, and selector) — the capture-side equivalent
+  of import's driven-render failure; recording a frame of the wrong state is
+  never an option. `drive` is semantic configuration exactly like
+  `compDrive`: it enters `configHash` and `stateConfigHash`, so changing,
+  reordering, adding, or removing steps invalidates the pair through the
+  FR-23 gate, and the executed steps are recorded in the capture's
+  provenance as `inputs.drive` (informational evidence; the gating is the
+  per-state hash, as on the reference side). Unlike `compDrive`, `drive`
+  carries no comp-mapping precondition: it names no reference surface, so a
+  capture-only state may drive freely.
 
 ### 4.4 `compare` and `report`
 
@@ -326,9 +394,10 @@ servers, any hard-coded knowledge of a specific design or project
   manifest (`driven: true`, excluded from whole-comp resolution), resolved
   by `compare` under that id, rendered under `--refresh` (config changes do
   not alter the comp content hash), and pruned when the state disappears.
-  `compDrive` is reference-side only (capture drives the implementation via
-  `route.params`/`setupScript`) and is semantic configuration: it enters
-  `configHash`. A capture-only state may not declare it. **Driven-only
+  `compDrive` is reference-side only — the implementation side is driven by
+  FR-39 `drive`, which shares this exact grammar, validator, and error
+  vocabulary (and `route.params`/`setupScript` remain) — and is semantic
+  configuration: it enters `configHash`. A capture-only state may not declare it. **Driven-only
   screens:** a screen whose undriven frame is empty (FR-10) and which is
   mapped only by `compDrive` state(s) skips its base reference entirely —
   the driven reference(s) are its only references, failing loudly through

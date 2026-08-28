@@ -109,10 +109,15 @@ jobs:
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
       - name: Smoke-run version and help
         run: |
-          expected="noise-visual-diff ${GITHUB_REF_NAME#v}"
+          # A shakeout tag (v1.2.3-rc.1) carries a pre-release suffix the
+          # binary's package version never has — strip it, so rc tags smoke
+          # the same build a real tag would, while a genuine version mismatch
+          # (tag v0.9.0 on a 0.8.1 tree) still fails.
+          base="${GITHUB_REF_NAME%%-*}"
+          expected="noise-visual-diff ${base#v}"
           actual=$("./${{ steps.assets.outputs.bin }}" version)
           if [ "$actual" != "$expected" ]; then
-            echo "version smoke failed: got '$actual', want '$expected'" >&2
+            echo "version smoke failed: got '$actual', want '$expected' (tag $GITHUB_REF_NAME)" >&2
             exit 1
           fi
           "./${{ steps.assets.outputs.bin }}" help

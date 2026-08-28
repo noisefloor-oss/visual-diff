@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpDir } from './helpers/tmp.mjs';
 import { join } from 'node:path';
 import { realpathSync } from 'node:fs';
-import { configHash, stateConfigHash } from '../src/config.mjs';
+import { configHash, parseConfig, stateConfigHash } from '../src/config.mjs';
 import {
   PROVENANCE_SCHEMA_VERSION,
   ProvenanceError,
@@ -273,6 +273,66 @@ test('stateConfigHash is an additive optional 64-hex field that round-trips', as
     await writeFile(recordPath, JSON.stringify({ ...JSON.parse(stringifyRecord(makeRecord())), inputs: { ...JSON.parse(stringifyRecord(makeRecord())).inputs, stateConfigHash: 'UPPER' } }));
     await assert.rejects(() => readRecord(recordPath), (err) => err instanceof ProvenanceError && err.code === 'PROVENANCE_SCHEMA');
   });
+});
+
+test('inputs.drive: the executed drive steps are recorded, validated, and round-trip (FR-39)', async () => {
+  await withProject(async (proj) => {
+    const drive = [
+      { click: '.nav-menu' }, { hover: '.row' }, { mouse: 'away' },
+      { focus: '.item' }, { press: { selector: '.item', key: 'Enter' } },
+    ];
+    const record = makeRecord({ inputs: { ...INPUTS, drive } });
+    assert.deepEqual(record.inputs.drive, drive);
+    assert.equal(makeRecord().inputs.drive, undefined, 'absent ≡ drove nothing; old records stay valid');
+
+    const recordPath = join(proj, 'records', 'drive.provenance.json');
+    await writeRecord(recordPath, record);
+    const back = await readRecord(recordPath);
+    assert.deepEqual(back.inputs.drive, drive);
+    assert.equal(stringifyRecord(back), stringifyRecord(record), 'round-trip is byte-identical');
+
+    // the record schema echoes the config grammar's vocabulary
+    const bad = (v) => assert.throws(() => makeRecord({ inputs: { ...INPUTS, drive: v } }), /inputs\.drive/);
+    bad([]);
+    bad('click');
+    bad([{ tap: '.a' }]);
+    bad([{ click: '.a', hover: '.b' }]);
+    bad([{ click: '' }]);
+    bad([{ mouse: 'left' }]);
+    bad([{ press: { selector: '.a' } }]);
+  });
+});
+
+test('provenance gate: a changed drive trips the FR-23 gate through the per-state hash (FR-39)', () => {
+  const mk = (drive) => parseConfig(JSON.stringify({
+    version: 1,
+    states: {
+      menu: {
+        route: 'http://localhost:5173/',
+        readiness: { policy: 'networkidle', timeout: 10000, settle: 250 },
+        threshold: 1,
+        ...(drive === undefined ? {} : { drive }),
+      },
+    },
+  })).config;
+  const none = mk(undefined);
+  const one = mk([{ click: '.nav-menu' }]);
+  const other = mk([{ click: '.nav-help' }]);
+
+  const rec = (config) => makeRecord({
+    inputs: { ...INPUTS, configHash: configHash(config), stateConfigHash: stateConfigHash(config, 'menu') },
+  });
+  // A capture recorded WITH a drive is not comparable to one recorded without.
+  assert.deepEqual(incompatibleFields(rec(none), rec(one)), ['inputs.stateConfigHash']);
+  // Nor is one driven into a different state.
+  assert.deepEqual(incompatibleFields(rec(one), rec(other)), ['inputs.stateConfigHash']);
+  // The same drive stays comparable.
+  assert.deepEqual(incompatibleFields(rec(one), rec(mk([{ click: '.nav-menu' }]))), []);
+  // inputs.drive itself is evidence, never a gated field: it is gated
+  // through the hash above, exactly like the reference side's compDrive.
+  const a = makeRecord({ inputs: { ...INPUTS, drive: [{ click: '.a' }] } });
+  const b = makeRecord({ inputs: { ...INPUTS, drive: [{ click: '.b' }] } });
+  assert.deepEqual(incompatibleFields(a, b), []);
 });
 
 test('provenance gate: the per-state hash replaces the whole-config comparison when both records carry it', () => {

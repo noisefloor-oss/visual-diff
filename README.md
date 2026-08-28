@@ -88,6 +88,26 @@ import once (one reference, six warnings), read the manifest for the screen
 ids, author one `compDrive` state per conditional screen you intend to
 verify, and `import --refresh`.
 
+The implementation usually has the same shape: an SPA where every screen is
+a **nav click**, not a distinct URL. Drive both sides from the one state —
+`compDrive` opens the surface on the comp, `drive` navigates to it in the
+app, in the same language:
+
+```json
+"menu": {
+  "route": { "staticDir": "impl" },
+  "comp": "app#02-menu",
+  "viewport": { "width": 1502, "height": 818, "fullPage": true },
+  "readiness": { "policy": "networkidle", "timeout": 10000, "settle": 250 },
+  "threshold": 1,
+  "compDrive": [{ "click": "[data-comp-menu-button]" }],
+  "drive": [{ "click": "[data-menu-button]" }, { "mouse": "away" }]
+}
+```
+
+One state, one screen id (`app#02-menu@menu`), both sides driven and both
+sides gated by the same per-state config hash.
+
 ### The hill-climb round (repeat until compare exits 0)
 
 ```sh
@@ -206,10 +226,17 @@ Read `regions` to aim the next step: a missing panel shows as hot column
 bands, a thin stray band as one hot row band — a single frame percentage
 cannot tell those apart.
 
-`attribution` goes one step further and names the cause. It is present only
-on FAILING states — a state under its threshold carries `attribution: null`
-and prints nothing, however many pixels differ — and it is computed from
-exactly the scored pixels — masked pixels never appear in a band or a pair:
+`attribution` goes one step further and names the cause. It is present on
+FAILING states, and on PASSING states that qualify for the **uniform-delta
+advisory**: exactly one distinct colour pair, a dominant pair clearing its
+own floors, and at least 64 **attributed** pixels. That combination is the
+signature of a wrong design token — a 1px border repainted the wrong colour
+can never reach a usable mismatch threshold, so the verdict stays `pass`
+while every border in the UI is wrong — while the floors keep routine
+antialiasing from ever printing as a structural claim. Any other state
+under its threshold carries `attribution: null` and prints nothing. It is
+computed from exactly the scored pixels — masked pixels never appear in a
+band or a pair:
 
 - `rowBands` — rows with differing pixels coalesced into contiguous bands,
   top 3 by share: `[{ "y0": 0, "y1": 33, "share": 0.41 }]`
@@ -221,11 +248,16 @@ exactly the scored pixels — masked pixels never appear in a band or a pair:
 - `distinctColorPairs` — how many distinct pairs the mismatch contains. `1`
   means a uniform delta (a wrong token everywhere); thousands means a
   structural shift.
+- `attributedPixels` — the denominator every share above is computed
+  against: differing pixels inside the **shared** region. When the two
+  images differ in size this is smaller than `frame.differingPixels`, which
+  also counts dimension overflow — overflow has no pixel location, so it can
+  be neither banded nor paired.
 
 The human output prints the same two lines after the region rollup, e.g.
 `attribution (diagnostic): row bands: rows 0–32: 41.0% of mismatch` and
-`uniform delta #1a2c42 vs #0e1b2c (78.0% of mismatched pixels, 1 distinct
-color pair)`. Like `regions`, attribution is diagnostic only.
+`uniform delta #1a2c42 vs #0e1b2c (78.0% of 4096 attributed pixels, 1
+distinct color pair)`. Like `regions`, attribution is diagnostic only.
 
 **Units, stated once** (they are not interchangeable): config and CLI
 thresholds are **percent** (0..100); `frame.mismatch`, section/region
@@ -299,6 +331,15 @@ fraction), and a run-level `diff` summary
       "sections": { "canvas": { "x": 0.22, "y": 0.05, "width": 0.78, "height": 0.9 } },
       "masks": { "info-bar": { "x": 0, "y": 0, "width": 1, "height": 0.04 } }
     },
+    "menu": {
+      "route": { "staticDir": "impl" },
+      "comp": "app#02-menu",
+      "viewport": { "width": 1502, "height": 818, "fullPage": true },
+      "readiness": { "policy": "networkidle", "timeout": 10000, "settle": 250 },
+      "threshold": 1,
+      "compDrive": [{ "click": "[data-comp-menu-button]" }],
+      "drive": [{ "click": "[data-menu-button]" }, { "mouse": "away" }]
+    },
     "mobile-01": {
       "route": "http://127.0.0.1:3000/",
       "comp": "atlas-5-mobile#01-canvas",
@@ -355,6 +396,46 @@ fraction), and a run-level `diff` summary
   a frame of the wrong state is worse than no frame. `readiness.compSelector`
   is the comp-side equivalent, consumed by import's driven render (FR-37).
   The two are side-bound by design: never point `selector` at comp markup.
+- `compDrive` (reference side, FR-37) and `drive` (implementation side,
+  FR-39) put a page into a runtime state before its screenshot. **One
+  grammar, one validator, one error vocabulary** — the only difference is
+  which page each drives:
+
+  ```json
+  [
+    { "click": "[data-menu-button]" },
+    { "hover": ".row" },
+    { "focus": ".field" },
+    { "press": { "selector": ".field", "key": "Enter" } },
+    { "mouse": "away" }
+  ]
+  ```
+
+  Each step waits for its target to become **visible**, acts, then settles.
+  `{ mouse: "away" }` parks the pointer outside the viewport (it clears
+  `:hover` where a full-viewport click-catcher keeps it set). A target that
+  never appears fails the run loudly (exit 3) naming the step index, action,
+  and selector — a screenshot of the wrong state is worse than no
+  screenshot.
+
+  Ordering on the capture side mirrors the comp side, settle for settle:
+  `route.setupScript` (page setup) → readiness policy wait → settle →
+  `drive` → `readiness.selector` → settle → screenshot, against the comp's
+  policy wait → settle → `compDrive` → `readiness.compSelector` → settle →
+  screenshot. Both sides therefore sample after the same number of settle
+  intervals for the same drive list — sampling a timer-driven UI at
+  different moments on the two sides would be a false pair no hash catches. `drive` and `setupScript` coexist; `setupScript` is
+  arbitrary JS for seeding a page that has not reached readiness, `drive` is
+  declarative, validated interaction with a settled UI.
+
+  Both keys are **semantic configuration**: they enter the config hash, so
+  changing or reordering steps invalidates that state's pair through the
+  provenance gate (re-import with `--refresh` / re-capture). The steps a
+  capture executed are recorded in its provenance as `inputs.drive`.
+  `compDrive` requires an explicit `<comp>#<screen>` mapping (it drives a
+  reference surface); `drive` requires nothing — a capture-only state may
+  drive freely.
+
 - `comp` is `<comp-name>#<screen-id>` from the import manifest
   (`.visual-diff/references/manifest.json`). States without `comp` are
   capture-only.
@@ -538,7 +619,7 @@ node src/cli.mjs <verb> ...
 npm run build:sea
 
 # suite version (deployment gates compare this verbatim)
-noise visual-diff version    # -> noise-visual-diff 0.9.0
+noise visual-diff version    # -> noise-visual-diff 0.10.0
 ```
 
 **Uninstall / data retention:** the tool writes `.visual-diff/` inside the

@@ -101,6 +101,7 @@ import { init, guardProjectPath, layoutFor, PathEscapeError } from './artifact-l
 import { ConfigError, effectiveMasks, loadConfig, parseCompRef, stateConfigHash } from './config.mjs';
 import { discoverComps } from './comps.mjs';
 import { waitReady } from './capture.mjs';
+import { runDriveSteps } from './drive.mjs';
 import { probeCompAuthoredMasks, probeMaskElements, probeToRegion } from './masks.mjs';
 import { acquireBrowser } from './discover.mjs';
 import {
@@ -112,6 +113,7 @@ import {
 } from './provenance.mjs';
 import { isTimeoutError, loadVendorManifest, renderPage, verifySri } from './render.mjs';
 import { resolveBrowser } from './browser.mjs';
+import { codedLine, errorLine } from './cli-error.mjs';
 import extractDesignZip, {
   ZipError,
 } from './unzip.mjs';
@@ -569,32 +571,36 @@ async function renderCompScreen({
     const { pathFired } = await waitForReferenceReady(page, readiness);
     // FR-37: drive the comp into the runtime state before measuring and
     // shooting — each step waits for its target, acts, settles; then the
-    // comp-side readiness selector (side-bound, FR-16). The frame is
-    // measured AFTER driving so driven layout changes crop correctly.
+    // comp-side readiness selector (side-bound, FR-16), then one final
+    // settle before the frame is sampled. The frame is measured AFTER
+    // driving so driven layout changes crop correctly.
+    //
+    // FR-39 timing contract — the two sides sample after the SAME number of
+    // settle intervals for the same drive list (see src/capture.mjs
+    // waitReady, which states the mirrored sequence):
+    //   comp:    policy wait + fonts -> settle -> [wait target, act, settle]
+    //            xN -> compSelector? -> settle -> measure + screenshot
+    //   capture: policy wait + fonts -> settle -> [wait target, act, settle]
+    //            xN -> selector? -> settle -> screenshot
+    // Both are 2 + N settle intervals with a drive, 1 without (an undriven
+    // render settles once inside waitForReferenceReady and never enters this
+    // branch). Sampling a timer-driven UI at different moments on the two
+    // sides would produce a false pair — matching drive lists, matching
+    // hashes, different sample moments — which is exactly what one shared
+    // drive language exists to prevent.
     let compSelectorFired;
     if (drive !== undefined) {
-      for (const [i, step] of drive.entries()) {
-        const [action, arg] = Object.entries(step)[0];
-        // FR-37: pointer-release and keyboard actions — { mouse: "away" }
-        // parks the pointer OUTSIDE the viewport (a full-viewport
-        // click-catcher holds :hover for any in-viewport position);
-        // { press: { selector, key } } activates by keyboard.
-        if (action === 'mouse') {
-          await page.mouse.move(-1, -1);
-          if (readiness.settle > 0) await page.waitForTimeout(readiness.settle);
-          continue;
-        }
-        const selector = action === 'press' ? arg.selector : arg;
-        try {
-          await page.waitForSelector(selector, { state: 'visible', timeout: readiness.timeout });
-        } catch (err) {
-          if (!isTimeoutError(err)) throw err;
+      // The step loop itself is src/drive.mjs's runDriveSteps — the SAME
+      // execution the capture side's `drive` uses (FR-39), so a step can
+      // never mean one thing against the comp and another against the
+      // implementation. Only the typed failure is side-specific.
+      await runDriveSteps(page, drive, {
+        timeout: readiness.timeout,
+        settle: readiness.settle,
+        onTargetMissing: (i, action, selector) => {
           throw trustError('drive-target-missing', `compDrive step ${i} (${action} ${JSON.stringify(selector)}) never became visible within ${readiness.timeout}ms — the comp cannot be driven into this state`);
-        }
-        if (action === 'press') await page.press(selector, arg.key);
-        else await page[action](selector);
-        if (readiness.settle > 0) await page.waitForTimeout(readiness.settle);
-      }
+        },
+      });
       if (readiness.compSelector !== undefined) {
         try {
           await page.waitForSelector(readiness.compSelector, { state: 'visible', timeout: readiness.timeout });
@@ -604,9 +610,19 @@ async function renderCompScreen({
           throw trustError('comp-selector-missing', `readiness compSelector ${JSON.stringify(readiness.compSelector)} never became visible within ${readiness.timeout}ms — refusing to record a reference of the wrong state`);
         }
       }
+      // The pre-sample settle: the shot must never race a just-fired
+      // compSelector (the capture side has always guaranteed this before its
+      // screenshot), and it is what keeps the two sides' settle counts equal.
+      // Unconditional inside this branch on purpose — the counts must not
+      // depend on whether a side happens to declare its optional selector.
+      if (readiness.settle > 0) await page.waitForTimeout(readiness.settle);
     }
     const measured = await measureScreenFrame(page, screenId);
     if (measured.missing) {
+      // A runtime conditional (sc-if) UNMOUNTS its subtree rather than
+      // collapsing it to zero size, so an undriven conditional screen is
+      // absent from the DOM, not empty. Both are the same triage input.
+      if (allowEmpty) return { empty: true, frame: { x: 0, y: 0, width: 0, height: 0 } };
       throw usageError('screen-missing', `screen ${JSON.stringify(screenId)} not found in ${url} after hydration`);
     }
     const frame = screenFrameRect(measured.figRect, measured.capRect);
@@ -2026,10 +2042,10 @@ export async function runImport(options, deps = {}) {
   try {
     const { positionals = [], values = {}, bools = {} } = options;
     if (positionals.length !== 1) {
-      const msg = positionals.length === 0
-        ? 'missing design-export.zip argument'
-        : `expected exactly one design-export.zip argument (got ${positionals.length})`;
-      stderr.write(`noise visual-diff import: ${msg}\n`);
+      const [code, msg] = positionals.length === 0
+        ? ['no-zip', 'missing design-export.zip argument']
+        : ['too-many-args', `expected exactly one design-export.zip argument (got ${positionals.length})`];
+      stderr.write(codedLine('noise visual-diff import', code, msg));
       return 2;
     }
     const result = await importZip(
@@ -2051,7 +2067,7 @@ export async function runImport(options, deps = {}) {
     for (const name of s.removed) stderr.write(`noise visual-diff import: removed references for ${name}\n`);
     return 0;
   } catch (err) {
-    stderr.write(`noise visual-diff import: ${importErrorMessage(err)}\n`);
+    stderr.write(errorLine('noise visual-diff import', err, importErrorMessage(err)));
     return importExitCode(err);
   }
 }

@@ -32,6 +32,7 @@ import { LayoutError, layoutFor } from './artifact-layout.mjs';
 import { loadPublishedReport, ReportError } from './report.mjs';
 import { readCurrentRun, RunError } from './run.mjs';
 import { runCompare } from './compare.mjs';
+import { codedLine, errorLine } from './cli-error.mjs';
 
 function pct(v) {
   return `${(v * 100).toFixed(4)}%`;
@@ -86,7 +87,7 @@ export async function runVerifyNeutral(options, deps = {}) {
     layout = layoutFor(options.projectDir);
   } catch (err) {
     if (err instanceof LayoutError) {
-      stderr.write(`noise visual-diff verify-neutral: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff verify-neutral', err));
       return { code: err.exitCode, runId: null, rows: [] };
     }
     throw err;
@@ -97,13 +98,19 @@ export async function runVerifyNeutral(options, deps = {}) {
     current = await readCurrentRun(layout);
   } catch (err) {
     if (err instanceof RunError) {
-      stderr.write(`noise visual-diff verify-neutral: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff verify-neutral', err));
       return { code: err.exitCode, runId: null, rows: [] };
     }
     throw err;
   }
   if (current === null) {
-    stderr.write('noise visual-diff verify-neutral: no published run — run capture and compare first; there is nothing to verify neutrality against\n');
+    stderr.write(
+      codedLine(
+        'noise visual-diff verify-neutral',
+        'no-published-run',
+        'no published run — run capture and compare first; there is nothing to verify neutrality against',
+      ),
+    );
     return { code: 2, runId: null, rows: [] };
   }
   const runId = current.runId;
@@ -113,7 +120,7 @@ export async function runVerifyNeutral(options, deps = {}) {
     baseline = await loadPublishedReport(layout, runId);
   } catch (err) {
     if (err instanceof ReportError) {
-      stderr.write(`noise visual-diff verify-neutral: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff verify-neutral', err));
       return { code: err.exitCode, runId, rows: [] };
     }
     throw err;
@@ -142,7 +149,11 @@ export async function runVerifyNeutral(options, deps = {}) {
     await rm(runDir, { recursive: true, force: true });
     await rename(backupDir, runDir);
     stderr.write(
-      `noise visual-diff verify-neutral: re-compare of run ${runId} crashed (${err?.message ?? err}) — the published baseline was restored untouched\n`,
+      errorLine(
+        'noise visual-diff verify-neutral',
+        err,
+        `re-compare of run ${runId} crashed (${err?.message ?? err}) — the published baseline was restored untouched`,
+      ),
     );
     return { code: 3, runId, rows: [] };
   }
@@ -153,8 +164,12 @@ export async function runVerifyNeutral(options, deps = {}) {
     await rm(runDir, { recursive: true, force: true });
     await rename(backupDir, runDir);
     stderr.write(
-      `noise visual-diff verify-neutral: re-compare of run ${runId} refused (exit ${res.code}) — ` +
-        'the project no longer satisfies compare’s gates; the published baseline was restored untouched\n',
+      codedLine(
+        'noise visual-diff verify-neutral',
+        'recompare-refused',
+        `re-compare of run ${runId} refused (exit ${res.code}) — ` +
+          'the project no longer satisfies compare’s gates; the published baseline was restored untouched',
+      ),
     );
     return { code: 3, runId, rows: [] };
   }

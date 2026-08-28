@@ -135,6 +135,116 @@ test('compDrive pointer-release and keyboard actions (FR-37)', () => {
   rejects({ states: { s: { ...base, comp: 'app#01-main', compDrive: [{ press: '.a' }] } } }, '$.states.s.compDrive[0].press');
 });
 
+// FR-39: `drive` is the capture-side twin of `compDrive`. The grammar, the
+// validator, and the error vocabulary are ONE implementation — a divergence
+// between the two keys is exactly the failure this feature closes, so the
+// suite drives every case through both keys and compares the messages.
+const DRIVE_REJECTIONS = [
+  { steps: [], at: '' },
+  { steps: [{ click: '.a', hover: '.b' }], at: '[0]' },
+  { steps: [{ tap: '.a' }], at: '[0]' },
+  { steps: [{}], at: '[0]' },
+  { steps: ['.a'], at: '[0]' },
+  { steps: [{ click: '' }], at: '[0].click' },
+  { steps: [{ click: 7 }], at: '[0].click' },
+  { steps: [{ hover: '' }], at: '[0].hover' },
+  { steps: [{ focus: '' }], at: '[0].focus' },
+  { steps: [{ mouse: 'left' }], at: '[0].mouse' },
+  { steps: [{ press: '.a' }], at: '[0].press' },
+  { steps: [{ press: { selector: '.a' } }], at: '[0].press.key' },
+  { steps: [{ press: { key: 'Enter' } }], at: '[0].press.selector' },
+  { steps: [{ press: { selector: '.a', key: '' } }], at: '[0].press.key' },
+  { steps: [{ press: { selector: '.a', key: 'Enter', extra: 1 } }], at: '[0].press.extra' },
+  { steps: [{ click: '.ok' }, { mouse: 'nope' }], at: '[1].mouse' },
+];
+
+const DRIVE_STEPS = [
+  { click: '.menu' }, { hover: '.row' }, { mouse: 'away' }, { focus: '.item' },
+  { press: { selector: '.item', key: 'Enter' } },
+];
+
+test('drive and compDrive share ONE grammar, validator, and error vocabulary (FR-39)', () => {
+  const base = { route: URL_ROUTE, readiness: READY, threshold: 1, comp: 'app#01-main' };
+  const parse = (key, steps) => parseConfig(JSON.stringify({ states: { s: { ...base, [key]: steps } } }));
+
+  for (const key of ['compDrive', 'drive']) {
+    const good = parse(key, DRIVE_STEPS);
+    assert.deepEqual(good.config.states.s[key], DRIVE_STEPS);
+    // round-trips through the authoring document unchanged
+    assert.deepEqual(configToDocument(good.config).states.s[key], DRIVE_STEPS);
+    // absent ≡ none
+    assert.equal(parse(key, undefined).config.states.s[key], undefined);
+  }
+
+  // Every rejection compDrive has, `drive` has — same path, same reason
+  // modulo the key name it names.
+  const reasonFor = (key, steps) => {
+    try {
+      parse(key, steps);
+    } catch (err) {
+      assert.ok(err instanceof ConfigError);
+      return { path: err.path, reason: err.reason };
+    }
+    assert.fail(`${key} ${JSON.stringify(steps)} should have been rejected`);
+  };
+  for (const { steps, at } of DRIVE_REJECTIONS) {
+    const c = reasonFor('compDrive', steps);
+    const d = reasonFor('drive', steps);
+    assert.equal(c.path, `$.states.s.compDrive${at}`);
+    assert.equal(d.path, `$.states.s.drive${at}`);
+    assert.equal(
+      d.reason,
+      c.reason.replaceAll('compDrive', 'drive'),
+      `grammar drift between compDrive and drive for ${JSON.stringify(steps)}`,
+    );
+  }
+});
+
+test('drive has no comp-mapping precondition; compDrive keeps its own (FR-39)', () => {
+  const base = { route: URL_ROUTE, readiness: READY, threshold: 1 };
+  // A capture-only state (no comp mapping) may drive the implementation: an
+  // SPA export's screens are nav clicks, not URLs.
+  const captureOnly = parseConfig(JSON.stringify({ states: { s: { ...base, drive: [{ click: '.nav' }] } } }));
+  assert.deepEqual(captureOnly.config.states.s.drive, [{ click: '.nav' }]);
+  // A whole-comp mapping is fine too — `drive` names no reference surface.
+  const wholeComp = parseConfig(JSON.stringify({ states: { s: { ...base, comp: 'app', drive: [{ click: '.nav' }] } } }));
+  assert.deepEqual(wholeComp.config.states.s.drive, [{ click: '.nav' }]);
+  // compDrive's reference-side preconditions are unchanged.
+  rejects({ states: { s: { ...base, compDrive: [{ click: '.a' }] } } }, '$.states.s.compDrive');
+  rejects({ states: { s: { ...base, comp: 'app', compDrive: [{ click: '.a' }] } } }, '$.states.s.compDrive');
+
+  // Both sides of one state: the pairing this feature exists for.
+  const both = parseConfig(JSON.stringify({
+    states: { s: { ...base, comp: 'app#02-menu', compDrive: [{ click: '.comp-menu' }], drive: [{ click: '.app-menu' }] } },
+  }));
+  assert.deepEqual(both.config.states.s.compDrive, [{ click: '.comp-menu' }]);
+  assert.deepEqual(both.config.states.s.drive, [{ click: '.app-menu' }]);
+  assert.deepEqual(configToDocument(both.config).states.s.drive, [{ click: '.app-menu' }]);
+});
+
+test('drive is semantic configuration: it enters configHash and stateConfigHash (FR-39)', () => {
+  const base = { route: URL_ROUTE, readiness: READY, threshold: 1 };
+  const cfg = (drive) => parseConfig(JSON.stringify({
+    states: { s: drive === undefined ? { ...base } : { ...base, drive }, other: { ...base } },
+  }));
+  const none = cfg(undefined);
+  const one = cfg([{ click: '.nav-menu' }]);
+  const other = cfg([{ click: '.nav-help' }]);
+  const ordered = cfg([{ click: '.nav-help' }, { click: '.nav-menu' }]);
+
+  assert.notEqual(none.hash, one.hash);
+  assert.notEqual(one.hash, other.hash);
+  assert.notEqual(stateConfigHash(none.config, 's'), stateConfigHash(one.config, 's'));
+  assert.notEqual(stateConfigHash(one.config, 's'), stateConfigHash(other.config, 's'));
+  // Step ORDER is semantic — the same steps in another order is another state.
+  assert.notEqual(
+    stateConfigHash(cfg([{ click: '.nav-menu' }, { click: '.nav-help' }]).config, 's'),
+    stateConfigHash(ordered.config, 's'),
+  );
+  // Per-state granularity survives: driving state s never moves state other.
+  assert.equal(stateConfigHash(none.config, 'other'), stateConfigHash(one.config, 'other'));
+});
+
 test('masks: absent ≡ empty, validated like sections minus threshold, excluded from the hash (FR-36)', () => {
   const base = { route: URL_ROUTE, readiness: READY, threshold: 1 };
   const MASK = { x: 0, y: 0, width: 1, height: 0.04 };

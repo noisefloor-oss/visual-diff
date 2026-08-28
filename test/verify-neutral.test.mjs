@@ -162,7 +162,7 @@ describe('verify-neutral', () => {
     await rm(layout.capturePng('r1', 'home'));
     const res = await verifyAt(dir);
     assert.equal(res.code, 3);
-    assert.match(res.streams.err(), /re-compare of run r1 refused/);
+    assert.match(res.streams.err(), /^noise visual-diff verify-neutral \[recompare-refused\]: re-compare of run r1 refused/m);
     assert.match(res.streams.err(), /baseline was restored/);
     // the published report is byte-intact
     const restored = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
@@ -186,7 +186,7 @@ describe('verify-neutral', () => {
     await init(dir);
     const res = await verifyAt(dir);
     assert.equal(res.code, 2);
-    assert.match(res.streams.err(), /no published run/);
+    assert.match(res.streams.err(), /^noise visual-diff verify-neutral \[no-published-run\]: no published run/m);
     assert.equal(res.streams.out(), '');
   });
 
@@ -198,8 +198,13 @@ describe('verify-neutral', () => {
       },
     });
     assert.equal(res.code, 3);
-    assert.match(res.streams.err(), /re-compare of run r1 crashed \(EACCES/);
-    assert.match(res.streams.err(), /baseline was restored/);
+    // The thrown error is a plain Error carrying no code, so the boundary
+    // line degrades to the uncoded form: prefix, message, no bracket.
+    assert.equal(
+      res.streams.err(),
+      'noise visual-diff verify-neutral: re-compare of run r1 crashed ' +
+        '(EACCES: simulated mid-compare crash) — the published baseline was restored untouched\n',
+    );
     // the published run directory is back, byte-intact, and still pointed at
     const restored = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
     assert.equal(restored.states.home.frame.differingPixels, 0);

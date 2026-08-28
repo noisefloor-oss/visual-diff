@@ -509,6 +509,7 @@ describe('canonical FR-23 pipeline (import → config → capture → compare)',
 
     const cmp = await runCompareVerb(dir, 'r-pipe-0002');
     assert.equal(cmp.r.code, 3, cmp.s.err());
+    assert.match(cmp.s.err(), /^noise visual-diff compare \[provenance-mismatch\]: /m);
     assert.match(cmp.s.err(), /provenance gate failed for state home/);
     assert.match(cmp.s.err(), /inputs\.readiness\.policy/);
     assert.match(cmp.s.err(), /inputs\.configHash/);

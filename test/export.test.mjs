@@ -50,7 +50,25 @@ const PRIVATE_VOCAB = [
   new RegExp('noisefloor' + '-app'),
   new RegExp('brain' + 'company'),
   new RegExp('doug' + '@'),
+  // The field-report register. Scoped hard, because this class is not
+  // reliably detectable by vocabulary: what makes "the reporter's comp
+  // shape" a leak is that the reader cannot see the reporter, and no
+  // pattern knows who is visible. These match only ADJACENT constructions
+  // that cannot mean anything else — a definite possessive, or a crediting
+  // verb immediately after the bare noun. Any modifier between them ("the
+  // error reporter's output", "the crash reporter found") names a
+  // component and passes, as do plurals and ordinary prose about field or
+  // stress testing. What this misses is a review responsibility, not a gap
+  // the gate pretends to cover.
+  new RegExp('\\bthe (?:report|test)' + 'er[\u2019\']s\\b', 'i'),
+  new RegExp('\\bthe (?:report|test)' + 'er (?:said|found|reported|observed|noted|filed|flagged|hit)\\b', 'i'),
+  new RegExp('\\bfield[ -]' + 'report\\b', 'i'),
 ];
+
+/** Every banned pattern a line trips, so the rules are testable directly. */
+function privateReferenceHits(line) {
+  return [...EXCLUDED_PATH_REFS, ...PRIVATE_VOCAB].filter((re) => re.test(line));
+}
 
 const SCAN_EXT = new Set(['.mjs', '.md', '.yml', '.yaml', '.json']);
 const SKIP_FILES = new Set([SELF, 'package-lock.json']);
@@ -79,10 +97,38 @@ test('export: git archive payload has no dangling refs or private vocabulary', (
     if (dot === -1 || !SCAN_EXT.has(rel.slice(dot))) continue;
     const lines = readFileSync(join(out, rel), 'utf8').split('\n');
     lines.forEach((line, i) => {
-      for (const re of [...EXCLUDED_PATH_REFS, ...PRIVATE_VOCAB]) {
-        if (re.test(line)) findings.push(`${rel}:${i + 1}: ${re} :: ${line.trim().slice(0, 120)}`);
+      for (const re of privateReferenceHits(line)) {
+        findings.push(`${rel}:${i + 1}: ${re} :: ${line.trim().slice(0, 120)}`);
       }
     });
   }
   assert.deepEqual(findings, [], `private references in the export payload:\n${findings.join('\n')}`);
+});
+
+// These fixtures are only safe here because this file is in SKIP_FILES —
+// the archive scan never reads it, so the leak examples below cannot trip
+// the gate they define.
+test('export: the rules catch report-context gestures without banning ordinary prose', () => {
+  for (const leak of [
+    "The reporter's comp shape: a real SPA export",
+    'The reporter\u2019s comp shape is private',
+    'the tester found a blocker in the ladder',
+    'from the field report, two failures',
+  ]) {
+    assert.ok(privateReferenceHits(leak).length > 0, `must be caught: ${leak}`);
+  }
+  for (const legit of [
+    'The stress test verifies memory behaviour under load',
+    'a battlefield test of the discovery ladder',
+    'the error reporter emits JSON on stderr',
+    'Error reporters collect stack traces',
+    'The error reporter found no matching source map',
+    'The field test verifies radio behaviour outdoors',
+    'The crash reporter\u2019s output is a JSON blob',
+    'Issues are open for bug reports and feedback',
+    'the report verb prints the published verdict',
+    'a test error is reported with its exit code',
+  ]) {
+    assert.deepEqual(privateReferenceHits(legit), [], `must stay exportable: ${legit}`);
+  }
 });

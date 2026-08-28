@@ -6,12 +6,12 @@
 //
 // Dispatch under test (the noise suite host contract):
 //   - standalone:    exec <entry> <verb> ...
-//   - real host:     `noise visual-diff <verb> ...` — used only when a noise
-//                    host binary is present AND the visual-diff entry is
-//                    installed in its libexec root (a machine that ran
-//                    noise-setup). This repo never writes into the live
-//                    libexec root (NFR-3), so in CI/dev the entry cannot
-//                    be installed and this path is not taken.
+//   - real host:     `noise visual-diff <verb> ...` — opt-in, requested with
+//                    NOISE_VD_HOST_ORACLE=1 on a machine whose libexec root
+//                    holds an entry built from THIS source. Requesting it is
+//                    binding: the run fails if host dispatch cannot actually
+//                    be selected, so a job that means to exercise it cannot
+//                    pass by quietly falling back.
 //   - substitution:  exec <entry> visual-diff <verb> ... — the documented
 //                    fallback, run by the packaging contract test. It is the
 //                    exact exec the host performs on the libexec entry,
@@ -130,6 +130,12 @@ function run(cmd, args, opts = {}) {
 let sea = null; // { node, dist, entry, manifest }
 let dispatch = null; // { kind: 'host' | 'substitution', label, cmd, argsOf }
 
+// Opt in to the real-host oracle. Requesting it is binding: if the host is
+// missing, the entry is not installed, or the installed entry is a different
+// version than this checkout, the run fails instead of substituting — a job
+// that asks to exercise host dispatch must actually exercise it.
+const HOST_ORACLE_REQUESTED = process.env.NOISE_VD_HOST_ORACLE === '1';
+
 const node = findNodeBinary();
 const buildDeps = ['esbuild', 'postject'].every((d) =>
   existsSync(join(repoRoot, 'node_modules', d)),
@@ -157,29 +163,48 @@ before(async () => {
     manifest: JSON.parse(readFileSync(join(DIST_DIR, 'manifest.json'), 'utf8')),
   };
 
-  const host = findHost();
-  if (host) {
+  // The real-host oracle is opt-in, and opting in is binding (see
+  // HOST_ORACLE_REQUESTED below). Auto-selecting it was wrong in both
+  // directions. It cannot be trusted when it is available: the installed entry
+  // is a RELEASE build, this checkout is not, and no probe can prove the two
+  // were built from the same source — the version string is equal for every
+  // unreleased branch of a released semver, so the oracle would compare the
+  // released binary's behavior against modified working-tree source and fail
+  // any honest change to a diagnostic line. And it cannot be relied on when it
+  // is absent: silently substituting for it let a run that meant to exercise
+  // host dispatch pass without ever touching it. So: the default is the
+  // documented substitution, which execs the entry built from THIS source; a
+  // job that wants the real host asks for it and is held to it.
+  const host = HOST_ORACLE_REQUESTED ? findHost() : null;
+  if (HOST_ORACLE_REQUESTED) {
+    assert.ok(
+      host,
+      'NOISE_VD_HOST_ORACLE=1 but no noise host binary was found ' +
+        '(set NOISE_HOST, or unset NOISE_VD_HOST_ORACLE to use the substitution)',
+    );
     // The live libexec root is never written by this repo (NFR-3); a real-host
-    // dispatch is possible only where the entry is already installed. Detect
-    // that; otherwise fall back to the documented substitution.
+    // dispatch is possible only where the entry is already installed.
     const probe = run(host, ['visual-diff', 'report']);
-    // A host is only a valid oracle when its installed entry was built from
-    // this checkout's version — a stale install (older semver) would compare
-    // old behavior against new source. Fall back to substitution then.
+    assert.notEqual(probe.status, 127, `noise host at ${host} is not executable`);
+    assert.doesNotMatch(
+      probe.stderr,
+      /plugin not installed/,
+      `the visual-diff entry is not installed in the libexec root of ${host}`,
+    );
     const installedVersion = run(host, ['visual-diff', 'version']);
     const devVersion = run(process.execPath, [cliPath, 'version']);
-    const reachable =
-      probe.status !== 127 &&
-      !/plugin not installed/.test(probe.stderr) &&
-      installedVersion.stdout === devVersion.stdout;
-    if (reachable) {
-      dispatch = {
-        kind: 'host',
-        label: `real noise host (${host})`,
-        cmd: host,
-        argsOf: (args) => ['visual-diff', ...args],
-      };
-    }
+    assert.equal(
+      installedVersion.stdout,
+      devVersion.stdout,
+      `the installed entry is ${installedVersion.stdout.trim()} but this checkout is ` +
+        `${devVersion.stdout.trim()} — it cannot stand in as the oracle for this source`,
+    );
+    dispatch = {
+      kind: 'host',
+      label: `real noise host (${host})`,
+      cmd: host,
+      argsOf: (args) => ['visual-diff', ...args],
+    };
   }
   if (!dispatch) {
     dispatch = {
@@ -230,6 +255,16 @@ test('packaging: staged manifest records version, node version, and sha256', (t)
 test('packaging: dispatch mode selected (real host or documented substitution)', (t) => {
   if (!ready) return t.skip('prerequisites unavailable (node binary / esbuild / postject)');
   assert.ok(dispatch, 'no dispatch mode — build prerequisites missing?');
+  // Asking for the host oracle and getting the substitution is the silent
+  // failure this guards: the probes below would all pass without the real
+  // host ever being dispatched through.
+  if (HOST_ORACLE_REQUESTED) {
+    assert.equal(
+      dispatch.kind,
+      'host',
+      'NOISE_VD_HOST_ORACLE=1 was set but host dispatch was not selected',
+    );
+  }
   t.diagnostic(`dispatch: ${dispatch.kind} — ${dispatch.label}`);
 });
 

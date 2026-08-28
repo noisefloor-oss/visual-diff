@@ -113,7 +113,7 @@ test('dispatch: unknown verb is a usage error', () => {
   const code = run(['frobnicate'], {}, CWD, s);
   assert.equal(code, EXIT.USAGE);
   assert.equal(s.out(), '');
-  assert.match(s.err(), /unknown verb: frobnicate/);
+  assert.match(s.err(), /^noise visual-diff \[unknown-verb\]: unknown verb: frobnicate/m);
 });
 
 test('dispatch: no arguments is a usage error', () => {
@@ -121,7 +121,7 @@ test('dispatch: no arguments is a usage error', () => {
   const code = run([], {}, CWD, s);
   assert.equal(code, EXIT.USAGE);
   assert.equal(s.out(), '');
-  assert.match(s.err(), /missing verb/);
+  assert.match(s.err(), /^noise visual-diff \[no-verb\]: missing verb/m);
   assert.match(s.err(), /usage:/);
   assert.match(s.err(), /try 'noise visual-diff help'/, 'error path points at the help verb');
 });
@@ -164,7 +164,7 @@ test('help: unknown topic is a usage error (exit 2, stderr, with hint)', () => {
   const code = run(['help', 'frobnicate'], {}, CWD, s);
   assert.equal(code, EXIT.USAGE);
   assert.equal(s.out(), '');
-  assert.match(s.err(), /unknown help topic: frobnicate/);
+  assert.match(s.err(), /^noise visual-diff \[unknown-help-topic\]: unknown help topic: frobnicate/m);
   assert.match(s.err(), /usage:/);
   assert.match(s.err(), /try 'noise visual-diff help'/);
 });
@@ -183,7 +183,7 @@ test('help: --help after the verb stays an unknown-flag error (parse is single-p
   const code = run(['compare', '--help'], {}, CWD, s);
   assert.equal(code, EXIT.USAGE);
   assert.equal(s.out(), '');
-  assert.match(s.err(), /unknown flag for compare: --help/);
+  assert.match(s.err(), /^noise visual-diff \[unknown-flag\]: unknown flag for compare: --help/m);
 });
 
 test('help: drift guard — every verb and flag in VERB_SPECS appears in the help', () => {
@@ -572,8 +572,7 @@ test('host contract: an invalid NOISE_PROJECT_DIR surfaces as exit 2 with clean 
   const code = run(['report'], { NOISE_PROJECT_DIR: 'relative' }, CWD, s);
   assert.equal(code, EXIT.USAGE);
   assert.equal(s.out(), '', 'stdout must stay clean on a host-contract refusal');
-  assert.match(s.err(), /NOISE_PROJECT_DIR/);
-  assert.match(s.err(), /absolute directory/);
+  assert.match(s.err(), /^noise visual-diff \[bad-project-dir\]: NOISE_PROJECT_DIR must be an absolute directory/m);
 });
 
 // --- End-to-end exit codes (the load-bearing contract) -----------------------

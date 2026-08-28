@@ -24,6 +24,8 @@ import {
   bandRects,
   diffAttribution,
   diffSection,
+  UNIFORM_ADVISORY_MIN_PIXELS,
+  uniformDeltaAdvisory,
   parseThresholdOverride,
   pixelDiff,
   regionRollup,
@@ -618,6 +620,7 @@ describe('driven-state failure diagnostics (FR-37)', () => {
     await withProject(config, { 'app#01-main': ref }, { r1: { home: ref } }, async ({ dir }) => {
       const res = await compareAt(dir);
       assert.equal(res.code, 2);
+      assert.match(res.streams.err(), /^noise visual-diff compare \[no-reference\]: /m);
       assert.match(res.streams.err(), /no reference PNG at reference app#01-main@home/);
       assert.match(res.streams.err(), /import --refresh/);
       assert.doesNotMatch(res.streams.err(), /--refresh.*run import before compare/);
@@ -2041,6 +2044,7 @@ test('compare fails closed when the run holds none of the selected states', asyn
       const res = await compareAt(dir, { values: { state: ['settings'] } });
       assert.equal(res.code, 3);
       assert.equal(res.report, null);
+      assert.match(res.streams.err(), /^noise visual-diff compare \[capture-missing\]: /m);
       assert.match(res.streams.err(), /capture artifact missing/);
       assert.match(res.streams.err(), /holds no capture for the selected state\(s\) settings/);
     },
@@ -2078,6 +2082,7 @@ test('a threshold below the measured noise floor is refused (exit 2) unless --fo
       const refused = await compareAt(dir);
       assert.equal(refused.code, 2);
       assert.equal(refused.report, null);
+      assert.match(refused.streams.err(), /^noise visual-diff compare \[threshold-below-noise-floor\]: /m);
       assert.match(refused.streams.err(), /threshold below the measured noise floor/);
       assert.match(refused.streams.err(), /10%/);
 
@@ -2237,6 +2242,7 @@ describe('provenance gate (FR-23)', () => {
     });
     const res = await compareAt(proj.dir, { values: { state: ['home'] } });
     assert.equal(res.code, 3);
+    assert.match(res.streams.err(), /^noise visual-diff compare \[provenance-mismatch\]: /m);
     assert.match(res.streams.err(), /provenance gate failed/);
     assert.match(res.streams.err(), /inputs\.stateConfigHash/);
   });
@@ -2360,7 +2366,7 @@ describe('usage failures (exit 2)', () => {
     const res = await compareAt(dir);
     assert.equal(res.code, 2);
     assert.equal(res.report, null);
-    assert.match(res.streams.err(), /no states defined — author \.visual-diff\/visual-diff\.json/);
+    assert.match(res.streams.err(), /^noise visual-diff compare \[no-states\]: no states defined — author \.visual-diff\/visual-diff\.json/m);
   });
 
   test('a malformed browser pin is a usage error (exit 2) — compare loads config', async () => {
@@ -2394,7 +2400,7 @@ describe('usage failures (exit 2)', () => {
     await withProject(config, { 'app#01-main': ref }, {}, async ({ dir }) => {
       const res = await compareAt(dir, { runId: null });
       assert.equal(res.code, 2);
-      assert.match(res.streams.err(), /no captured run/);
+      assert.match(res.streams.err(), /^noise visual-diff compare \[no-captured-run\]: no captured run/m);
       assert.doesNotMatch(res.streams.err(), /pinned|browser/);
     });
   });
@@ -2429,7 +2435,7 @@ describe('usage failures (exit 2)', () => {
     await withProject(IDENTICAL_CONFIG, { 'app#01-main': pngBuffer(4, 4) }, { r1: { home: pngBuffer(4, 4) } }, async ({ dir }) => {
       const res = await compareAt(dir, { values: { state: ['bogus'] } });
       assert.equal(res.code, 2);
-      assert.match(res.streams.err(), /unknown state/);
+      assert.match(res.streams.err(), /^noise visual-diff compare \[unknown-state\]: unknown state/m);
     });
   });
 
@@ -2495,6 +2501,7 @@ describe('usage failures (exit 2)', () => {
       const res = await compareAt(dir, { json: true, values: { threshold: 'not-a-number' } });
       assert.equal(res.code, 2);
       assert.equal(res.streams.out(), '');
+      assert.match(res.streams.err(), /^noise visual-diff compare \[bad-threshold\]: /m);
       assert.match(res.streams.err(), /--threshold/);
     });
   });
@@ -2513,7 +2520,7 @@ describe('region-attributed diff summary (FR-20)', () => {
       assert.equal(res.code, 1);
       const out = res.streams.out();
       assert.match(out, /attribution \(diagnostic\): row bands: rows 0–7: 100\.0% of mismatch/);
-      assert.match(out, /uniform delta #1a2c42 vs #0e1b2c \(100\.0% of mismatched pixels, 1 distinct color pair\)/);
+      assert.match(out, /uniform delta #1a2c42 vs #0e1b2c \(100\.0% of 64 attributed pixels, 1 distinct color pair\)/);
 
       const home = res.report.states.home;
       assert.deepEqual(home.attribution.rowBands, [{ y0: 0, y1: 8, share: 1 }]);
@@ -2536,11 +2543,12 @@ describe('region-attributed diff summary (FR-20)', () => {
     });
   });
 
-  test('a below-threshold mismatch still passes quietly: no attribution anywhere', async () => {
-    // 2/16 = 12.5% mismatch, threshold 20% → pass; attribution must stay out
-    // of report.json and the printed output (it is a failure diagnostic).
+  test('a below-threshold NON-uniform mismatch still passes quietly: no attribution anywhere', async () => {
+    // 2/16 = 12.5% mismatch across TWO distinct color pairs, threshold 20% →
+    // pass; attribution must stay out of report.json and the printed output
+    // (a structural pass is not the token-error signature).
     const ref = pngBuffer(4, 4);
-    const cap = pngBuffer(4, 4, { rects: [[0, 0, 2, 1, BLACK]] });
+    const cap = pngBuffer(4, 4, { rects: [[0, 0, 1, 1, BLACK], [3, 3, 1, 1, RED]] });
     await withProject(IDENTICAL_CONFIG, { 'app#01-main': ref }, { r1: { home: cap } }, async ({ dir, layout }) => {
       const res = await compareAt(dir, { values: { threshold: '20' } });
       assert.equal(res.code, 0);
@@ -2551,6 +2559,88 @@ describe('region-attributed diff summary (FR-20)', () => {
 
       const report = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
       assert.equal(report.states.home.attribution, null);
+    });
+  });
+
+  test('a below-threshold UNIFORM delta of feature extent surfaces attribution as an advisory', async () => {
+    // 100/1600 = 6.25% mismatch, threshold 20% → pass. One distinct color
+    // pair over 100 pixels is the design-token signature (a wrong 1px border
+    // color can never reach a usable threshold), and 100 clears the
+    // repainted-feature extent floor — attribution is emitted and printed.
+    const ref = pngBuffer(40, 40);
+    const cap = pngBuffer(40, 40, { rects: [[0, 0, 10, 10, BLACK]] });
+    await withProject(IDENTICAL_CONFIG, { 'app#01-main': ref }, { r1: { home: cap } }, async ({ dir, layout }) => {
+      const res = await compareAt(dir, { values: { threshold: '20' } });
+      assert.equal(res.code, 0);
+      const home = res.report.states.home;
+      assert.equal(home.verdict, 'pass');
+      assert.equal(home.frame.differingPixels, 100);
+      assert.equal(home.attribution.distinctColorPairs, 1);
+      assert.deepEqual(home.attribution.dominantColorPair, { ref: '#ffffff', cap: '#000000', share: 1 });
+      assert.equal(home.attribution.attributedPixels, 100);
+      assert.match(res.streams.out(), /uniform delta #ffffff vs #000000 \(100\.0% of 100 attributed pixels/);
+
+      const report = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
+      assert.deepEqual(report.states.home.attribution, home.attribution);
+    });
+  });
+
+  test('a passing uniform delta BELOW the feature-extent floor stays quiet', async () => {
+    // Two identical stray pixels are one color pair too, but routine
+    // antialiasing must never print as a structural token claim: under
+    // UNIFORM_ADVISORY_MIN_PIXELS the passing state carries null and says
+    // nothing, exactly as before the advisory existed.
+    const ref = pngBuffer(40, 40);
+    const cap = pngBuffer(40, 40, { rects: [[0, 0, 2, 1, BLACK]] });
+    await withProject(IDENTICAL_CONFIG, { 'app#01-main': ref }, { r1: { home: cap } }, async ({ dir, layout }) => {
+      const res = await compareAt(dir, { values: { threshold: '20' } });
+      assert.equal(res.code, 0);
+      const home = res.report.states.home;
+      assert.equal(home.verdict, 'pass');
+      assert.equal(home.frame.differingPixels, 2);
+      assert.equal(home.attribution, null);
+      assert.doesNotMatch(res.streams.out(), /uniform delta/);
+
+      const report = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
+      assert.equal(report.states.home.attribution, null);
+    });
+  });
+
+  test('uniformDeltaAdvisory: every condition is required', () => {
+    const uniform = {
+      distinctColorPairs: 1,
+      dominantColorPair: { ref: '#fff', cap: '#000', share: 1 },
+      rowBands: [],
+      attributedPixels: UNIFORM_ADVISORY_MIN_PIXELS,
+    };
+    assert.equal(uniformDeltaAdvisory(uniform), true);
+    // extent below the floor — stray pixels, not a repainted feature
+    assert.equal(uniformDeltaAdvisory({ ...uniform, attributedPixels: UNIFORM_ADVISORY_MIN_PIXELS - 1 }), false);
+    // a single differing pixel never clears DOMINANT_PAIR_MIN_COUNT, so the
+    // advisory would have had no pair to name — it must not fire
+    assert.equal(uniformDeltaAdvisory({ ...uniform, dominantColorPair: null, attributedPixels: 4096 }), false);
+    // a structural shift is not a token delta
+    assert.equal(uniformDeltaAdvisory({ ...uniform, distinctColorPairs: 2, attributedPixels: 4096 }), false);
+    // byte-identical / overflow-only states have no attribution at all
+    assert.equal(uniformDeltaAdvisory(null), false);
+  });
+
+  test('overflow pixels never buy a passing state the advisory', async () => {
+    // A dimension mismatch inflates frame.differingPixels with overflow that
+    // has no pixel location: 2 differing shared pixels + 62 overflow rows
+    // reach 64, the advisory's floor. But attribution examined only the 2, so
+    // gating on the frame count would print "one pair covers 100%" on the
+    // strength of two pixels. The floor counts attributed pixels only.
+    const ref = pngBuffer(31, 40);
+    const cap = pngBuffer(31, 42, { rects: [[0, 0, 2, 1, BLACK]] });
+    await withProject(IDENTICAL_CONFIG, { 'app#01-main': ref }, { r1: { home: cap } }, async ({ dir }) => {
+      const res = await compareAt(dir, { values: { threshold: '20' } });
+      assert.equal(res.code, 0);
+      const home = res.report.states.home;
+      assert.equal(home.verdict, 'pass');
+      assert.ok(home.frame.differingPixels >= UNIFORM_ADVISORY_MIN_PIXELS, 'frame count is inflated by overflow');
+      assert.equal(home.attribution, null, 'only 2 pixels were attributable — no advisory');
+      assert.doesNotMatch(res.streams.out(), /uniform delta/);
     });
   });
 
@@ -2699,6 +2789,7 @@ describe('compare --against', () => {
     await withProject(IDENTICAL_CONFIG, { 'app#01-main': ref }, { r1: { home: ref } }, async ({ dir }) => {
       const res = await compareAt(dir, { runId: 'r1', values: { against: 'nope' } });
       assert.equal(res.code, 2);
+      assert.match(res.streams.err(), /^noise visual-diff compare \[no-such-run\]: /m);
       assert.match(res.streams.err(), /no stored report for run "nope" — looked for diffs\/nope\/report\.json/);
       assert.equal(res.report, null);
     });

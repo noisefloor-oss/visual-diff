@@ -13,6 +13,7 @@
 // leading `visual-diff` token is dropped before the verb parser runs — both
 // forms then converge on the same argv as `node src/cli.mjs`.
 import { run, EXIT } from './cli.mjs';
+import { errorLine } from './cli-error.mjs';
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -26,17 +27,13 @@ async function main() {
     });
   } catch (err) {
     // Mirrors src/cli.mjs main(): an unexpected throw is the trust bucket.
-    process.stderr.write(
-      `noise visual-diff: ${err && err.message ? err.message : String(err)}\n`,
-    );
+    process.stderr.write(errorLine('noise visual-diff', err));
     code = EXIT.TRUST;
   }
   process.exit(code);
 }
 
 main().catch((err) => {
-  process.stderr.write(
-    `noise visual-diff: ${err && err.message ? err.message : String(err)}\n`,
-  );
+  process.stderr.write(errorLine('noise visual-diff', err));
   process.exit(EXIT.TRUST);
 });

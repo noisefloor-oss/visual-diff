@@ -80,6 +80,7 @@ import { readReferenceManifest, REFERENCE_MANIFEST_FILE } from './import.mjs';
 import { selectStates } from './capture.mjs';
 import { publishRun, runStatus } from './run.mjs';
 import { computeRunDiff, loadRunReportForDiff, renderRunDiff } from './run-diff.mjs';
+import { codedLine, errorLine } from './cli-error.mjs';
 
 export const REPORT_SCHEMA = 1;
 export const RUN_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$/;
@@ -336,6 +337,12 @@ export const ATTRIBUTION_TOP_BANDS = 3;
 // mismatch. Below that the honest answer is "no dominant pair".
 export const DOMINANT_PAIR_MIN_COUNT = 2;
 export const DOMINANT_PAIR_MIN_SHARE = 0.1;
+// A PASSING state only earns the uniform-delta advisory when the delta is
+// wide enough to be a repainted FEATURE rather than a few stray pixels: a
+// 1px CSS border on a 32px-wide element is 64 device pixels at DPR 2, the
+// smallest thing a design token can plausibly paint. Below that the honest
+// answer is the verdict itself — a passing state stays quiet.
+export const UNIFORM_ADVISORY_MIN_PIXELS = 64;
 
 function hexColor(data, i) {
   const rgb = [data[i], data[i + 1], data[i + 2]].map((v) => v.toString(16).padStart(2, '0')).join('');
@@ -363,9 +370,30 @@ function hexColor(data, i) {
  * or null when the shared region has no differing pixels (a byte-identical
  * state, or an overflow-only mismatch — overflow has no pixel location to
  * attribute). The caller additionally withholds attribution from PASSING
- * states (scoreState gates the field on the state verdict), so report.json
- * and the printed block only ever describe failures.
+ * states unless they qualify for the uniform-delta advisory
+ * (uniformDeltaAdvisory below), so report.json and the printed block
+ * describe failures plus qualifying token-delta advisories only.
  */
+/**
+ * Does a PASSING state's attribution qualify as a uniform-delta advisory?
+ * Requires a uniform delta (one colour pair), a dominant pair that cleared
+ * DOMINANT_PAIR_MIN_COUNT/SHARE — the advisory names that pair, so it must
+ * exist — and at least UNIFORM_ADVISORY_MIN_PIXELS ATTRIBUTED pixels: the
+ * extent below which the honest reading is stray pixels, not a repainted
+ * feature. The floor counts attributed pixels rather than the frame's
+ * differing count because a dimension mismatch inflates the latter with
+ * overflow the attribution never examined — gating on it would let an
+ * overflow-dominated state claim a pair covers "100% of mismatched pixels"
+ * on the strength of two shared ones. Diagnostic only: never consulted for
+ * a verdict or an exit code.
+ */
+export function uniformDeltaAdvisory(attribution) {
+  return attribution !== null
+    && attribution.distinctColorPairs === 1
+    && attribution.dominantColorPair !== null
+    && attribution.attributedPixels >= UNIFORM_ADVISORY_MIN_PIXELS;
+}
+
 export function diffAttribution(refImg, capImg, frame) {
   const { width: w, height: h, data } = frame;
   if (w < 1 || h < 1) return null;
@@ -418,7 +446,13 @@ export function diffAttribution(refImg, capImg, frame) {
       ? { ref: hexColor(refImg.data, top.ri), cap: hexColor(capImg.data, top.ci), share: topShare }
       : null;
 
-  return { rowBands, dominantColorPair, distinctColorPairs: pairs.size };
+  // attributedPixels is the denominator every share above is computed
+  // against: differing pixels INSIDE the shared region. It is not
+  // frame.differingPixels, which also counts dimension overflow — overflow
+  // has no pixel location, so it can be neither banded nor paired. Reporting
+  // it keeps the shares auditable and gives the advisory floor the only
+  // count that means "pixels this attribution actually explains".
+  return { rowBands, dominantColorPair, distinctColorPairs: pairs.size, attributedPixels: total };
 }
 
 // --- Masks (FR-36; anchored masks) -------------------------------------------
@@ -1247,9 +1281,18 @@ export function scoreState(staged, { sectionScope = [], override = null } = {}) 
     },
     sections,
     regions,
-    // Attribution is a failure diagnostic: PASSING states (mismatch under the
-    // effective threshold) carry null and stay quiet even when pixels differ.
-    attribution: verdict === 'fail' ? attribution : null,
+    // Attribution is a failure diagnostic: FAILING states always carry it.
+    // A PASSING state earns it only as a UNIFORM-DELTA advisory, because
+    // pixel share is the wrong severity proxy for a design-token error: a
+    // 1px border repainted the wrong colour cannot physically reach a usable
+    // threshold, yet one colour pair over the whole delta is near-proof of a
+    // token bug at any share. Admission is deliberately narrow — every
+    // condition must hold, so routine antialiasing can never print as a
+    // structural claim: exactly one distinct pair, a dominant pair that
+    // cleared its OWN floors (so the printed pair is never null while the
+    // advisory asserts uniformity), and an extent that a repainted feature
+    // reaches but stray pixels do not.
+    attribution: verdict === 'fail' || uniformDeltaAdvisory(attribution) ? attribution : null,
     verdict,
     provenance: { compatible: true, fields: [] },
     // The heatmap payload (width/height/data) is consumed by the writer and
@@ -1325,7 +1368,7 @@ export async function runCompare(options, deps = {}) {
     override = parseThresholdOverride(values.threshold);
   } catch (err) {
     if (err instanceof CompareError) {
-      stderr.write(`noise visual-diff compare: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff compare', err));
       return { code: err.exitCode, runId: null, report: null };
     }
     throw err;
@@ -1338,7 +1381,7 @@ export async function runCompare(options, deps = {}) {
     ({ config, layout } = await loadConfig(options.projectDir));
   } catch (err) {
     if (err instanceof ConfigError) {
-      stderr.write(`noise visual-diff compare: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff compare', err));
       return { code: err.exitCode, runId: null, report: null };
     }
     throw err;
@@ -1346,11 +1389,11 @@ export async function runCompare(options, deps = {}) {
 
   const selected = selectStates(config, values.state);
   if (selected.error) {
-    stderr.write(`noise visual-diff compare: ${selected.error}\n`);
+    stderr.write(codedLine('noise visual-diff compare', 'unknown-state', selected.error));
     return { code: 2, runId: null, report: null };
   }
   if (selected.names.length === 0) {
-    stderr.write('noise visual-diff compare: no states defined — author .visual-diff/visual-diff.json\n');
+    stderr.write(codedLine('noise visual-diff compare', 'no-states', 'no states defined — author .visual-diff/visual-diff.json'));
     return { code: 2, runId: null, report: null };
   }
 
@@ -1359,13 +1402,13 @@ export async function runCompare(options, deps = {}) {
     runId = await resolveRun(layout, { runId: runIdSeam });
   } catch (err) {
     if (err instanceof CompareError) {
-      stderr.write(`noise visual-diff compare: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff compare', err));
       return { code: err.exitCode, runId: null, report: null };
     }
     throw err;
   }
   if (!runId) {
-    stderr.write('noise visual-diff compare: no captured run to compare — run capture first\n');
+    stderr.write(codedLine('noise visual-diff compare', 'no-captured-run', 'no captured run to compare — run capture first'));
     return { code: 2, runId: null, report: null };
   }
 
@@ -1642,8 +1685,9 @@ export async function runCompare(options, deps = {}) {
             stdout.write(`      cols: ${state.regions.cols.map((b) => `x=${b.rect.x}..${b.rect.x + b.rect.width} ${pct(b.mismatch)}`).join(', ')}\n`);
           }
         }
-        // Region-attributed summary — only when there is a mismatch
-        // to explain (passing states stay quiet). Diagnostic only.
+        // Region-attributed summary — prints for failures and for the
+        // uniform-delta advisory on passing states (both carry a non-null
+        // attribution); other passing states stay quiet. Diagnostic only.
         if (state.attribution) {
           const a = state.attribution;
           stdout.write(
@@ -1654,7 +1698,7 @@ export async function runCompare(options, deps = {}) {
           if (a.dominantColorPair) {
             const p = a.dominantColorPair;
             stdout.write(
-              `      uniform delta ${p.ref} vs ${p.cap} (${(p.share * 100).toFixed(1)}% of mismatched pixels, ` +
+              `      uniform delta ${p.ref} vs ${p.cap} (${(p.share * 100).toFixed(1)}% of ${a.attributedPixels} attributed pixels, ` +
                 `${a.distinctColorPairs} distinct color ${a.distinctColorPairs === 1 ? 'pair' : 'pairs'})\n`,
             );
           } else {
@@ -1677,11 +1721,11 @@ export async function runCompare(options, deps = {}) {
     return { code: report.exit, runId, report };
   } catch (err) {
     if (err instanceof CompareError) {
-      stderr.write(`noise visual-diff compare: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff compare', err));
       return { code: err.exitCode, runId, report: null };
     }
     if (err instanceof ProvenanceError) {
-      stderr.write(`noise visual-diff compare: provenance failure: ${err.message}\n`);
+      stderr.write(errorLine('noise visual-diff compare', err, `provenance failure: ${err.message}`));
       return { code: err.exitCode ?? 3, runId, report: null };
     }
     throw err;

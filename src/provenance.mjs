@@ -135,6 +135,9 @@ function requireFonts(v, what) {
 // resolved to on THIS side, in image device px. Recorded, never gated —
 // incompatibleFields follows the selectorFired precedent and never reads it.
 const MASK_RECORD_SHAPES = ['box', 'ring'];
+// The shared drive grammar's action set (config.mjs owns the authoring-time
+// validator; this is the record-schema echo of the same vocabulary).
+const DRIVE_ACTIONS = new Set(['click', 'hover', 'focus', 'press', 'mouse']);
 
 function validateMaskRecord(v, what, fail) {
   if (!isPlainObject(v)) fail(`${what} must be an object`);
@@ -235,6 +238,39 @@ function validateCompAuthoredMasksInput(v, what, fail) {
     Object.defineProperty(out, name, { value: entry, enumerable: true, configurable: true, writable: true });
   }
   return out;
+}
+
+// FR-39 drive evidence: the ordered drive steps the render executed to reach
+// the state, in the shared config grammar (config.mjs validateDriveSteps).
+// Recorded, never gated by the field predicate — `drive` is semantic
+// configuration and is gated through inputs.stateConfigHash, exactly like the
+// reference side's compDrive. Absent means the render drove nothing, so
+// records written before this feature stay valid with no re-capture.
+function validateDriveInput(v, what, fail) {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v) || v.length === 0) fail(`${what} must be a non-empty array of drive steps`);
+  return v.map((step, i) => {
+    const at = `${what}[${i}]`;
+    if (!isPlainObject(step)) fail(`${at} must be an object`);
+    const keys = Object.keys(step);
+    const action = keys[0];
+    if (keys.length !== 1 || !DRIVE_ACTIONS.has(action)) {
+      fail(`${at} must have exactly one key: "click", "hover", "focus", "press", or "mouse"`);
+    }
+    if (action === 'press') {
+      const p = step.press;
+      if (!isPlainObject(p)) fail(`${at}.press must be an object { selector, key }`);
+      nonEmpty(p.selector, `${at}.press.selector`, fail);
+      nonEmpty(p.key, `${at}.press.key`, fail);
+      return { press: { selector: p.selector, key: p.key } };
+    }
+    if (action === 'mouse') {
+      if (step.mouse !== 'away') fail(`${at}.mouse must be "away"`);
+      return { mouse: 'away' };
+    }
+    nonEmpty(step[action], `${at}.${action}`, fail);
+    return { [action]: step[action] };
+  });
 }
 
 function validateSelfCheckInput(v, what, fail) {
@@ -358,6 +394,7 @@ export function createRecord({ kind, artifactPath, artifactBytes, renderer, inpu
       ...(inputs.stateConfigHash !== undefined ? { stateConfigHash: inputs.stateConfigHash } : {}),
       ...(inputs.masks !== undefined ? { masks: inputs.masks } : {}),
       ...(inputs.compAuthoredMasks !== undefined ? { compAuthoredMasks: inputs.compAuthoredMasks } : {}),
+      ...(inputs.drive !== undefined ? { drive: inputs.drive } : {}),
       ...(inputs.selfCheck !== undefined ? { selfCheck: inputs.selfCheck } : {}),
       ...(inputs.serve !== undefined ? { serve: inputs.serve } : {}),
       // Delivered-frame evidence (FR-38): informational pass-through — the
@@ -471,6 +508,7 @@ function validateRecord(obj, fail) {
 
   const cleanMasks = validateMasksInput(i.masks, 'inputs.masks', fail);
   const cleanCompAuthoredMasks = validateCompAuthoredMasksInput(i.compAuthoredMasks, 'inputs.compAuthoredMasks', fail);
+  const cleanDrive = validateDriveInput(i.drive, 'inputs.drive', fail);
   const cleanSelfCheck = validateSelfCheckInput(i.selfCheck, 'inputs.selfCheck', fail);
   const cleanServe = validateServeInput(i.serve, 'inputs.serve', fail);
   const cleanFrame = validateFrameInput(i.frame, 'inputs.frame', fail);
@@ -494,6 +532,7 @@ function validateRecord(obj, fail) {
       ...(stateConfigHashValue !== undefined ? { stateConfigHash: stateConfigHashValue } : {}),
       ...(cleanMasks !== undefined ? { masks: cleanMasks } : {}),
       ...(cleanCompAuthoredMasks !== undefined ? { compAuthoredMasks: cleanCompAuthoredMasks } : {}),
+      ...(cleanDrive !== undefined ? { drive: cleanDrive } : {}),
       ...(cleanSelfCheck !== undefined ? { selfCheck: cleanSelfCheck } : {}),
       ...(cleanServe !== undefined ? { serve: cleanServe } : {}),
       ...(cleanFrame !== undefined ? { frame: cleanFrame } : {}),
