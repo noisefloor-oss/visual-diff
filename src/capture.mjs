@@ -11,7 +11,7 @@
 //        shared FR-9 isolation machinery (src/render.mjs). This module owns no
 //        parallel isolation implementation.
 // FR-14  determinism stack per capture: fixed viewport per state (default
-//        1502x818 from config), deviceScaleFactor 2, frozen Date.now, an
+//        1502x818 from config), deviceScaleFactor 2, frozen Date, an
 //        anti-animation stylesheet, document.fonts.ready, and the configured
 //        settle delay. The frozen-clock and anti-animation hooks are installed
 //        as context init scripts so they run BEFORE any page script.
@@ -62,6 +62,8 @@ import { initRunDir, newRunId } from './run.mjs';
 import { probeMaskElements, probeToRegion } from './masks.mjs';
 import { accommodationDivergence, frameShortfall, pngDimensions } from './png.mjs';
 import { codedLine, errorLine } from './cli-error.mjs';
+import { frozenClockScriptSource } from './frozen-clock.mjs';
+import { INSTANT_SCROLL_SCRIPT } from './instant-scroll.mjs';
 
 export const EXIT = Object.freeze({
   OK: 0,
@@ -94,11 +96,15 @@ export const ANTI_ANIMATION_CSS = [
 // capture time retires the hand-written caret-color fixtures.
 export const SUPPRESS_CARET_CSS = '*,*::before,*::after{caret-color:transparent!important;}';
 
-// A context init script that freezes Date.now. Playwright serializes the
+// A context init script that freezes the full Date constructor. Playwright serializes the
 // function into the browser, so the frozen value is baked in as a literal (the
 // function body cannot close over module scope).
 export function freezeDateNowInitScript(now = FROZEN_DATE_NOW_MS) {
-  return new Function(`Date.now = function () { return ${now}; };`);
+  return new Function(frozenClockScriptSource(now));
+}
+
+export function instantScrollInitScript() {
+  return new Function(INSTANT_SCROLL_SCRIPT);
 }
 
 // A context init script that injects the anti-animation stylesheet before any
@@ -664,7 +670,7 @@ async function renderCapture({
     vendorDir,
     log,
     contextOptions: buildContextOptions(state),
-    contextInitScripts: [freezeDateNowInitScript(), antiAnimationInitScript(ANTI_ANIMATION_CSS + fixtureCss)],
+    contextInitScripts: [freezeDateNowInitScript(), antiAnimationInitScript(ANTI_ANIMATION_CSS + fixtureCss), instantScrollInitScript()],
     gotoOptions: { waitUntil: 'domcontentloaded', timeout: state.readiness.timeout },
     tolerateGotoTimeout: true,
   });

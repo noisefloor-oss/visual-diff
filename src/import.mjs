@@ -23,7 +23,7 @@
 //      declaration from its vendored bytes and fails closed on mismatch.
 //      Vendor content hashes enter provenance.
 //   5. REFERENCE pass — render each screen frame twice (FR-15 fresh contexts,
-//      FR-11 double render) under determinism (frozen Date.now + anti-animation
+//      FR-11 double render) under determinism (frozen Date + motion suppression
 //      stylesheet, FR-14) with the hydration readiness; capture the screen
 //      frame (excluding a static figure's caption row, FR-10) as one reference
 //      PNG per screen, write its provenance record (FR-8/FR-12), and record the
@@ -156,6 +156,8 @@ import {
 import { isTimeoutError, loadVendorManifest, renderPage, verifySri } from './render.mjs';
 import { resolveBrowser } from './browser.mjs';
 import { codedLine, errorLine } from './cli-error.mjs';
+import { frozenClockScriptSource } from './frozen-clock.mjs';
+import { INSTANT_SCROLL_SCRIPT } from './instant-scroll.mjs';
 import extractDesignZip, {
   ZipError,
 } from './unzip.mjs';
@@ -232,15 +234,16 @@ const MIME_BY_EXT = {
 
 const DETERMINISM_SCRIPTS = Object.freeze([
   {
-    content: `(() => { const FROZEN = ${FROZEN_NOW}; const orig = Date.now; Date.now = () => FROZEN; })();`,
+    content: frozenClockScriptSource(FROZEN_NOW),
   },
   {
     content: [
       "(() => { const s = document.createElement('style');",
-      "s.textContent = '*,*::before,*::after{animation:none!important;animation-duration:0s!important;transition:none!important}';",
+      "s.textContent = '*,*::before,*::after{animation:none!important;animation-duration:0s!important;transition:none!important;scroll-behavior:auto!important}';",
       "document.head.appendChild(s); })();",
     ].join('\n'),
   },
+  { content: INSTANT_SCROLL_SCRIPT },
 ]);
 
 // =============================================================================
