@@ -239,7 +239,8 @@ servers, any hard-coded knowledge of a specific design or project
   implementation.
 - **FR-14** Determinism stack: fixed viewport per state (default 1502×818;
   `full-page` mode for scrolling content), `deviceScaleFactor: 2`, frozen
-  `Date.now`, anti-animation stylesheet, `document.fonts.ready` plus settle
+  all no-argument `Date` forms, anti-animation and instant-scroll hooks,
+  `document.fonts.ready` plus settle
   delay.
 - **FR-15** Every state and every verification re-capture runs in a fresh
   browser context (never a re-navigated page).

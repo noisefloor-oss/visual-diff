@@ -354,11 +354,11 @@ describe('determinism stack', () => {
     assert.equal(FROZEN_DATE_NOW_MS, 1700000000000);
   });
 
-  test('freezeDateNowInitScript serializes a fixed clock into the page', () => {
+  test('freezeDateNowInitScript serializes a fixed Date constructor into the page', () => {
     const fn = freezeDateNowInitScript();
     const src = fn.toString();
     assert.match(src, /1700000000000/);
-    assert.match(src, /Date\.now/);
+    assert.match(src, /globalThis\.Date = new Proxy/);
   });
 
   test('antiAnimationInitScript serializes the kill-switch stylesheet', () => {
@@ -378,10 +378,11 @@ describe('determinism stack', () => {
     );
     assert.equal(r.code, EXIT.OK);
     const ctx = browser._contexts[0];
-    assert.equal(ctx._initScripts.length, 2, 'Date.now freeze + anti-animation script');
+    assert.equal(ctx._initScripts.length, 3, 'Date freeze, anti-animation, and instant-scroll scripts');
     // The freeze script bakes a fixed clock; the stylesheet kills animation.
-    assert.match(ctx._initScripts[0].toString(), /Date\.now/);
+    assert.match(ctx._initScripts[0].toString(), /globalThis\.Date = new Proxy/);
     assert.match(ctx._initScripts[1].toString(), /createElement\("style"\)/);
+    assert.match(ctx._initScripts[2].toString(), /scrollIntoView/);
   });
 });
 

@@ -1069,7 +1069,7 @@ node src/cli.mjs <verb> ...
 npm run build:sea
 
 # suite version (deployment gates compare this verbatim)
-noise visual-diff version    # -> noise-visual-diff 0.11.0
+noise visual-diff version    # -> noise-visual-diff 0.12.0
 ```
 
 **Uninstall / data retention:** the tool writes `.visual-diff/` inside the
