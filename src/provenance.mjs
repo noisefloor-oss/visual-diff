@@ -395,6 +395,10 @@ export function createRecord({ kind, artifactPath, artifactBytes, renderer, inpu
       ...(inputs.masks !== undefined ? { masks: inputs.masks } : {}),
       ...(inputs.compAuthoredMasks !== undefined ? { compAuthoredMasks: inputs.compAuthoredMasks } : {}),
       ...(inputs.drive !== undefined ? { drive: inputs.drive } : {}),
+      // FR-40: the compTarget selector the reference was framed to
+      // (unlabelled comps). Informational — gated through stateConfigHash,
+      // which projects compTarget (config.mjs RENDER_STATE_KEYS).
+      ...(inputs.compTarget !== undefined ? { compTarget: inputs.compTarget } : {}),
       ...(inputs.selfCheck !== undefined ? { selfCheck: inputs.selfCheck } : {}),
       ...(inputs.serve !== undefined ? { serve: inputs.serve } : {}),
       // Delivered-frame evidence (FR-38): informational pass-through — the
@@ -509,6 +513,12 @@ function validateRecord(obj, fail) {
   const cleanMasks = validateMasksInput(i.masks, 'inputs.masks', fail);
   const cleanCompAuthoredMasks = validateCompAuthoredMasksInput(i.compAuthoredMasks, 'inputs.compAuthoredMasks', fail);
   const cleanDrive = validateDriveInput(i.drive, 'inputs.drive', fail);
+  // FR-40: informational — the compTarget selector an unlabelled reference
+  // was framed to. Recorded, never gated by the field predicate.
+  let cleanCompTarget;
+  if (i.compTarget !== undefined) {
+    cleanCompTarget = nonEmpty(i.compTarget, 'inputs.compTarget', fail);
+  }
   const cleanSelfCheck = validateSelfCheckInput(i.selfCheck, 'inputs.selfCheck', fail);
   const cleanServe = validateServeInput(i.serve, 'inputs.serve', fail);
   const cleanFrame = validateFrameInput(i.frame, 'inputs.frame', fail);
@@ -533,6 +543,7 @@ function validateRecord(obj, fail) {
       ...(cleanMasks !== undefined ? { masks: cleanMasks } : {}),
       ...(cleanCompAuthoredMasks !== undefined ? { compAuthoredMasks: cleanCompAuthoredMasks } : {}),
       ...(cleanDrive !== undefined ? { drive: cleanDrive } : {}),
+      ...(cleanCompTarget !== undefined ? { compTarget: cleanCompTarget } : {}),
       ...(cleanSelfCheck !== undefined ? { selfCheck: cleanSelfCheck } : {}),
       ...(cleanServe !== undefined ? { serve: cleanServe } : {}),
       ...(cleanFrame !== undefined ? { frame: cleanFrame } : {}),
@@ -549,15 +560,23 @@ export function stringifyRecord(record) {
   return canonicalStringify(record) + '\n';
 }
 
+// Validate + serialize without touching disk: for callers that stage the
+// bytes through a transaction of their own (import's staged reference
+// writes), so the staging write does not nest a second temp file — and a
+// second crash-residue family — inside the staged one.
+export function serializeRecord(record) {
+  return stringifyRecord(validateRecord(record, failArgument));
+}
+
 // Write a record atomically (temp file + rename, matching the atomicity
 // doctrine). Validates and projects before anything touches disk.
 export async function writeRecord(recordPath, record) {
-  const clean = validateRecord(record, failArgument);
+  const data = serializeRecord(record);
   const parent = dirname(recordPath);
   await mkdir(parent, { recursive: true });
   const tmp = join(parent, `.${randomUUID()}.provenance.tmp`);
   try {
-    await writeFile(tmp, stringifyRecord(clean), 'utf8');
+    await writeFile(tmp, data, 'utf8');
     await rename(tmp, recordPath);
   } catch (err) {
     await unlink(tmp).catch(() => {});

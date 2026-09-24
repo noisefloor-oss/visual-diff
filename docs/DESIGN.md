@@ -100,7 +100,83 @@ servers, any hard-coded knowledge of a specific design or project
 
 - **FR-5** `import <design-export.zip>` extracts the archive safely:
   path-traversal and symlink entries rejected, fixed decompressed byte and
-  file-count limits, atomic extraction via staging directory + rename.
+  file-count limits, atomic extraction via staging directory + rename. The
+  import as a whole is one transaction in the same register.
+  - **One import per project at a time.** A run takes an exclusive lock file
+    under `.visual-diff/` carrying its pid, start time, and a per-run nonce;
+    it appears with its contents already in it, so a competitor can name the
+    holder it lost to whenever that file is readable (and says so plainly when
+    it is not). A second import of the same project is refused
+    as a usage error naming that holder. A lock is never stolen — not on a
+    liveness check, not after a timeout — so a lock left behind by a killed run
+    keeps refusing imports until an operator removes the file the refusal
+    names. Releasing is identity-checked: a run holds the lock file's
+    descriptor open for its whole life and unlinks the path only while it still
+    resolves to that very file. Holding the descriptor is what makes the check
+    sound — it pins the inode, so the number cannot be recycled under a
+    look-alike, which a recorded inode or a recorded payload both fall for.
+    What remains is that the unlink itself names a path rather than a file, so
+    a run could still remove a lock that replaced its own in the instant
+    between the check and the unlink; closing that needs OS-level locking the
+    runtime does not offer, and reaching it needs someone to remove a live
+    lock — the documented manual override — at exactly that moment. For the
+    same reason no cleanup path ever removes `.visual-diff/` recursively — a
+    run undoes what it created, and anything it does not own stops the
+    removal.
+  - **Scratch.** The extracted tree is the run's scratch: kept only so that
+    run can serve it, pruned by the next successful import, and removed on any
+    failure the run raises, whatever else it had already committed. A run's sweep only
+    ever removes scratch that was already there when it took the lock, and
+    everything it removes is derived: extracted trees, and the staged files an
+    interrupted run never published.
+  - **References.** Nothing already published is ever moved. Each file the run
+    writes goes to a sibling temp name in `references/` and is renamed onto its
+    real path only at commit; each removal (a stale screen artifact, a removed
+    comp's references) is recorded and performed only at commit. So for the
+    whole run every committed artifact stays exactly where it is, with its
+    bytes and its mtime, and an abandoned run has nothing to restore and
+    nothing to verify — unwinding is discarding its own temps, which are
+    derived bytes by construction. The residue of a failure is never the only
+    copy of anything. A partially-successful import is not a state the tool
+    produces: an import either commits its reference set or leaves the previous
+    one, and no manifest is left describing artifacts that do not exist (or
+    artifacts left with no manifest) — with the single exception of a failure
+    that strikes inside the commit itself, which the limit below states.
+  - **Commit.** Committing renames each staged file into place, applies the
+    recorded removals, and renames the manifest LAST — the manifest is the
+    commit point, so it names the set only once the set is there. Those renames
+    are individually atomic but not atomic as a group; see the limit below.
+  - **Known limit.** The staging record lives in the import process and covers
+    every failure the tool raises BEFORE the commit begins — those unwind
+    completely, with one qualification: if a cleanup removal itself fails (an
+    I/O error, say), the committed references still stay exactly as they were,
+    but the derived residue (a staged temp, the extracted tree, the lock file)
+    can remain — and the failure the tool raises names it rather than
+    claiming a cleanup it did not perform. Two things are outside it. A
+    process killed outright (SIGKILL,
+    an OOM kill, power loss) never gets to unwind, so it leaves its extracted
+    tree and its unpublished staged files on disk; both are unreferenced
+    derived bytes, swept by the next import (staged files as it starts, trees
+    when it succeeds). And a kill — or an I/O error — striking DURING the
+    commit leaves a mix of old and new artifacts under the old manifest, since
+    the renames are individually atomic but not atomic as a group. A removal
+    that fails there stops the commit before the manifest, so the manifest at
+    least still describes the previous set, and the failure names the file. `import --refresh`
+    republishes the whole reference set against the current inputs and is the
+    repair for both. This is stated as a limit rather than a promise because it
+    is the tool's behaviour today; making the commit itself crash-atomic needs
+    a design of its own, which this is deliberately not.
+  - **Register boundary.** The transaction covers exactly the extracted
+    scratch tree and the reference set. Vendored bytes (FR-8) and a browser
+    pin committed during discovery (FR-33) are deliberately outside it: the
+    vendor store is content-addressed and additive, and a pin records a real
+    verified discovery, so a late render failure legitimately retains both
+    while the references roll back. The consequence to know: provenance
+    records the hashes of the whole vendor directory, so the references a
+    failed run leaves in place can be provenance-incompatible with a vendor
+    store that same run had already grown — a later compare fails closed on
+    `inputs.vendorHashes` until the reference set is republished against the
+    current store, which is what `import --refresh` does.
 - **FR-6** It discovers every `.dc.html` comp in the archive, derives a
   sanitized comp name from the relative path, and resolves collisions
   deterministically. `--only <comp>...` restricts the import.
@@ -381,9 +457,41 @@ servers, any hard-coded knowledge of a specific design or project
 
 - **FR-30** All artifacts live under `<project>/.visual-diff/`:
   `visual-diff.json`, `references/<comp>.png` + provenance (driven-state
-  references: `references/<comp>#<screen>@<state>.png` + provenance),
+  references: `references/<comp>#<screen>@<state>.png` + provenance;
+  state-scoped references of an unlabelled comp (FR-40):
+  `references/<comp>@<state>.png` + provenance),
   `captures/<run-id>/`, `diffs/<run-id>/` + `report.json`, `vendor/`,
   `current-run`.
+- **FR-40** A comp with **no** `[data-screen-label]` screens (an unlabelled
+  export holding a complete interactive app) is importable only through
+  explicit per-state mappings — never by guessing which element is the
+  screen. Each state mapping it names the whole comp and declares
+  `compTarget`: a CSS selector resolving, at import render time, to exactly
+  one visible element whose frame becomes the reference (the same
+  exactly-one contract as `clip`, which the state must also declare so the
+  capture side names its corresponding element). `compTarget` requires a
+  whole-comp mapping and a `clip`, is a config error on a `<comp>#<screen>`
+  or capture-only state, and fails the import (exit 2) when the comp turns
+  out to have labelled screens. Import renders **one state-scoped reference
+  per mapping state** (`<comp>@<state>`, manifest entry
+  `{ state, driven: true, noiseFloor }` under a comp marked
+  `unlabelled: true`), each under that state's readiness and FR-37
+  `compDrive` (which a `compTarget` satisfies as the required single state
+  surface), double-rendered for its own measured noise floor; there is no
+  base reference and no cross-state uniform-dimensions assertion. Undriven
+  renders await the `compTarget` element as the readiness witness after the
+  policy wait and fonts (mirroring capture's `readiness.selector` ordering);
+  driven renders await it after the drive steps. A target that never
+  becomes visible, resolves ambiguously, or frames an empty/zero-box
+  element fails loudly (`comp-target-missing`, exit 3; `empty-frame`, exit
+  2). `compTarget` is semantic configuration: it enters `configHash`/
+  `stateConfigHash` and is recorded informationally as `inputs.compTarget`;
+  retargeting it invalidates the state's pair through the FR-23 gate.
+  Compare resolves the state's own `<comp>@<state>` reference (a mapping
+  without `compTarget`, or a state the import never rendered, fails closed
+  with the `import --refresh` remedy). Comp-authored `data-vd-mask`
+  annotations do not apply (no screen element scopes them); config masks
+  are unchanged.
 - **FR-37** A state mapped to a comp screen may declare `compDrive`: an
   ordered list of `{ click: selector }` / `{ hover: selector }` steps that
   `import` executes against the rendered comp — after hydration readiness,
@@ -460,10 +568,15 @@ servers, any hard-coded knowledge of a specific design or project
   one immutable versioned tree published atomically through `noise-setup`.
   An independently released repo never writes into the live libexec root.
 - **NFR-4 (dependencies)** Runtime dependencies limited to `playwright`
-  (exact pin), `pngjs`, `pixelmatch`. Build-time-only devDependencies
-  (exact-pinned; e.g. `esbuild` and `postject` for the SEA packaging step)
-  are permitted outside this list: they never enter the shipped closure —
-  the SEA blob carries only the NFR-4 runtime set.
+  (exact pin), `pngjs`, `pixelmatch`. Build-time-only **and test-only**
+  devDependencies (exact-pinned; e.g. `esbuild` and `postject` for the SEA
+  packaging step, `acorn` for the test suite's static analysis) are
+  permitted outside this list, under three constraints that are the whole
+  of the permission: exact-pinned, never imported by anything under
+  `src/`, and never present in the shipped closure — the SEA blob carries
+  only the NFR-4 runtime set. Test-only satisfies that rationale by a wider
+  margin than build-time does: such a dependency is absent from the shipped
+  closure *and* from the build.
 - **NFR-5 (harness neutrality)** Drivable identically from any agent CLI:
   plain flags, `--json`, meaningful exit codes; no agent-specific protocol.
 - **NFR-6 (process)** MIT-licensed; developed privately with

@@ -11,6 +11,9 @@
 //          | { staticDir, params?, setupScript? }   // served on loopback
 //          | "<url>"                        // string shorthand for a URL
 //     comp:  "<comp>" | "<comp>#<screen>" | null   // null = capture-only
+//     compTarget: "<selector>"   // FR-40: frame selector for an UNLABELLED
+//               comp (no [data-screen-label] screens); whole-comp mappings
+//               only, requires clip
 //     viewport: { width, height, fullPage? } | "full-page"   // default 1502x818
 //     readiness: { policy, timeout, settle }   // required per state (FR-16)
 //     threshold: <pct 0..100>               // required per state
@@ -61,7 +64,7 @@ const SUPPORTED_VERSION = 1;
 const DEFAULT_VIEWPORT = Object.freeze({ width: 1502, height: 818, fullPage: false });
 
 const TOP_LEVEL_KEYS = new Set(['version', 'states', 'browser', 'masks', 'capture']);
-const STATE_KEYS = new Set(['route', 'comp', 'viewport', 'readiness', 'threshold', 'sections', 'masks', 'compDrive', 'drive', 'clip', 'selfCheck']);
+const STATE_KEYS = new Set(['route', 'comp', 'viewport', 'readiness', 'threshold', 'sections', 'masks', 'compDrive', 'drive', 'clip', 'compTarget', 'selfCheck']);
 const ROUTE_KEYS = new Set(['url', 'staticDir', 'params', 'setupScript']);
 const VIEWPORT_KEYS = new Set(['width', 'height', 'fullPage']);
 const READINESS_KEYS = new Set(['policy', 'timeout', 'settle', 'selector', 'compSelector']);
@@ -426,6 +429,39 @@ function validateClip(v, path) {
   return v;
 }
 
+// FR-40: compTarget is the reference-side frame selector for a comp with NO
+// [data-screen-label] screens (an unlabelled export holding a complete
+// interactive app). It names the one element in the comp page whose frame is
+// the reference — the explicit mapping that replaces screen enumeration when
+// there is nothing to enumerate. Rules:
+//   - requires a comp mapping (a capture-only state has no reference side);
+//   - requires a WHOLE-COMP mapping — a <comp>#<screen> reference already
+//     names its target, so compTarget alongside one is contradictory;
+//   - requires clip — the reference is framed to the compTarget element, so
+//     the capture side must name its corresponding element too; an unclipped
+//     capture is a full-page frame and could only ever compare as a dimension
+//     mismatch. Both sides naming their target is the "explicit capture-target
+//     mapping" — the tool never guesses which element is the screen.
+// Whether the mapped comp actually has screens is known only at import time;
+// a compTarget state mapping a LABELLED comp fails there (import:
+// comp-target-invalid), never silently re-frames a screen.
+function validateCompTarget(v, path, compRef, clip) {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string' || v.trim() === '') {
+    fail(path, 'compTarget must be a non-empty CSS selector string');
+  }
+  if (compRef === null) {
+    fail(path, 'compTarget requires a comp mapping — a capture-only state has no reference to target');
+  }
+  if (compRef.screen !== undefined) {
+    fail(path, 'compTarget with a <comp>#<screen> mapping is contradictory — the screen already names the reference target; drop compTarget');
+  }
+  if (clip === null) {
+    fail(path, 'compTarget requires a clip selector — the reference is framed to the compTarget element, so the capture must name its corresponding element (an unclipped full-page capture could only compare as a dimension mismatch)');
+  }
+  return v;
+}
+
 function validateReadiness(v, path) {
   if (v === undefined) {
     fail(path, 'missing required key "readiness"');
@@ -525,17 +561,19 @@ function validateDriveSteps(v, path, key) {
 }
 
 // FR-37: compDrive drives the COMP into a runtime state before the reference
-// screenshot — reference-side only, so it requires an explicit comp#screen
-// mapping. The grammar itself is the shared one above.
-function validateCompDrive(v, path, hasComp, hasScreen) {
+// screenshot — reference-side only, so it requires an explicit mapping to one
+// reference surface: a <comp>#<screen> pair for a labelled comp, or a
+// compTarget selector for an unlabelled one (FR-40). The grammar itself is
+// the shared one above.
+function validateCompDrive(v, path, hasComp, hasTarget) {
   if (v === undefined) {
     return undefined;
   }
   if (!hasComp) {
     fail(path, 'compDrive requires a comp mapping — a capture-only state has no reference to drive (FR-37)');
   }
-  if (!hasScreen) {
-    fail(path, 'compDrive requires an explicit <comp>#<screen> mapping — a whole-comp mapping names no single state surface (FR-37)');
+  if (!hasTarget) {
+    fail(path, 'compDrive requires an explicit <comp>#<screen> mapping (or a compTarget for an unlabelled comp) — a whole-comp mapping names no single state surface (FR-37)');
   }
   return validateDriveSteps(v, path, 'compDrive');
 }
@@ -895,12 +933,13 @@ export function validateConfig(raw, { projectDir } = {}) {
     const readiness = validateReadiness(s.readiness, `${spath}.readiness`);
     const threshold = validateThreshold(s.threshold, `${spath}.threshold`);
     const sections = validateSections(s.sections, `${spath}.sections`, threshold);
-    const compDrive = validateCompDrive(s.compDrive, `${spath}.compDrive`, comp !== null, compRef !== null && compRef.screen !== undefined);
+    const clip = validateClip(s.clip, `${spath}.clip`);
+    const compTarget = validateCompTarget(s.compTarget, `${spath}.compTarget`, compRef, clip);
+    const compDrive = validateCompDrive(s.compDrive, `${spath}.compDrive`, comp !== null, (compRef !== null && compRef.screen !== undefined) || compTarget !== undefined);
     const drive = validateDrive(s.drive, `${spath}.drive`);
     const masks = validateMasks(s.masks, `${spath}.masks`);
-    const clip = validateClip(s.clip, `${spath}.clip`);
     const selfCheck = validateSelfCheck(s.selfCheck, `${spath}.selfCheck`);
-    states[stateName] = { route, compRef, comp, viewport, readiness, threshold, sections, compDrive, drive, masks, clip, selfCheck };
+    states[stateName] = { route, compRef, comp, viewport, readiness, threshold, sections, compDrive, drive, masks, clip, compTarget, selfCheck };
   }
   // Top-level shared masks (FR-36): device chrome is a category — the
   // same masks every state repeats are declared once at the root and merged
@@ -946,8 +985,10 @@ export function canonicalStringify(value) {
 // no compDrive it drives nothing and is projected out too.
 // `drive` is semantic configuration exactly like `compDrive` (FR-39): it
 // decides WHICH state the capture shows, so changing it must invalidate the
-// pair through the FR-23 gate.
-const RENDER_STATE_KEYS = ['route', 'compRef', 'comp', 'viewport', 'readiness', 'compDrive', 'drive', 'clip'];
+// pair through the FR-23 gate. `compTarget` (FR-40) decides WHICH element the
+// unlabelled reference is framed to — retargeting it changes the reference's
+// pixels, so it is render-affecting and gated the same way.
+const RENDER_STATE_KEYS = ['route', 'compRef', 'comp', 'viewport', 'readiness', 'compDrive', 'drive', 'clip', 'compTarget'];
 
 function renderStateProjection(s) {
   const out = Object.fromEntries(RENDER_STATE_KEYS.filter((k) => s[k] !== undefined).map((k) => [k, s[k]]));
@@ -1083,6 +1124,10 @@ export function configToDocument(config) {
     // rewrites the config, which includes the browser re-pin that
     // --auto-discover-browser performs mid-run.
     if (st.clip !== null && st.clip !== undefined) state.clip = st.clip;
+    // compTarget (FR-40) likewise decides what the reference frames — an
+    // unlabelled-comp state rewritten without it would fail its next import
+    // as an unmapped screenless comp.
+    if (st.compTarget !== undefined) state.compTarget = st.compTarget;
     doc.states[name] = state;
   }
   if (config.masks !== undefined && Object.keys(config.masks).length > 0) doc.masks = config.masks;

@@ -621,6 +621,79 @@ test('e2e: real process exits 2 on an invalid NOISE_PROJECT_DIR', () => {
   assert.match(r.stderr, /NOISE_PROJECT_DIR/);
 });
 
+// Regression: --json payloads over ~64 KiB truncated at exactly 80 KiB when
+// stdout was a pipe, because main() called process.exit() without draining
+// (reported against 0.10.0). Stage a published run whose report --json echo
+// clears the pipe buffer, then read the child's piped stdout to completion.
+test('e2e: a >80 KiB --json payload over a pipe arrives complete and parses', async () => {
+  const dir = tmpDir('vd-cli-pipe');
+  const runId = '20260906-000000-drain01';
+  const states = {};
+  for (let i = 0; i < 200; i++) {
+    const name = `state-${String(i).padStart(3, '0')}`;
+    states[name] = {
+      stateName: name,
+      comp: 'app#01-main',
+      screenLabel: '01 Main',
+      noiseFloor: 0,
+      threshold: 1,
+      thresholdUsed: 1,
+      override: null,
+      frame: {
+        mismatch: 0,
+        differingPixels: 0,
+        totalPixels: 16,
+        verdict: 'pass',
+        notes: [`padding to push the document past the pipe buffer: ${'x'.repeat(300)}`],
+      },
+      sections: {},
+      verdict: 'pass',
+      provenance: { compatible: true, fields: [] },
+    };
+  }
+  const body = {
+    schema: 1,
+    runId,
+    command: 'compare',
+    thresholdOverride: null,
+    forced: false,
+    states,
+    exit: 0,
+  };
+  for (const half of ['captures', 'diffs']) {
+    const base = join(dir, '.visual-diff', half, runId);
+    mkdirSync(base, { recursive: true });
+    writeFileSync(join(base, 'state-000.png'), `${half}-state-000`);
+  }
+  writeFileSync(
+    join(dir, '.visual-diff', 'captures', runId, 'state-000.provenance.json'),
+    JSON.stringify({ schema: 1, kind: 'capture', state: 'state-000' }),
+  );
+  writeFileSync(
+    join(dir, '.visual-diff', 'diffs', runId, 'report.json'),
+    JSON.stringify(body, null, 2) + '\n',
+  );
+  const { init } = await import('../src/artifact-layout.mjs');
+  const { publishRun } = await import('../src/run.mjs');
+  await publishRun(await init(dir), runId);
+
+  // spawnSync reads the child's stdout through a real pipe — the exact
+  // shape that truncated before the drain fix.
+  const r = spawnSync(process.execPath, [cliPath, 'report', '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, NOISE_PROJECT_DIR: dir },
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  assert.equal(r.status, EXIT.OK, r.stderr);
+  assert.ok(
+    r.stdout.length > 81920,
+    `payload must exceed the old truncation point, got ${r.stdout.length}`,
+  );
+  const parsed = JSON.parse(r.stdout);
+  assert.equal(parsed.runId, runId);
+  assert.equal(Object.keys(parsed.run.states).length, 200);
+});
+
 test('e2e: real process honors a valid NOISE_PROJECT_DIR and reports an empty state', () => {
   const r = spawnSync(process.execPath, [cliPath, 'report'], {
     encoding: 'utf8',

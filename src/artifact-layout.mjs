@@ -166,9 +166,16 @@ export function layoutFor(projectDir) {
 function referenceBasename(comp, screen, state) {
   const c = checkComponent(comp, COMP_RE, 'comp name');
   // No screen (undefined or null): the whole-comp reference (FR-30
-  // references/<comp>.png).
+  // references/<comp>.png) — or, with a state, the state-scoped reference of
+  // an UNLABELLED comp (FR-40 references/<comp>@<state>.png): a comp without
+  // [data-screen-label] screens has no screen id to splice, so the mapping
+  // state itself names the reference, exactly like a driven reference's
+  // @state suffix does.
   if (screen === undefined || screen === null) {
-    return c;
+    if (state === undefined || state === null) {
+      return c;
+    }
+    return `${c}@${checkComponent(state, STATE_RE, 'state name')}`;
   }
   const s = checkComponent(screen, SCREEN_RE, 'screen label') + (state !== undefined ? `@${checkComponent(state, STATE_RE, 'state name')}` : '');
   return `${c}#${s}`;

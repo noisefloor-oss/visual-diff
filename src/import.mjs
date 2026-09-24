@@ -33,6 +33,38 @@
 //      whose content hash changed; `--refresh` re-renders everything with new
 //      provenance (FR-12).
 //
+// The whole pipeline is one transaction in the FR-5 register, not just the
+// extraction. A run holds an exclusive project lock (.visual-diff/import.lock)
+// for its whole duration — a second import of the same project is refused, not
+// merged. The extracted tree is the run's scratch (kept only so this run can
+// serve it, pruned by the next successful import, removed on any failure the
+// run raises), and the reference set is committed by the rename of the manifest
+// that names it. Nothing already published is ever moved: each file the pass
+// writes is staged beside its real path and renamed into place at commit, and
+// each removal happens at commit too — so a failure before the commit leaves
+// references/ exactly as the run found it, by never having touched it.
+//
+// Known limit, stated so it is not overread: the staging record lives in this
+// process and covers every failure raised BEFORE the commit begins. A run
+// killed outright (SIGKILL, an OOM kill, power loss) never unwinds and leaves
+// its extracted tree and unpublished staged files behind — derived bytes the
+// next import sweeps (staged files as it starts, trees when it succeeds). A
+// kill or an I/O error striking DURING the commit leaves a mix of old and new
+// under the old manifest, since the renames are atomic one at a time but not as
+// a group; a removal that fails there stops before the manifest, so the
+// manifest still describes the previous set. `import --refresh` republishes the
+// set and is the repair for both. That is today's behavior; making the commit
+// itself crash-atomic is a design of its own.
+//
+// Boundary, stated so it is not overread: the transaction covers the scratch
+// tree and the reference set. Vendored bytes (FR-8) and a browser pin
+// committed during discovery (FR-33) are deliberately OUTSIDE it — the vendor
+// store is content-addressed and additive and the pin records a real verified
+// discovery, so a late render failure keeps both. Because provenance records
+// the hashes of the whole vendor directory, the references a failed run leaves
+// in place can then be vendorHashes-incompatible with the store that same run
+// grew, until `import --refresh`.
+//
 // Canonical flow (FR-23): import → author .visual-diff/visual-diff.json →
 // import --refresh → capture → compare. When the project config exists,
 // reference screens mapped by a state's <comp>#<screen> render under that
@@ -68,6 +100,13 @@
 //     }
 //   }
 //
+// An UNLABELLED comp (no [data-screen-label] screens, FR-40) carries
+// "unlabelled": true and one state-scoped entry per mapping state instead —
+//   { "id": "<state>", "label": "<comp> (@<state>)", "state": "<state>",
+//     "driven": true, "noiseFloor": 0 } —
+// with artifacts at references/<comp>@<state>.png. There is no base
+// reference; the entry is reachable only through the state that declared it.
+//
 // noiseFloor is the fraction of differing pixels between the two independent
 // renders of the screen (0..1; a dimension mismatch between the renders is
 // measured as 1 with a prominent warning).
@@ -81,7 +120,10 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  link,
+  lstat,
   mkdir,
+  open,
   readdir,
   readFile,
   rename,
@@ -92,7 +134,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { PNG } from 'pngjs';
 
 import { accommodationDivergence, frameShortfall, pngDimensions } from './png.mjs';
@@ -107,9 +149,9 @@ import { acquireBrowser } from './discover.mjs';
 import {
   createRecord,
   readRecord,
+  serializeRecord,
   sha256Hex,
   vendorHashesFor,
-  writeRecord,
 } from './provenance.mjs';
 import { isTimeoutError, loadVendorManifest, renderPage, verifySri } from './render.mjs';
 import { resolveBrowser } from './browser.mjs';
@@ -120,6 +162,8 @@ import extractDesignZip, {
 
 export const REFERENCE_MANIFEST_FILE = 'manifest.json';
 export const REFERENCE_MANIFEST_SCHEMA = 1;
+// Project-level exclusive import lock (see acquireImportLock below).
+export const IMPORT_LOCK_FILE = 'import.lock';
 
 // Reference render determinism constants (FR-14): the same viewport, DPR, and
 // frozen clock every reference render uses, so a later capture through the
@@ -418,16 +462,83 @@ function measureScreenFrame(page, screenId) {
     const screens = [...document.querySelectorAll('[data-screen-label]')];
     const screen = screens.find((el) => san(el.getAttribute('data-screen-label')) === id);
     if (!screen) return { missing: true, id };
-    const f = screen.getBoundingClientRect();
-    const figRect = { x: f.left + window.scrollX, y: f.top + window.scrollY, width: f.width, height: f.height };
+
+    const box = (el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height };
+    };
+    const union = (a, b) => {
+      const minX = Math.min(a.x, b.x);
+      const minY = Math.min(a.y, b.y);
+      const maxX = Math.max(a.x + a.width, b.x + b.width);
+      const maxY = Math.max(a.y + a.height, b.y + b.height);
+      return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+    };
+
+    // A figure's bounding box is its widest child in a flex column, so a long
+    // caption widens the figure even though the caption is labelling, not
+    // design surface. The frame is the union of the figure's renderable
+    // children (everything except the figcaption); for non-figure screens the
+    // labelled element itself is the frame.
+    function contentFrameRect(el) {
+      const isCaption = (child) => child.tagName && child.tagName.toLowerCase() === 'figcaption';
+      const hasCaption = [...el.children].some(isCaption);
+      if (!hasCaption) return box(el);
+      // Children with no rendered box (display:none, script/template) report
+      // a zero rect at the viewport origin; unioning one would balloon the
+      // frame to the document origin.
+      const rendered = (child) =>
+        typeof child.getClientRects === 'function' && child.getClientRects().length > 0;
+      let rect = null;
+      for (const child of el.children) {
+        if (isCaption(child) || !rendered(child)) continue;
+        rect = rect ? union(rect, box(child)) : box(child);
+      }
+      return rect ?? box(el);
+    }
+
+    const figRect = contentFrameRect(screen);
     const cap = screen.querySelector('figcaption');
     let capRect = null;
     if (cap) {
-      const c = cap.getBoundingClientRect();
-      capRect = { x: c.left + window.scrollX, y: c.top + window.scrollY, width: c.width, height: c.height };
+      capRect = box(cap);
     }
     return { missing: false, figRect, capRect, docHeight: document.documentElement.scrollHeight };
   }, screenId);
+}
+
+// FR-40: frame measurement by explicit selector, for comps with no
+// [data-screen-label] screens. The selector must match exactly one element
+// with a layout box — the same contract capture's clip enforces (a second
+// match would make the captured frame a function of document order) — so the
+// reference frame is a stated fact, never a guess. Returns the same shape as
+// measureScreenFrame with capRect null (no caption row concept exists without
+// a figure screen); a missing/ambiguous/hidden target is a loud trust failure,
+// matching compSelector and comp-mask anchors.
+async function measureSelectorFrame(page, selector) {
+  const found = await page.$$(selector);
+  if (found.length !== 1) {
+    throw trustError(
+      'comp-target-missing',
+      `compTarget ${JSON.stringify(selector)} matched ${found.length} elements — it must match exactly one`,
+    );
+  }
+  const box = await found[0].boundingBox();
+  if (box === null) {
+    throw trustError(
+      'comp-target-missing',
+      `compTarget ${JSON.stringify(selector)} matched an element with no layout box (display:none or detached) — ` +
+        'the reference would frame nothing',
+    );
+  }
+  // boundingBox() is VIEWPORT-relative; the full-page screenshot clip is
+  // DOCUMENT-relative (same normalization as capture's clip, src/capture.mjs).
+  const scroll = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+  return {
+    missing: false,
+    figRect: { x: box.x + scroll.x, y: box.y + scroll.y, width: box.width, height: box.height },
+    capRect: null,
+  };
 }
 
 // The document canvas a fullPage screenshot can cover (CSS px): Chromium
@@ -539,10 +650,16 @@ async function renderCompDiscovery({ browser, url, vendorDir, readiness, log }) 
 // (FR-15), determinism, hydration readiness, screenshot of the frame excluding
 // the caption row. Any abort here — an external the discovery pass missed — is
 // a provenance defect (FR-9): fail, never render against the live CDN.
+//
+// The target is either `screenId` (a [data-screen-label] screen) or — FR-40 —
+// `selector` (a state's compTarget, for an unlabelled comp). Exactly one is
+// set. A selector target is never allowEmpty: the mapping is explicit, so a
+// missing target is a failure, not a triage case.
 async function renderCompScreen({
   browser,
   url,
   screenId,
+  selector,
   vendor,
   vendorDir,
   readiness,
@@ -551,6 +668,9 @@ async function renderCompScreen({
   allowEmpty = false,
   log,
 }) {
+  const targetDesc = selector === undefined
+    ? `screen ${JSON.stringify(screenId)}`
+    : `compTarget ${JSON.stringify(selector)}`;
   const { page, context, result } = await renderPage({
     browser,
     url,
@@ -568,7 +688,34 @@ async function renderCompScreen({
         `reference render of ${url} aborted requests — unvendored external or isolation failure: ${formatDefects(result.aborted)}`,
       );
     }
-    const { pathFired } = await waitForReferenceReady(page, readiness);
+    const measure = () => (selector === undefined
+      ? measureScreenFrame(page, screenId)
+      : measureSelectorFrame(page, selector));
+    let pathFired;
+    if (selector !== undefined && drive === undefined) {
+      // FR-40 undriven readiness: policy wait + fonts, then the frame TARGET
+      // as the readiness witness (an unlabelled app may hydrate
+      // asynchronously — the target appearing is the ground truth that the
+      // comp reached a renderable state), then ONE settle. This mirrors the
+      // capture side's fonts -> readiness.selector -> settle ordering
+      // (capture.mjs waitReady), so both sides sample after exactly one
+      // settle interval with no drive.
+      const { selector: _s, compSelector: _c, ...policyOnly } = readiness;
+      ({ pathFired } = await waitReady(page, { ...policyOnly, settle: 0 }));
+      try {
+        await page.waitForSelector(selector, { state: 'visible', timeout: readiness.timeout });
+      } catch (err) {
+        if (!isTimeoutError(err)) throw err;
+        throw trustError(
+          'comp-target-missing',
+          `compTarget ${JSON.stringify(selector)} never became visible within ${readiness.timeout}ms — ` +
+            'the comp never rendered the frame target; refusing to record a reference of the wrong state',
+        );
+      }
+      if (readiness.settle > 0) await page.waitForTimeout(readiness.settle);
+    } else {
+      ({ pathFired } = await waitForReferenceReady(page, readiness));
+    }
     // FR-37: drive the comp into the runtime state before measuring and
     // shooting — each step waits for its target, acts, settles; then the
     // comp-side readiness selector (side-bound, FR-16), then one final
@@ -610,6 +757,21 @@ async function renderCompScreen({
           throw trustError('comp-selector-missing', `readiness compSelector ${JSON.stringify(readiness.compSelector)} never became visible within ${readiness.timeout}ms — refusing to record a reference of the wrong state`);
         }
       }
+      if (selector !== undefined) {
+        // FR-40 driven: the frame target may be CREATED by the drive (a
+        // conditional surface), so it is awaited here — post-drive, like
+        // compSelector — never before the steps run.
+        try {
+          await page.waitForSelector(selector, { state: 'visible', timeout: readiness.timeout });
+        } catch (err) {
+          if (!isTimeoutError(err)) throw err;
+          throw trustError(
+            'comp-target-missing',
+            `compTarget ${JSON.stringify(selector)} never became visible within ${readiness.timeout}ms after the compDrive steps — ` +
+              'the comp never rendered the frame target; refusing to record a reference of the wrong state',
+          );
+        }
+      }
       // The pre-sample settle: the shot must never race a just-fired
       // compSelector (the capture side has always guaranteed this before its
       // screenshot), and it is what keeps the two sides' settle counts equal.
@@ -617,11 +779,13 @@ async function renderCompScreen({
       // depend on whether a side happens to declare its optional selector.
       if (readiness.settle > 0) await page.waitForTimeout(readiness.settle);
     }
-    const measured = await measureScreenFrame(page, screenId);
+    const measured = await measure();
     if (measured.missing) {
       // A runtime conditional (sc-if) UNMOUNTS its subtree rather than
       // collapsing it to zero size, so an undriven conditional screen is
       // absent from the DOM, not empty. Both are the same triage input.
+      // (A selector target never lands here — measureSelectorFrame throws
+      // comp-target-missing instead.)
       if (allowEmpty) return { empty: true, frame: { x: 0, y: 0, width: 0, height: 0 } };
       throw usageError('screen-missing', `screen ${JSON.stringify(screenId)} not found in ${url} after hydration`);
     }
@@ -635,9 +799,12 @@ async function renderCompScreen({
       if (allowEmpty) return { empty: true, frame };
       throw usageError(
         'empty-frame',
-        `screen ${JSON.stringify(screenId)} in ${url} has an empty frame (caption only?) — ` +
-          'a screen that only renders under runtime state (e.g. an sc-if conditional) can be ' +
-          'referenced driven-only by mapping it with a compDrive state (FR-37)',
+        selector === undefined
+          ? `screen ${JSON.stringify(screenId)} in ${url} has an empty frame (caption only?) — ` +
+            'a screen that only renders under runtime state (e.g. an sc-if conditional) can be ' +
+            'referenced driven-only by mapping it with a compDrive state (FR-37)'
+          : `compTarget ${JSON.stringify(selector)} in ${url} has an empty frame — ` +
+            'the target element rendered zero-sized; fix the selector or the comp',
       );
     }
     // FR-38 canvas accommodation: with an inner-scroll comp (html,body at
@@ -673,11 +840,11 @@ async function renderCompScreen({
         };
         await page.setViewportSize(grown);
         await page.waitForTimeout(Math.max(readiness.settle ?? 0, 100));
-        const remeasured = await measureScreenFrame(page, screenId);
+        const remeasured = await measure();
         if (remeasured.missing) {
           throw trustError(
             'frame-unstable',
-            `screen ${JSON.stringify(screenId)} in ${url} disappeared after the viewport was grown to ` +
+            `${targetDesc} in ${url} disappeared after the viewport was grown to ` +
               `${grown.width}x${grown.height} to fit its frame — the comp's layout depends on viewport size, ` +
               'so the tool cannot safely extend the canvas',
           );
@@ -687,7 +854,7 @@ async function renderCompScreen({
           || regrown.width !== frame.width || regrown.height !== frame.height) {
           throw trustError(
             'frame-unstable',
-            `screen ${JSON.stringify(screenId)} in ${url} measured ${fmtRect(frame)} at the declared viewport ` +
+            `${targetDesc} in ${url} measured ${fmtRect(frame)} at the declared viewport ` +
               `but ${fmtRect(regrown)} after the viewport was grown to ${grown.width}x${grown.height} to fit it — ` +
               'the comp reflows responsively under a taller viewport, so the tool cannot safely extend the ' +
               'canvas without changing the pixels being referenced. Fix the comp to a static frame, or let ' +
@@ -736,7 +903,7 @@ async function renderCompScreen({
         : `${shortfall.delivered.width}x${shortfall.delivered.height} device px`;
       throw trustError(
         'frame-truncated',
-        `screen ${JSON.stringify(screenId)} in ${url}: the render delivered ${got} ` +
+        `${targetDesc} in ${url}: the render delivered ${got} ` +
           `but the screen frame requires ${shortfall.expected.width}x${shortfall.expected.height} — ` +
           'the screenshot clip was clamped to the document scroll box. This usually means the comp ' +
           'scrolls in an inner container (html,body at height:100% with an overflow:auto region), so ' +
@@ -764,7 +931,7 @@ async function renderCompScreen({
             'comp-mask-missing',
             `mask ${JSON.stringify(name)} compSelector ${JSON.stringify(m.compSelector)} matched ` +
               `${probe === undefined ? 0 : probe.matches} elements (${probe === undefined ? 0 : probe.visible} visible) ` +
-              `in ${url}#${screenId} — it must match exactly one visible element`,
+              `in ${url} (${targetDesc}) — it must match exactly one visible element`,
           );
         }
         masks[name] = {
@@ -786,7 +953,15 @@ async function renderCompScreen({
     // loop for annotation-less comps). Names ride a null-prototype map with
     // defineProperty assignment: a mask named "__proto__" (or colliding with
     // the probe's protocol fields) must survive intact.
-    const authoredProbes = await page.evaluate(probeCompAuthoredMasks, screenId);
+    //
+    // A compTarget (FR-40) render skips the probe: data-vd-mask scoping is
+    // defined relative to a [data-screen-label] screen, which an unlabelled
+    // comp does not have — config masks (fractional or compSelector-anchored)
+    // remain available. The empty map is recorded for the same
+    // probed-vs-never-probed distinction.
+    const authoredProbes = selector === undefined
+      ? await page.evaluate(probeCompAuthoredMasks, screenId)
+      : null;
     const compAuthoredMasks = Object.create(null);
     if (authoredProbes && authoredProbes.missing !== true) {
       for (const probe of authoredProbes.entries ?? []) {
@@ -848,13 +1023,46 @@ async function renderCompScreen({
 // provenance records; the rendered pixels (and noise floor) are untouched.
 async function repairSkippedCompMasks({
   comp, oldEntry, config, browser, url, vendorEntries, vendorDir, readiness, screenReadiness,
-  screenCompMasks, drivenStates, layout, log,
+  screenCompMasks, drivenStates, statesByComp, layout, stagedWrites, log,
 }) {
   const staleEntries = (record, declared) =>
     Object.entries(declared).filter(([name, spec]) => {
       const entry = record.inputs.masks?.[name];
       return entry === undefined || entry.compSelector !== spec.compSelector || entry.shape !== spec.shape;
     });
+  // FR-40: an unlabelled comp has no discovery screens to iterate — its
+  // repair units are the state-scoped references its compTarget mappings
+  // declared at the last render. Each state's compSelector'd masks resolve
+  // against that state's own render (compTarget + readiness + compDrive),
+  // exactly as they did when the reference was made. A mapping state added
+  // AFTER the comp last rendered has no record at all — repair is not its
+  // remedy (compare fails it as no-reference naming import --refresh), so it
+  // is skipped here. compAuthoredMasks needs no repair on this path: the
+  // FR-40 render records it (empty) unconditionally from the first version
+  // that supports unlabelled comps.
+  if (comp.screenless) {
+    for (const { stateName, state } of statesByComp.get(comp.name) ?? []) {
+      const manifestScreen = oldEntry?.screens?.find((s) => s.state === stateName);
+      if (manifestScreen === undefined) continue;
+      const declared = Object.fromEntries(
+        Object.entries(effectiveMasks(config, state))
+          .filter(([, m]) => m.selector !== undefined && m.compSelector !== undefined)
+          .map(([name, m]) => [name, { compSelector: m.compSelector, shape: m.shape }]),
+      );
+      const provPath = layout.referenceProvenance(comp.name, undefined, stateName);
+      const record = await readRecord(provPath);
+      const stale = staleEntries(record, declared);
+      if (stale.length === 0) continue;
+      log(`import: ${comp.name}@${stateName} unchanged but its mask provenance is missing/stale — re-probing (record-only repair)`);
+      const probed = await renderCompScreen({
+        browser, url, selector: state.compTarget, vendor: vendorEntries, vendorDir,
+        readiness: state.readiness, drive: state.compDrive, compMasks: declared, log,
+      });
+      record.inputs.masks = probed.masks;
+      await stagedWrites.writeRecord(provPath, record);
+    }
+    return;
+  }
   for (const screen of comp.screens) {
     const key = `${comp.name}#${screen.id}`;
     // A screen the prior import recorded without a base reference has no
@@ -883,7 +1091,7 @@ async function repairSkippedCompMasks({
       });
       if (stale.length > 0) record.inputs.masks = probed.masks;
       record.inputs.compAuthoredMasks = probed.compAuthoredMasks;
-      await writeRecord(provPath, record);
+      await stagedWrites.writeRecord(provPath, record);
     }
     }
     for (const { stateName, state } of drivenStates.get(key) ?? []) {
@@ -906,7 +1114,7 @@ async function repairSkippedCompMasks({
       });
       if (driveStale.length > 0) record.inputs.masks = probed.masks;
       record.inputs.compAuthoredMasks = probed.compAuthoredMasks;
-      await writeRecord(provPath, record);
+      await stagedWrites.writeRecord(provPath, record);
     }
   }
 }
@@ -1133,6 +1341,20 @@ export async function vendorExternals({ externals, vendorDir, existing, fetcher,
 // Reference manifest (FR-11/FR-12 record)
 // =============================================================================
 
+// Reference artifact paths [png, provenance] for a manifest screen entry.
+// Base and driven entries splice their id (<screen> / <screen>@<state>); a
+// state-scoped FR-40 entry of an unlabelled comp carries no screen id and
+// splices its state instead (<comp>@<state>).
+function referencePathsFor(layout, compName, s) {
+  if (s.state !== undefined) {
+    return [
+      layout.referencePng(compName, undefined, s.state),
+      layout.referenceProvenance(compName, undefined, s.state),
+    ];
+  }
+  return [layout.referencePng(compName, s.id), layout.referenceProvenance(compName, s.id)];
+}
+
 // Consumed by compare for the measured noise floor (FR-11/FR-22) —
 // exported, never re-implemented.
 export async function readReferenceManifest(referencesDir) {
@@ -1177,6 +1399,329 @@ async function writeFileAtomic(filePath, data) {
     await unlink(tmp).catch(() => {});
     throw err;
   }
+}
+
+// =============================================================================
+// Project import lock (one import per project at a time)
+// =============================================================================
+
+const pathExists = (p) => stat(p).then(() => true, () => false);
+
+/**
+ * Take the project-level exclusive import lock. Two imports of one project
+ * were never a sane thing to run: they race on the same reference paths and on
+ * one manifest, so each would publish over parts of the other's set and no
+ * manifest on disk would describe what is actually there. The second import is
+ * therefore REFUSED, never merged and never silently queued.
+ *
+ * The lock is an atomically created file (`open` with `wx`, which fails when
+ * the path exists) under `.visual-diff/`, carrying the holder's pid, start
+ * time, and a per-run nonce. A lock is NEVER stolen — not on a pid liveness
+ * check, not after a timeout: stealing the lock while the holder is in fact
+ * alive is the one failure mode this whole mechanism exists to prevent, and no
+ * check from outside the process can rule that out. The refusal names the file,
+ * so removing it is the operator's explicit, deliberate override; the refusal
+ * also says what a killed run leaves behind, because nothing repairs it
+ * automatically.
+ *
+ * The file appears with its payload already in it: the bytes are written to a
+ * temp file and `link`ed into place, which is atomic and fails when the
+ * destination exists. A competitor therefore never observes a created-but-
+ * empty lock, and can name the holder it lost to whenever that file is
+ * readable — and says so plainly (an unidentified holder) when it is not.
+ *
+ * Release is OWNERSHIP-CHECKED. A lock file at this path is not necessarily
+ * this run's lock: if this run's own cleanup (or anything else) removed the
+ * file, a later import may have legitimately taken the same path, and
+ * unlinking THAT would let a third import overlap a live holder. So release
+ * unlinks the path only while it still resolves to the very file this run
+ * created — compared as `lstat(path)` against `fstat` of the descriptor held
+ * open since acquisition, never as payload bytes, which a byte-identical
+ * look-alike on a recycled inode would defeat (see release() below).
+ */
+async function acquireImportLock(vdRoot, { nonce }) {
+  const lockPath = join(vdRoot, IMPORT_LOCK_FILE);
+  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), nonce }) + '\n';
+  // The staged file's whole lifetime is inside one try/finally: a failure to
+  // write, flush, close, or link must not leave `.<uuid>.lock.tmp` behind.
+  const staged = join(vdRoot, `.${randomUUID()}.lock.tmp`);
+  let handle = null;
+  try {
+    handle = await open(staged, 'wx');
+    await handle.writeFile(payload);
+    await handle.datasync();
+    // link() gives lockPath as a SECOND name for the file just written, so the
+    // lock appears with its contents already in it. The staged name is dropped
+    // below; the descriptor stays open for the run (see release).
+    await link(staged, lockPath);
+  } catch (err) {
+    await handle?.close().catch(() => {});
+    handle = null;
+    if (err.code !== 'EEXIST' || !(await pathExists(lockPath))) throw err;
+    const holder = await readFile(lockPath, 'utf8')
+      .then((t) => JSON.parse(t))
+      .catch(() => null);
+    const who = holder && holder.pid
+      ? `pid ${holder.pid}${holder.startedAt ? `, started ${holder.startedAt}` : ''}`
+      : 'an unidentified holder';
+    throw usageError(
+      'import-locked',
+      `another import is already running for this project (${who}) — concurrent imports of one project ` +
+        'are refused, never merged. If no import is running the lock is stale (a previous run was killed): ' +
+        `remove ${lockPath} to re-run. A killed run cannot unwind itself, so its reference set may be left ` +
+        'half-written under the previous manifest — re-run with --refresh to republish it',
+    );
+  } finally {
+    await unlink(staged).catch(() => {});
+  }
+  return {
+    path: lockPath,
+    /**
+     * Unlink the lock only while the path still resolves to the very file this
+     * run created — compared as `lstat(path)` against `fstat` of the descriptor
+     * held open since acquisition.
+     *
+     * The held descriptor is what makes the comparison sound. An inode number
+     * is reusable the moment its last reference goes away, so a successor that
+     * removes this lock and writes its own can be handed the SAME dev/ino pair
+     * (reproducible on this project's runner) — a recorded inode, and equally a
+     * recorded payload, both then match a file this run never created. An open
+     * descriptor pins the inode: while it is held the number cannot be recycled
+     * for anything else, so a match against it means the path names this file
+     * and not a look-alike. `lstat` keeps a planted symlink from matching, since
+     * it is never followed.
+     *
+     * POSIX unlinks by name, not by descriptor, so a window remains between the
+     * comparison and the unlink that no user-space check can close (Node has no
+     * `flock`). What must happen inside it is someone removing a LIVE lock — the
+     * documented manual override — while another run takes the path in that
+     * same instant.
+     *
+     * Returns the failures met (empty when the lock is gone or was never this
+     * run's to remove). Ownership-safe cases are NOT failures: the path
+     * already gone (ENOENT) or now naming a different file means there is
+     * nothing of this run's left to unlink. A stat or unlink that fails for a
+     * real reason leaves the lock behind — and a leftover lock refuses every
+     * later import — so the caller must report it, never swallow it.
+     */
+    async release() {
+      const failures = [];
+      try {
+        let own = null;
+        if (handle !== null) {
+          try {
+            own = await handle.stat();
+          } catch (err) {
+            failures.push(`could not stat the held lock descriptor: ${err.message}`);
+          }
+        }
+        let there = null;
+        try {
+          there = await lstat(lockPath);
+        } catch (err) {
+          // Already gone is the intended end state; any other error means the
+          // ownership check could not run and the lock may still be there.
+          if (err.code !== 'ENOENT') failures.push(`could not inspect ${lockPath}: ${err.message}`);
+        }
+        if (own !== null && there !== null && there.isFile()
+          && there.dev === own.dev && there.ino === own.ino) {
+          try {
+            await unlink(lockPath);
+          } catch (err) {
+            if (err.code !== 'ENOENT') failures.push(`could not remove ${lockPath}: ${err.message}`);
+          }
+        }
+      } finally {
+        await handle?.close().catch(() => {});
+        handle = null;
+      }
+      return failures;
+    },
+  };
+}
+
+// =============================================================================
+// Staged reference writes (FR-5 atomicity, whole-import register)
+// =============================================================================
+
+const STAGED_SUFFIX = '.staged.tmp';
+// Every temp family this module's writers can leave behind, each matched in
+// the directory its writer stages it in: staged reference temps in
+// references/, a killed lock acquisition's `.<uuid>.lock.tmp` at the
+// .visual-diff/ root, a legacy nested provenance temp (`.<uuid>.provenance.tmp`,
+// staged by provenance writeRecord before the staging wrote bytes directly),
+// and the vendor pass's `.staging-<uuid>/` directories and `.<uuid>.tmp`
+// manifest temps in vendor/. All are dot-prefixed names no artifact can have.
+const isReferenceTempName = (name) =>
+  name.startsWith('.') && (name.endsWith(STAGED_SUFFIX) || name.endsWith('.provenance.tmp'));
+const isLockTempName = (name) => name.startsWith('.') && name.endsWith('.lock.tmp');
+const isVendorTempName = (name) =>
+  name.startsWith('.staging-') || (name.startsWith('.') && name.endsWith('.tmp'));
+
+/**
+ * The reference pass writes PNGs and provenance screen by screen and prunes
+ * stale artifacts as it goes, while the manifest that names the set is written
+ * last — so a mid-pass failure must not leave artifacts no manifest describes,
+ * nor a previous import's references half-replaced under its own (now wrong)
+ * manifest.
+ *
+ * Nothing existing is ever moved. Each new file is written to a sibling temp
+ * name in references/ and renamed onto its real path only at commit; each
+ * removal is recorded and performed only at commit. So for the whole run every
+ * committed artifact stays exactly where it is, with its bytes and its mtime —
+ * an abandoned run has nothing to restore, nothing to verify, and leaves no
+ * file that exists nowhere else. Rolling back is unlinking this run's temps,
+ * which are derived bytes by construction.
+ *
+ * That is the property worth the design: the residue of a failure is never the
+ * only copy of anything. (An earlier revision moved originals aside and put
+ * them back, which made every failure a custody question about bytes that
+ * existed in one place only.)
+ *
+ * Commit renames each staged file into place, then applies the removals, then
+ * renames the manifest last — the manifest is the commit point, so it names the
+ * set only once the set is there. Those renames are individually atomic but not
+ * atomic as a group: a process killed (or an I/O error striking) between them
+ * leaves a mix of old and new under the old manifest, which is the same
+ * documented limit as any kill mid-import, bounded here to a handful of renames
+ * rather than a whole render pass. `import --refresh` republishes the set.
+ */
+function createStagedWrites(referencesDir) {
+  const staged = new Map(); // final path -> temp path
+  const removals = new Set(); // final paths to unlink at commit
+  const tempFor = (finalPath) => join(dirname(finalPath), `.${randomUUID()}${STAGED_SUFFIX}`);
+  return {
+    /** Stage `bytes` for `finalPath`. Nothing at that path is touched yet. */
+    async writeFile(finalPath, bytes) {
+      const temp = staged.get(finalPath) ?? tempFor(finalPath);
+      // Registered BEFORE the write: a write that creates the file and then
+      // fails must still leave a temp this run knows how to discard.
+      staged.set(finalPath, temp);
+      removals.delete(finalPath);
+      await mkdir(dirname(finalPath), { recursive: true });
+      await writeFile(temp, bytes);
+    },
+    /**
+     * Stage a provenance record for `finalPath` (validated as it is
+     * serialized). The staged temp IS this run's atomicity mechanism, so the
+     * bytes are written straight to it: routing through writeRecord would
+     * nest a second temp (`.<uuid>.provenance.tmp`) inside the staged one —
+     * another crash-residue family the sweep would have to know about — while
+     * buying atomicity nothing needs (a torn staged temp is swept, never
+     * read).
+     */
+    async writeRecord(finalPath, record) {
+      const temp = staged.get(finalPath) ?? tempFor(finalPath);
+      staged.set(finalPath, temp);
+      removals.delete(finalPath);
+      const data = serializeRecord(record);
+      await mkdir(dirname(finalPath), { recursive: true });
+      await writeFile(temp, data, 'utf8');
+    },
+    /**
+     * Record that `finalPath` is to be removed. A deletion has no
+     * write-aside-and-rename form, so it is deferred instead: until commit the
+     * artifact is untouched, and an abandoned run simply never removes it.
+     */
+    remove(finalPath) {
+      if (staged.has(finalPath)) return; // this run rewrites it; the write wins
+      removals.add(finalPath);
+    },
+    /**
+     * Publish everything: staged files first, then the removals, then the
+     * manifest (`last`), which is the commit point.
+     */
+    async commit(last) {
+      for (const [finalPath, temp] of staged) {
+        if (finalPath === last) continue;
+        await rename(temp, finalPath);
+      }
+      for (const finalPath of removals) {
+        try {
+          await unlink(finalPath);
+        } catch (err) {
+          // Already gone is the intended end state. Anything else is a real
+          // failure and must NOT be followed by the manifest rename: publishing
+          // a manifest that does not describe an artifact still on disk would
+          // be exactly the half-state this whole path exists to prevent. It
+          // stops here instead, with the mixed set under the OLD manifest —
+          // the documented commit-window limit — and says which file and why.
+          if (err.code !== 'ENOENT') {
+            throw trustError(
+              'commit-incomplete',
+              `could not remove the stale reference ${relative(referencesDir, finalPath)} while publishing the ` +
+                `reference set: ${err.message} — the manifest was NOT republished, so it still describes the ` +
+                'previous set; re-run the import with --refresh to republish everything',
+            );
+          }
+        }
+      }
+      if (last !== undefined && staged.has(last)) await rename(staged.get(last), last);
+      staged.clear();
+      removals.clear();
+    },
+    /**
+     * Abandon everything: unlink this run's temps. Nothing committed was ever
+     * moved, so there is nothing to put back — a temp that survives (a failing
+     * unlink) is derived bytes no manifest names, and the next import sweeps it.
+     */
+    async rollback() {
+      const failures = [];
+      for (const [finalPath, temp] of staged) {
+        try {
+          await rm(temp, { force: true });
+        } catch (err) {
+          failures.push(`${basename(temp)} (staged for ${basename(finalPath)}): ${err.message}`);
+        }
+      }
+      staged.clear();
+      removals.clear();
+      if (failures.length > 0) {
+        throw trustError(
+          'staged-cleanup',
+          `could not remove every staged reference file: ${failures.join('; ')} — no committed artifact was ` +
+            'touched; the leftovers are unreferenced and the next import sweeps them',
+        );
+      }
+    },
+  };
+}
+
+/**
+ * Remove temps an interrupted run of this tool left behind in `dir`.
+ * `isTempName` names one reserved temp family (see the predicates above):
+ * dot-prefixed names no artifact can have, so the match is safe by
+ * construction, and under the import lock this run is the only writer. The
+ * sweep is authoritative: a name is reported as swept only when it is actually
+ * gone, and a removal that fails for a real reason fails the import rather
+ * than letting it claim a cleanup it did not perform.
+ */
+async function sweepTempFiles(dir, isTempName, what) {
+  let names;
+  try {
+    names = await readdir(dir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+  const swept = [];
+  const failures = [];
+  for (const name of names.filter(isTempName)) {
+    try {
+      await rm(join(dir, name), { recursive: true, force: true });
+      swept.push(name);
+    } catch (err) {
+      failures.push(`${name}: ${err.message}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw trustError(
+      'sweep-failed',
+      `could not sweep every ${what} an interrupted run left behind: ${failures.join('; ')} — ` +
+        'the import stops here rather than claim a cleanup it did not perform; remove the leftovers by hand and re-run',
+    );
+  }
+  return swept;
 }
 
 // =============================================================================
@@ -1240,14 +1785,60 @@ function closeServer(server) {
 // Orchestration
 // =============================================================================
 
+// Cleanup failures never replace the error that triggered the unwind — that
+// error still decides the exit code — but they are never silent either: they
+// are named in that error's message, which the CLI prints, so the tool never
+// reports a failure while quietly leaving residue it claimed to remove.
+const noteCleanup = (err, failures) => {
+  if (failures.length > 0 && err instanceof Error) {
+    err.message +=
+      ` — and the cleanup afterwards was incomplete: ${failures.join('; ')} — ` +
+      'remove the leftovers by hand';
+  }
+};
+
 /**
  * Run an import. Options: projectDir, zipPath, only, refresh, readiness,
  * env, cwd. Deps (test seams): resolveBrowser, fetcher, log, streams.
  * Throws typed errors (ImportError, BrowserResolutionError, ZipError,
  * CompsError, RenderError, ProvenanceError, LayoutError) on failure; returns
  * `{ summary }` on success.
+ *
+ * One import per project at a time: the run holds the project import lock from
+ * the moment the tree skeleton exists until it has committed or unwound, and
+ * releases it on every exit path. The release is never silent: on a failure
+ * exit a release failure rides the original error's message (which keeps its
+ * exit code), and after a SUCCESSFUL transaction it fails the run — the set
+ * committed but a leftover lock refuses every later import, so the operator
+ * must hear it and get the remedy.
  */
 export async function importZip(options, deps = {}) {
+  const held = { lock: null };
+  let failure = null;
+  let result;
+  try {
+    result = await runImportTransaction(options, deps, held);
+  } catch (err) {
+    failure = err;
+  }
+  const releaseFailures = held.lock === null ? [] : await held.lock.release();
+  held.lock = null;
+  if (failure !== null) {
+    noteCleanup(failure, releaseFailures);
+    throw failure;
+  }
+  if (releaseFailures.length > 0) {
+    const lockPath = join(options.projectDir, '.visual-diff', IMPORT_LOCK_FILE);
+    throw trustError(
+      'lock-release',
+      `the import committed, but its lock could not be released: ${releaseFailures.join('; ')} — ` +
+        `the leftover lock refuses later imports as import-locked; remove ${lockPath} to re-run`,
+    );
+  }
+  return result;
+}
+
+async function runImportTransaction(options, deps, held) {
   const {
     projectDir,
     zipPath,
@@ -1298,15 +1889,50 @@ export async function importZip(options, deps = {}) {
       /* missing or not a directory — nothing was staged there */
     }
   };
-  const unwindPreCommit = async (stagedTree) => {
-    if (freshProject) {
-      await rm(vdRoot, { recursive: true, force: true });
-      return;
-    }
-    if (stagedTree) await rm(stagedTree, { recursive: true, force: true }).catch(() => {});
+  // This run's nonce names its extracted tree under imports/. A tree left
+  // behind by a killed run is pruned by the next successful import; the staged
+  // temps it never got to publish (reference, lock, vendor — each in the
+  // directory its writer stages it in) are swept as the next import starts.
+  // All of it is derived bytes.
+  const nonce = Math.random().toString(36).slice(2, 10);
+  const treeRoot = join(importsRoot, `import-${nonce}`);
+  const stagedWrites = createStagedWrites(layout.referencesDir);
+  // The extracted tree is pure scratch — derived bytes owned by this
+  // invocation alone, kept after a SUCCESSFUL run only so the run can serve
+  // it, and pruned by the next one. Removing it is therefore independent of
+  // every commit decision below: it is always removable on failure, including
+  // a render-stage failure that legitimately keeps the committed browser pin.
+  // A removal that FAILS is not swallowed: it propagates (force covers only
+  // absence) so the caller can name the residue — see noteCleanup.
+  const removeScratchTree = async () => {
+    await rm(treeRoot, { recursive: true, force: true });
+  };
+  // The PROJECT skeleton unwind is the separate, narrower decision: it undoes
+  // what this invocation staged toward initializing the project — the skeleton
+  // dirs it created (only while still empty) on an existing project, or the
+  // whole .visual-diff on a fresh one. It is correct only BEFORE the browser
+  // pin is committed; afterwards the project is legitimately initialized.
+  // Returns the cleanup failures it met (empty when the unwind was complete).
+  const unwindPreCommit = async () => {
+    const failures = [];
+    await removeScratchTree().catch((err) => failures.push(`extracted tree: ${err.message}`));
     for (const dir of skeletonDirs) {
       if (!preExisting.has(dir)) await removeIfEmpty(dir);
     }
+    if (!freshProject) return failures;
+    // On a fresh project the skeleton was this run's, so the root goes too —
+    // but by removing what this run made, never by recursively deleting a
+    // directory that is no longer only ours. This cleanup releases the lock
+    // itself (ownership-checked), then removes the root only while it is
+    // EMPTY: anything a successor created stops the removal cold, and the
+    // ownership-checked release above it can no longer unlink someone else's
+    // lock. rmdir on a non-empty directory simply fails, which is the answer.
+    if (held.lock !== null) {
+      failures.push(...await held.lock.release());
+      held.lock = null;
+    }
+    await rmdir(vdRoot).catch(() => {});
+    return failures;
   };
   // init() itself is a pre-commit stage: a partial failure (e.g. a
   // pre-existing captures FILE where a dir is expected) must not leave the
@@ -1315,8 +1941,43 @@ export async function importZip(options, deps = {}) {
     await init(projectDir);
     await mkdir(importsRoot, { recursive: true });
   } catch (err) {
-    await unwindPreCommit(null);
+    noteCleanup(err, await unwindPreCommit());
     throw err;
+  }
+
+  // --- exclusive import lock -------------------------------------------------
+  // From here on this run owns the project's reference set. A refusal unwinds
+  // NOTHING: whatever is on disk belongs to the import that holds the lock.
+  try {
+    held.lock = await acquireImportLock(vdRoot, { nonce });
+  } catch (err) {
+    // An overlap refusal unwinds NOTHING: what is on disk belongs to the run
+    // that holds the lock. Any OTHER acquisition failure is this invocation's
+    // own — it staged a skeleton and got nowhere — so it unwinds like every
+    // pre-commit stage.
+    if (!(err instanceof ImportError && err.code === 'import-locked')) noteCleanup(err, await unwindPreCommit());
+    throw err;
+  }
+  // Snapshot what imports/ holds now, so the success sweep at the end can only
+  // ever remove scratch that was already there when this run took the lock.
+  const preExistingScratch = await readdir(importsRoot).catch(() => []);
+  // Temps an interrupted run never published are unreferenced derived bytes
+  // (no manifest can name one: the names are reserved). Under the lock, this
+  // run is the only writer, so they are safe to sweep — every temp family the
+  // writers can leave, each in the directory it is staged in: staged
+  // reference temps, a killed acquisition's lock temp at the root, and the
+  // vendor pass's staging leftovers.
+  const sweptStaged = await sweepTempFiles(layout.referencesDir, isReferenceTempName, 'staged reference file');
+  if (sweptStaged.length > 0) {
+    log(`import: swept ${sweptStaged.length} staged reference file(s) an interrupted run left behind`);
+  }
+  const sweptLockTemps = await sweepTempFiles(vdRoot, isLockTempName, 'staged lock file');
+  if (sweptLockTemps.length > 0) {
+    log(`import: swept ${sweptLockTemps.length} staged lock file(s) an interrupted run left behind`);
+  }
+  const sweptVendorTemps = await sweepTempFiles(layout.vendorDir, isVendorTempName, 'vendor staging leftover');
+  if (sweptVendorTemps.length > 0) {
+    log(`import: swept ${sweptVendorTemps.length} vendor staging leftover(s) an interrupted run left behind`);
   }
 
   // --- FR-23 preflight, step 1: read and validate any existing
@@ -1331,7 +1992,7 @@ export async function importZip(options, deps = {}) {
     configHashValue = loaded.hash; // configHash(config) computed once by loadConfig
   } catch (err) {
     if (!(err instanceof ConfigError) || !err.reason.startsWith('config file not found')) {
-      await unwindPreCommit(null);
+      noteCleanup(err, await unwindPreCommit());
       throw err;
     }
   }
@@ -1340,8 +2001,18 @@ export async function importZip(options, deps = {}) {
   // unzip owns reading the archive (ZipInputError on a missing/unreadable
   // file); the tree name is a per-run nonce because older revisions are pruned
   // after a successful run.
-  const treeRoot = join(importsRoot, `import-${Math.random().toString(36).slice(2, 10)}`);
   let comps;
+  // Every config state's comp mapping, grouped by comp name (config order):
+  // drives the screenless-comp triage below AND the FR-40 state-scoped
+  // reference renders in the reference pass.
+  const statesByComp = new Map(); // comp name -> [{ stateName, state, ref }]
+  for (const [stateName, state] of Object.entries(config?.states ?? {})) {
+    if (state === undefined || state.comp === null) continue;
+    const ref = parseCompRef(state.comp);
+    const list = statesByComp.get(ref.comp) ?? [];
+    list.push({ stateName, state, ref });
+    statesByComp.set(ref.comp, list);
+  }
   try {
     extractDesignZip(zipAbs, treeRoot);
 
@@ -1352,24 +2023,51 @@ export async function importZip(options, deps = {}) {
       throw mapCompError(err);
     }
     // A screenless comp the config never references (a type
-    // specimen sheet) warns and skips instead of failing the whole import;
-    // one the config DOES reference fails closed.
-    const referencedComps = new Set(
-      Object.values(config?.states ?? {})
-        .map((s) => s?.comp?.split('#')[0])
-        .filter(Boolean),
-    );
+    // specimen sheet) warns and skips instead of failing the whole import.
+    // A referenced screenless comp is importable only through EXPLICIT
+    // mappings (FR-40): every state mapping it must name the whole comp —
+    // there are no labelled screens to name — and declare a compTarget
+    // selector framing the reference. Anything less fails closed: the tool
+    // never guesses which element is the screen.
     comps = comps.filter((comp) => {
-      if (!comp.screenless) return true;
-      if (referencedComps.has(comp.name)) {
+      const mappings = statesByComp.get(comp.name) ?? [];
+      if (!comp.screenless) {
+        const targeted = mappings.filter((m) => m.state.compTarget !== undefined);
+        if (targeted.length > 0) {
+          throw usageError(
+            'comp-target-invalid',
+            `state(s) ${targeted.map((m) => JSON.stringify(m.stateName)).join(', ')} declare compTarget, but comp ` +
+              `${comp.name} (${comp.path}) HAS [data-screen-label] screens — compTarget frames an unlabelled ` +
+              'comp only; map <comp>#<screen> instead',
+          );
+        }
+        return true;
+      }
+      if (mappings.length === 0) {
+        log(`import: warning comp ${comp.name} (${comp.path}) has no [data-screen-label] screens — skipping`);
+        return false;
+      }
+      const withScreen = mappings.filter((m) => m.ref.screen !== undefined);
+      if (withScreen.length > 0) {
         throw usageError(
           'comp-has-no-screens',
-          `comp ${comp.name} (${comp.path}) declares no [data-screen-label] screens but the config references it — ` +
-            'add screens to the comp or fix the config mapping',
+          `comp ${comp.name} (${comp.path}) declares no [data-screen-label] screens, but state(s) ` +
+            `${withScreen.map((m) => JSON.stringify(m.stateName)).join(', ')} map it as <comp>#<screen> — there are no ` +
+            'labelled screens to name. Map the whole comp and give the state an explicit compTarget selector (FR-40)',
         );
       }
-      log(`import: warning comp ${comp.name} (${comp.path}) has no [data-screen-label] screens — skipping`);
-      return false;
+      const untargeted = mappings.filter((m) => m.state.compTarget === undefined);
+      if (untargeted.length > 0) {
+        throw usageError(
+          'comp-has-no-screens',
+          `comp ${comp.name} (${comp.path}) declares no [data-screen-label] screens, but state(s) ` +
+            `${untargeted.map((m) => JSON.stringify(m.stateName)).join(', ')} map it without a compTarget — ` +
+            'an unlabelled comp is imported only through explicit mappings: give each mapping state a compTarget ' +
+            'selector (the reference frame) paired with a clip selector (the capture frame), or add ' +
+            '[data-screen-label] screens to the comp (FR-40)',
+        );
+      }
+      return true;
     });
     if (comps.length === 0) {
       throw usageError(
@@ -1383,7 +2081,7 @@ export async function importZip(options, deps = {}) {
     // FR-33: a zip validation/discovery failure writes nothing —
     // remove the staging this invocation created (and the whole skeleton on
     // a fresh project), leaving pre-existing paths and bytes untouched.
-    await unwindPreCommit(treeRoot);
+    noteCleanup(err, await unwindPreCommit());
     throw err;
   }
 
@@ -1431,6 +2129,12 @@ export async function importZip(options, deps = {}) {
   // compare time (driven-only and skipped siblings excluded), so under it a
   // runtime-conditional screen triages exactly as if unmapped.
   const screenExactStates = new Map();
+  // The alignment pass can fail (two states declaring one screen's mask
+  // differently), and it runs with this invocation's extracted tree already on
+  // disk — so it unwinds like every other pre-commit stage. Nothing here has
+  // written to the project tree, so the unwind is the scratch and any skeleton
+  // dir this run created; pre-existing state is untouched.
+  try {
   if (config !== null) {
     for (const stateName of Object.keys(config.states)) {
       const state = config.states[stateName];
@@ -1483,12 +2187,16 @@ export async function importZip(options, deps = {}) {
       }
     }
   }
+  } catch (err) {
+    noteCleanup(err, await unwindPreCommit());
+    throw err;
+  }
 
   let served;
   try {
     served = await serveTree(treeRoot);
   } catch (err) {
-    await unwindPreCommit(treeRoot);
+    noteCleanup(err, await unwindPreCommit());
     throw err;
   }
   let browser = null;
@@ -1620,12 +2328,136 @@ export async function importZip(options, deps = {}) {
         await repairSkippedCompMasks({
           comp, oldEntry: oldComps.get(comp.name), config, browser,
           url: served.origin + '/' + comp.path.split('/').map(encodeURIComponent).join('/'),
-          vendorEntries, vendorDir, readiness, screenReadiness, screenCompMasks, drivenStates, layout, log,
+          vendorEntries, vendorDir, readiness, screenReadiness, screenCompMasks, drivenStates, statesByComp, layout, stagedWrites, log,
         });
         nextComps.set(comp.name, oldComps.get(comp.name));
         continue;
       }
       const url = served.origin + '/' + comp.path.split('/').map(encodeURIComponent).join('/');
+      // FR-40: a screenless comp has no screens to iterate — its references
+      // are the state-scoped renders its explicit compTarget mappings declare,
+      // one <comp>@<state> reference per mapping state (config order), each
+      // rendered under that state's readiness and compDrive and double-
+      // rendered for its own measured noise floor, exactly like an FR-37
+      // driven reference. There is deliberately NO base reference and no
+      // cross-state uniform-dimensions assertion: distinct interaction states
+      // legitimately frame distinct geometry.
+      if (comp.screenless) {
+        const mappings = statesByComp.get(comp.name) ?? [];
+        log(`import: reference render ${comp.name} (unlabelled, ${mappings.length} state mapping(s))`);
+        const screens = [];
+        for (const { stateName, state } of mappings) {
+          const compMasks = Object.fromEntries(
+            Object.entries(effectiveMasks(config, state))
+              .filter(([, m]) => m.selector !== undefined && m.compSelector !== undefined)
+              .map(([name, m]) => [name, { compSelector: m.compSelector, shape: m.shape }]),
+          );
+          log(`import: render ${comp.name}@${stateName} (pass 1/2)`);
+          const first = await renderCompScreen({
+            browser, url, selector: state.compTarget, vendor: vendorEntries, vendorDir,
+            readiness: state.readiness, drive: state.compDrive, compMasks, log,
+          });
+          log(`import: render ${comp.name}@${stateName} (pass 2/2)`);
+          const second = await renderCompScreen({
+            browser, url, selector: state.compTarget, vendor: vendorEntries, vendorDir,
+            readiness: state.readiness, drive: state.compDrive, compMasks, log,
+          });
+          // Same FR-38 x FR-11 structural agreement as any double render.
+          const divergence = (first.canvasGrown === undefined && second.canvasGrown === undefined)
+            ? null
+            : accommodationDivergence(
+              { canvasGrown: first.canvasGrown, effectiveViewport: first.effectiveViewport, frame: first.frame },
+              { canvasGrown: second.canvasGrown, effectiveViewport: second.effectiveViewport, frame: second.frame },
+            );
+          if (divergence !== null) {
+            throw trustError(
+              'canvas-divergent',
+              `double render of ${comp.name}@${stateName} disagreed on the canvas accommodation: ${divergence} — ` +
+                'the two passes must make an identical structural decision (this is a canvas race, not pixel ' +
+                'jitter, and no noise floor may absorb it); the reference cannot be trusted',
+            );
+          }
+          const { floor, note } = measureNoiseFloor(first.png, second.png);
+          if (note) log(`import: warning ${comp.name}@${stateName}: ${note}`);
+          screens.push({
+            id: stateName,
+            label: `${comp.name} (@${stateName})`,
+            state: stateName,
+            driven: true,
+            noiseFloor: floor,
+          });
+          const pngPath = layout.referencePng(comp.name, undefined, stateName);
+          const provPath = layout.referenceProvenance(comp.name, undefined, stateName);
+          await stagedWrites.writeFile(pngPath, first.png);
+          const record = createRecord({
+            kind: 'reference',
+            artifactPath: relative(projectDir, pngPath),
+            artifactBytes: first.png,
+            renderer,
+            inputs: {
+              // Same declared-conditions contract as any reference render:
+              // the shared FR-14 viewport (the compTarget state's capture is
+              // clipped, so the gate's clipped exemption applies) plus the
+              // GATED effective viewport the render actually shot under.
+              viewport: { ...DEFAULT_VIEWPORT, fullPage: true },
+              deviceScaleFactor: DEVICE_SCALE_FACTOR,
+              readiness: {
+                policy: state.readiness.policy ?? 'hydration',
+                timeout: state.readiness.timeout,
+                settle: state.readiness.settle,
+                pathFired: first.pathFired,
+                ...(state.readiness.selector !== undefined ? { selector: state.readiness.selector } : {}),
+                ...(state.readiness.compSelector !== undefined ? { compSelector: state.readiness.compSelector } : {}),
+                ...(first.compSelectorFired !== undefined ? { compSelectorFired: first.compSelectorFired } : {}),
+              },
+              fonts: first.fonts,
+              configHash: configHashValue,
+              // A state-scoped reference belongs to exactly one state.
+              stateConfigHash: stateConfigHash(config, stateName),
+              vendorHashes,
+              // FR-40: the explicit frame selector this reference was
+              // rendered against (informational; gated via stateConfigHash).
+              compTarget: state.compTarget,
+              // Resolved comp-side mask anchors (informational).
+              ...(first.masks !== undefined ? { masks: first.masks } : {}),
+              // Always recorded — empty: a compTarget render never probes
+              // data-vd-mask annotations (no screen element scopes them).
+              compAuthoredMasks: first.compAuthoredMasks,
+              // Delivered-frame evidence (informational; see the base record).
+              frame: first.frame,
+              ...(first.delivered !== null ? { delivered: first.delivered } : {}),
+              ...(first.canvasGrown !== undefined ? { canvasGrown: first.canvasGrown } : {}),
+              effectiveViewport: first.effectiveViewport,
+            },
+          });
+          await stagedWrites.writeRecord(provPath, record);
+          log(`import: wrote ${relative(projectDir, pngPath)} (noise floor ${(floor * 100).toFixed(4)}%)`);
+        }
+        nextComps.set(comp.name, {
+          name: comp.name,
+          relPath: comp.path,
+          contentSha256: comp.contentSha256,
+          unlabelled: true,
+          screens,
+        });
+        // Drop stale artifacts for a re-rendered unlabelled comp (FR-12): a
+        // state mapping removed from the config loses its reference, and a
+        // comp that was LABELLED in a previous import loses its old screen
+        // artifacts (a screen id colliding with a state name must not keep a
+        // stale base reference alive — the families are disjoint paths).
+        const old = oldComps ? oldComps.get(comp.name) : undefined;
+        if (old) {
+          for (const s of old.screens) {
+            const keep = s.state !== undefined && screens.some((ns) => ns.state === s.state);
+            if (!keep) {
+              const [pngPath, provPath] = referencePathsFor(layout, comp.name, s);
+              stagedWrites.remove(pngPath);
+              stagedWrites.remove(provPath);
+            }
+          }
+        }
+        continue;
+      }
       log(`import: reference render ${comp.name} (${comp.screens.length} screens)`);
       const screens = [];
       // Every screen of a comp shares the device dimensions of the
@@ -1742,8 +2574,7 @@ export async function importZip(options, deps = {}) {
 
         const pngPath = layout.referencePng(comp.name, screen.id);
         const provPath = layout.referenceProvenance(comp.name, screen.id);
-        await mkdir(dirname(pngPath), { recursive: true });
-        await writeFile(pngPath, first.png);
+        await stagedWrites.writeFile(pngPath, first.png);
         const record = createRecord({
           kind: 'reference',
           artifactPath: relative(projectDir, pngPath),
@@ -1803,7 +2634,7 @@ export async function importZip(options, deps = {}) {
             effectiveViewport: first.effectiveViewport,
           },
         });
-        await writeRecord(provPath, record);
+        await stagedWrites.writeRecord(provPath, record);
         log(`import: wrote ${relative(projectDir, pngPath)} (noise floor ${(floor * 100).toFixed(4)}%)`);
         }
 
@@ -1851,8 +2682,7 @@ export async function importZip(options, deps = {}) {
 
           const dPngPath = layout.referencePng(comp.name, screen.id, stateName);
           const dProvPath = layout.referenceProvenance(comp.name, screen.id, stateName);
-          await mkdir(dirname(dPngPath), { recursive: true });
-          await writeFile(dPngPath, dFirst.png);
+          await stagedWrites.writeFile(dPngPath, dFirst.png);
           const dRecord = createRecord({
             kind: 'reference',
             artifactPath: relative(projectDir, dPngPath),
@@ -1891,7 +2721,7 @@ export async function importZip(options, deps = {}) {
               effectiveViewport: dFirst.effectiveViewport,
             },
           });
-          await writeRecord(dProvPath, dRecord);
+          await stagedWrites.writeRecord(dProvPath, dRecord);
           log(`import: wrote ${relative(projectDir, dPngPath)} (noise floor ${(dFloor.floor * 100).toFixed(4)}%)`);
         }
       }
@@ -1922,9 +2752,14 @@ export async function importZip(options, deps = {}) {
       if (old) {
         const keepsBase = (id) => screens.some((ns) => ns.id === id && ns.skipped === undefined && ns.drivenOnly !== true);
         for (const s of old.screens) {
-          if (!keepsBase(s.id)) {
-            await unlink(layout.referencePng(comp.name, s.id)).catch(() => {});
-            await unlink(layout.referenceProvenance(comp.name, s.id)).catch(() => {});
+          // A state-scoped FR-40 entry from an earlier UNLABELLED incarnation
+          // of this comp: a labelled comp never keeps it.
+          if (s.state !== undefined || !keepsBase(s.id)) {
+            // Deferred, not unlinked: a deletion has no stage-and-rename form,
+            // so it happens at commit and an abandoned run never performs it.
+            const [pngPath, provPath] = referencePathsFor(layout, comp.name, s);
+            stagedWrites.remove(pngPath);
+            stagedWrites.remove(provPath);
           }
         }
       }
@@ -1938,8 +2773,9 @@ export async function importZip(options, deps = {}) {
         if (names.has(name)) continue;
         const old = oldComps.get(name);
         for (const s of old.screens) {
-          await unlink(layout.referencePng(name, s.id)).catch(() => {});
-          await unlink(layout.referenceProvenance(name, s.id)).catch(() => {});
+          const [pngPath, provPath] = referencePathsFor(layout, name, s);
+          stagedWrites.remove(pngPath);
+          stagedWrites.remove(provPath);
         }
         removed.push(name);
       }
@@ -1951,10 +2787,26 @@ export async function importZip(options, deps = {}) {
       comps: Object.fromEntries([...nextComps.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))),
     };
     await mkdir(layout.referencesDir, { recursive: true });
-    await writeFileAtomic(join(layout.referencesDir, REFERENCE_MANIFEST_FILE), JSON.stringify(manifest, null, 2) + '\n');
+    const manifestPath = join(layout.referencesDir, REFERENCE_MANIFEST_FILE);
+    const manifestBytes = JSON.stringify(manifest, null, 2) + '\n';
+    await stagedWrites.writeFile(manifestPath, manifestBytes);
+    // Publish: every staged file renamed into place, the deferred removals
+    // applied, and the manifest renamed LAST — it is the commit point, so it
+    // names the set only once the set is on disk.
+    await stagedWrites.commit(manifestPath);
 
-    // --- prune older import trees (the current revision is the preserved one) ---
-    await pruneImportTrees(importsRoot, treeRoot);
+    // --- prune older import scratch (the current revision is the preserved one) ---
+    const pruneFailures = await pruneImportScratch(importsRoot, { keep: treeRoot, sweepable: preExistingScratch });
+    if (pruneFailures.length > 0) {
+      // The set IS committed — this is not a rollback case. But a prune the
+      // run could not perform must not be reported as a clean success: fail
+      // loudly, saying what committed and what residue remains.
+      throw trustError(
+        'scratch-prune',
+        `the reference set was committed, but scratch left by earlier runs could not be removed: ${pruneFailures.join('; ')} — ` +
+          'the leftovers are derived bytes under .visual-diff/imports/; remove them by hand and re-run',
+      );
+    }
 
     return {
       summary: {
@@ -1967,14 +2819,35 @@ export async function importZip(options, deps = {}) {
       },
     };
   } catch (err) {
+    // A failure raised BEFORE the commit leaves the references directory
+    // exactly as the run found it: nothing committed was ever moved, so
+    // unwinding is discarding this run's staged files, and the manifest —
+    // renamed last — never survives describing a set that was not published.
+    // A failure raised INSIDE the commit window (commit-incomplete) or after
+    // it (scratch-prune) is the documented exception: what is on disk stays
+    // under the manifest that describes it, the error says which case it is,
+    // and the rollback below is a no-op for anything already published.
+    const cleanupFailures = [];
+    try {
+      await stagedWrites.rollback();
+    } catch (cleanupErr) {
+      cleanupFailures.push(cleanupErr.message);
+    }
+    // The extracted tree is this run's scratch — always removable, whatever
+    // the pin decision below is.
+    await removeScratchTree().catch((cleanupErr) => cleanupFailures.push(`extracted tree: ${cleanupErr.message}`));
     // FR-33: a failure before the browser was acquired (no pin, a
     // refused/stale pin, a failed ladder, or the ws+flag usage conflict)
-    // writes nothing — remove the staging this invocation created (and the
-    // whole skeleton on a fresh project), leaving pre-existing paths and
-    // bytes untouched. Once acquisition succeeded the project is
-    // legitimately initialized — a render-stage failure leaves the
-    // committed pin in place.
-    if (browser === null) await unwindPreCommit(treeRoot);
+    // writes nothing — also unwind the project skeleton this invocation
+    // staged (the whole .visual-diff on a fresh project), leaving pre-existing
+    // paths and bytes untouched. Once acquisition succeeded the project is
+    // legitimately initialized — a render-stage failure leaves the committed
+    // pin in place (only the scratch and the references unwind).
+    if (browser === null) cleanupFailures.push(...await unwindPreCommit());
+    // The failure that started all this is the one worth reporting, so it is
+    // still the error that propagates — but cleanup failures are named in its
+    // message rather than swallowed or left to an optional logger.
+    noteCleanup(err, cleanupFailures);
     throw err;
   } finally {
     if (browser) {
@@ -1994,18 +2867,28 @@ async function vendorEntriesToObject(entries) {
   return out;
 }
 
-async function pruneImportTrees(importsRoot, keep) {
-  let names;
-  try {
-    names = await readdir(importsRoot);
-  } catch {
-    return;
-  }
+/**
+ * Prune import scratch after a successful run. Scoped on purpose: only this
+ * run's own directories and the scratch that was already there when the run
+ * took the lock (all of it dead by then — this run has held the lock since,
+ * and the startup sweep already removed the staged temps a killed run left)
+ * can be removed. Anything that appeared afterwards is not this run's to
+ * judge, so a sweep can never delete a directory another run is actively
+ * using.
+ *
+ * Returns the removal failures (empty when everything is gone): a leftover is
+ * residue the caller must report, never a swallowed error.
+ */
+async function pruneImportScratch(importsRoot, { keep, sweepable }) {
   const keepName = keep.split(sep).pop();
-  for (const name of names) {
+  const failures = [];
+  for (const name of sweepable) {
     if (name === keepName) continue;
-    await rm(join(importsRoot, name), { recursive: true, force: true }).catch(() => {});
+    // Everything here is an extracted tree: derived bytes, always safe to drop.
+    await rm(join(importsRoot, name), { recursive: true, force: true })
+      .catch((err) => failures.push(`${name}: ${err.message}`));
   }
+  return failures;
 }
 
 function rendererFromBackend(backend) {

@@ -933,6 +933,19 @@ function resolveReference(manifest, compRef) {
       `state maps to comp ${JSON.stringify(compRef.comp)} but no such comp has imported references`,
     );
   }
+  // FR-40: an unlabelled comp has no screens at all — references are
+  // state-scoped (<comp>@<state>) and resolve in stageState against the
+  // comparing state, never through screen ids.
+  if (comp.unlabelled === true) {
+    if (compRef.screen !== undefined) {
+      throw usageError(
+        'no-screen',
+        `comp ${compRef.comp} has no [data-screen-label] screens (unlabelled export) — a <comp>#<screen> mapping ` +
+          'cannot resolve. Map the whole comp and give the state an explicit compTarget selector, then re-run import',
+      );
+    }
+    return { comp, screen: null };
+  }
   let screen;
   if (compRef.screen !== undefined) {
     screen = comp.screens.find((s) => s.id === compRef.screen);
@@ -1027,10 +1040,72 @@ export async function stageState({ layout, runId, state, stateName, manifest, ma
   const { compRef } = state;
   if (!compRef) return null; // capture-only — nothing to compare against
 
+  const { comp, screen } = resolveReference(manifest, compRef);
+
+  // FR-40: an unlabelled comp's references are state-scoped — this state's
+  // own <comp>@<state> render, produced at import time from its explicit
+  // compTarget mapping. There is no base screen and no cross-state sharing.
+  if (comp.unlabelled === true) {
+    if (state.compTarget === undefined) {
+      throw usageError(
+        'comp-target-missing',
+        `state ${stateName} maps unlabelled comp ${comp.name} but declares no compTarget — the explicit frame ` +
+          'selector is required (the config drifted from what import rendered); restore compTarget and re-run import --refresh',
+      );
+    }
+    const entry = comp.screens.find((s) => s.state === stateName);
+    if (entry === undefined) {
+      throw usageError(
+        'no-reference',
+        `state ${stateName} maps unlabelled comp ${comp.name}, but the reference manifest holds no ` +
+          `${comp.name}@${stateName} reference — state-scoped references render only under import (a config ` +
+          'change does not alter the comp content hash) — run import --refresh',
+      );
+    }
+    const refPngPath = layout.referencePng(comp.name, undefined, stateName);
+    const refProvPath = layout.referenceProvenance(comp.name, undefined, stateName);
+    const capPngPath = layout.capturePng(runId, stateName);
+    const capProvPath = layout.captureProvenance(runId, stateName);
+    const refLabel = `${comp.name}@${stateName}`;
+    const ref = await readVerifiedArtifact({
+      pngPath: refPngPath,
+      provPath: refProvPath,
+      pngKind: 'reference',
+      remedy: 'state-scoped references render only under import --refresh (a config change does not alter the comp content hash) — run import --refresh',
+      provLabel: `reference ${refLabel}`,
+    });
+    const cap = await readVerifiedArtifact({
+      pngPath: capPngPath,
+      provPath: capProvPath,
+      pngKind: 'capture',
+      provLabel: `capture ${stateName}`,
+    });
+    const fields = incompatibleFields(ref.record, cap.record, { clipped: state.clip !== undefined && state.clip !== null });
+    if (fields.length > 0) {
+      throw trustError(
+        'provenance-mismatch',
+        `provenance gate failed for state ${stateName}: incompatible fields: ${fields.join(', ')} — ` +
+          're-import references or re-capture under matching conditions',
+      );
+    }
+    return {
+      stateName,
+      state,
+      masks,
+      comp,
+      screen: entry,
+      refLabel,
+      noiseFloor: entry.noiseFloor,
+      refRecord: ref.record,
+      capRecord: cap.record,
+      refImg: decodePng(ref.bytes),
+      capImg: decodePng(cap.bytes),
+    };
+  }
+
   // FR-37: a driven state compares against its @state reference; base states
   // keep the plain screen id.
   const driven = state.compDrive !== undefined ? stateName : undefined;
-  const { comp, screen } = resolveReference(manifest, compRef);
   // A screen the import skipped (rendered empty undriven, unmapped at import
   // time) has NO reference artifacts at all — a config that maps it after the
   // fact needs a re-import, not a hunt for a missing PNG.

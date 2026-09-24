@@ -566,6 +566,23 @@ export function run(
   return handlers[parsed.verb](options, { stdout, stderr });
 }
 
+// process.stdout/stderr writes to a pipe are asynchronous; exiting before
+// the buffer drains truncates large --json payloads (observed: exactly 80
+// KiB delivered of an 88 KB document). Queue a final empty write and exit
+// only from its callback, which fires after every preceding write has
+// flushed. A broken reader (EPIPE, e.g. `| head`) resolves too — the
+// verb's exit code is already decided.
+export function drainStream(stream) {
+  return new Promise((resolve) => {
+    if (!stream || !stream.writable || stream.writableFinished) {
+      resolve();
+      return;
+    }
+    stream.once('error', resolve);
+    stream.write('', resolve);
+  });
+}
+
 async function main() {
   const streams = { stdout: process.stdout, stderr: process.stderr };
   let code;
@@ -582,6 +599,8 @@ async function main() {
     streams.stderr.write(errorLine('noise visual-diff', err));
     code = EXIT.TRUST;
   }
+  await drainStream(streams.stdout);
+  await drainStream(streams.stderr);
   process.exit(code);
 }
 

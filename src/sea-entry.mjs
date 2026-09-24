@@ -12,7 +12,7 @@
 // documented substitution keeps it (exec with `visual-diff ...`), so a
 // leading `visual-diff` token is dropped before the verb parser runs — both
 // forms then converge on the same argv as `node src/cli.mjs`.
-import { run, EXIT } from './cli.mjs';
+import { run, EXIT, drainStream } from './cli.mjs';
 import { errorLine } from './cli-error.mjs';
 
 async function main() {
@@ -30,6 +30,8 @@ async function main() {
     process.stderr.write(errorLine('noise visual-diff', err));
     code = EXIT.TRUST;
   }
+  await drainStream(process.stdout);
+  await drainStream(process.stderr);
   process.exit(code);
 }
 

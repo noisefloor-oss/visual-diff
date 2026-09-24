@@ -14,7 +14,12 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
+  renameSync,
+  rmSync,
   statSync,
   writeFileSync,
   readFileSync,
@@ -30,6 +35,7 @@ import {
   DEFAULT_VIEWPORT,
   DEVICE_SCALE_FACTOR,
   FROZEN_NOW,
+  IMPORT_LOCK_FILE,
   ImportError,
   decodePng,
   extNameForUrl,
@@ -307,7 +313,28 @@ function makeFakePage({
         // model per-screen (or per-pass) geometry. Object form is static.
         const m = typeof measurement === 'function' ? measurement(arg) : measurement;
         if (m.missing) return { missing: true, id: arg };
-        return { missing: false, figRect: m.figRect, capRect: m.capRect, docHeight: 2000 };
+        // liveDom form: run the REAL measurement callback against a fake
+        // document/window, so tests cover the callback itself (e.g. the
+        // non-rendered-children filter) rather than a simulated result.
+        if (m.liveDom) {
+          const prevDocument = globalThis.document;
+          const prevWindow = globalThis.window;
+          globalThis.document = m.liveDom.document;
+          globalThis.window = m.liveDom.window;
+          try {
+            return fn(arg);
+          } finally {
+            globalThis.document = prevDocument;
+            globalThis.window = prevWindow;
+          }
+        }
+        // The real measureScreenFrame computes a content rect that excludes a
+        // figure's caption from the frame. When the test provides a narrower
+        // contentRect, simulate that new code path.
+        const figRect = src.includes('contentFrameRect') && m.contentRect
+          ? m.contentRect
+          : m.figRect;
+        return { missing: false, figRect, capRect: m.capRect, docHeight: 2000 };
       }
       if (src.includes('querySelectorAll')) {
         // the serialized probeMaskElements: arg is the
@@ -631,6 +658,10 @@ describe('screenFrameRect (FR-10: caption row excluded)', () => {
   test('a caption that is not a clean row falls back to the whole figure', () => {
     assert.deepEqual(screenFrameRect(FIG, { x: 40, y: 300, width: 100, height: 50 }), { x: 10, y: 20, width: 393, height: 886 });
   });
+  test('a wide caption does not widen a frame rect already excluding the caption', () => {
+    const frame = { x: 10, y: 54, width: 393, height: 852 };
+    assert.deepEqual(screenFrameRect(frame, { x: 10, y: 20, width: 446, height: 34 }), frame);
+  });
 });
 
 describe('external set merging (FR-8)', () => {
@@ -785,6 +816,95 @@ describe('importZip full pipeline', () => {
 
     // browser closed by the verb
     assert.equal(browser._closed, true);
+  });
+
+  test('a caption wider than the screen uses the frame width, not the caption width', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const browser = makeFakeBrowser(() => makeFakePage({
+      ...defaultPageOpts(),
+      measurement: {
+        // The figure itself is widened by the caption, but the rendered screen
+        // content keeps its own width.
+        figRect: { x: 10, y: 20, width: 446, height: 886 },
+        capRect: { x: 10, y: 20, width: 446, height: 34 },
+        contentRect: { x: 10, y: 54, width: 393, height: 852 },
+      },
+    }));
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+    const shots = browser._pages.flatMap((p) => p._calls.screenshot);
+    assert.equal(shots.length, 4, 'two screens double-rendered');
+    for (const clip of shots.map((c) => c.clip)) {
+      assert.equal(clip.width, 393, 'reference clip width matches the frame, not the wide caption');
+      assert.equal(clip.height, 852, 'reference clip height excludes the caption row');
+    }
+  });
+
+  // Executes the REAL measureScreenFrame callback (via the liveDom seam)
+  // against a fake DOM: a display:none child reports a zero rect at the
+  // viewport origin, and unioning it once ballooned the reference clip to
+  // the document origin (caught in cross-model review). The frame must
+  // cover only the rendered, non-caption children.
+  test('the real measurement callback excludes non-rendered children from the frame union', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+
+    const fakeEl = (tag, rect, { hidden = false, children = [], label = null } = {}) => ({
+      tagName: tag.toUpperCase(),
+      children,
+      getAttribute: (k) => (k === 'data-screen-label' ? label : null),
+      querySelector: (sel) =>
+        sel === 'figcaption' ? children.find((c) => c.tagName === 'FIGCAPTION') ?? null : null,
+      getBoundingClientRect: () => ({
+        left: rect.x,
+        top: rect.y,
+        width: rect.width,
+        height: rect.height,
+      }),
+      getClientRects: () => (hidden ? [] : [{}]),
+    });
+
+    const makeFigure = (label, origin) => {
+      const caption = fakeEl('figcaption', { x: origin.x, y: origin.y, width: 446, height: 34 });
+      const content = fakeEl('div', { x: origin.x, y: origin.y + 34, width: 393, height: 852 });
+      const invisible = fakeEl('div', { x: 0, y: 0, width: 0, height: 0 }, { hidden: true });
+      const script = fakeEl('script', { x: 0, y: 0, width: 0, height: 0 }, { hidden: true });
+      return fakeEl('figure', { x: origin.x, y: origin.y, width: 446, height: 920 }, {
+        children: [caption, content, invisible, script],
+        label,
+      });
+    };
+    const screens = [makeFigure('01 Main', { x: 100, y: 100 }), makeFigure('02 Detail', { x: 10, y: 20 })];
+    const liveDom = {
+      document: {
+        querySelectorAll: (sel) => (sel === '[data-screen-label]' ? screens : []),
+        documentElement: { scrollHeight: 2000 },
+      },
+      window: { scrollX: 0, scrollY: 0 },
+    };
+
+    const browser = makeFakeBrowser(() => makeFakePage({
+      ...defaultPageOpts(),
+      measurement: { liveDom },
+    }));
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+    );
+
+    const clips = browser._pages.flatMap((p) => p._calls.screenshot).map((c) => c.clip);
+    assert.equal(clips.length, 4, 'two screens double-rendered');
+    for (const clip of clips) {
+      assert.ok(
+        !(clip.x === 0 && clip.y === 0),
+        `clip ${JSON.stringify(clip)} must not balloon to the document origin`,
+      );
+      assert.equal(clip.width, 393, 'clip width is the rendered content, not the wide caption');
+      assert.equal(clip.height, 852, 'clip height is the rendered content');
+    }
   });
 
   test('discovers and renders an x-dc-wrapped dynamic comp through the stub pipeline', async (t) => {
@@ -2612,6 +2732,683 @@ describe('import pin/discovery (FR-33/FR-34)', () => {
 });
 
 // =============================================================================
+// Import failure hygiene (FR-5 atomicity across the whole import)
+// =============================================================================
+
+describe('import failure hygiene', () => {
+  // A renderer that dies part-way through the reference pass. The counter is
+  // shared across pages (each render gets a fresh context and page), so
+  // `failAfter` counts screenshots across the whole run: the app fixture
+  // double-renders two screens, so failing after the third shot leaves the
+  // FIRST screen's reference fully written when the second screen dies.
+  const failingBrowser = (failAfter) => {
+    let shots = 0;
+    return makeFakeBrowser(() =>
+      makeFakePage({
+        ...defaultPageOpts(),
+        screenshots: (opts) => {
+          shots += 1;
+          if (shots > failAfter) throw new Error('renderer died mid-pass');
+          return clipSolid(opts);
+        },
+      }),
+    );
+  };
+
+  const snapshot = (refs) =>
+    Object.fromEntries(
+      readdirSync(refs).map((name) => {
+        const p = join(refs, name);
+        return [name, { bytes: readFileSync(p), mtimeMs: statSync(p).mtimeMs }];
+      }),
+    );
+
+  const importTrees = (dir) => readdirSync(join(dir, '.visual-diff', 'imports'));
+
+  test('a render-stage failure removes the extracted tree and every artifact it wrote', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const first = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    const refs = join(dir, '.visual-diff', 'references');
+    const before = snapshot(refs);
+    assert.ok(Object.keys(before).length >= 5, 'the successful import published a reference set');
+    const keptTree = first.summary.tree.split('/').pop();
+
+    // a changed revision, so the incremental plan really re-renders the comp
+    const zipV2 = writeZip(dir, 'design-v2.zip', IMPORTABLE_FILES.map((f) =>
+      f.path === 'App.dc.html' ? { path: f.path, data: f.data + '\n<!-- revision two -->\n' } : f,
+    ));
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath: zipV2, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(failingBrowser(3)), fetcher: goodFetcher },
+      ),
+      /renderer died mid-pass/,
+    );
+
+    // the ~MB of extracted scratch does not leak: only the previous run's
+    // retained tree is left, and no undo scratch either
+    assert.deepEqual(importTrees(dir), [keptTree], 'the failed run’s scratch is gone');
+
+    // the references directory is exactly as the failed run found it
+    const after = snapshot(refs);
+    assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort(), 'no artifact added or removed');
+    for (const [name, e] of Object.entries(before)) {
+      assert.ok(e.bytes.equals(after[name].bytes), `${name} is byte-identical`);
+      assert.equal(after[name].mtimeMs, e.mtimeMs, `${name} was not rewritten`);
+    }
+    // The run rendered and wrote the first screen before it died, so this is
+    // the load-bearing part: a rewritten artifact was never moved out of the
+    // way, only staged beside it — and the staging left nothing behind.
+    assert.deepEqual(
+      readdirSync(refs).filter((n) => n.startsWith('.')),
+      [],
+      'no staged temp files are left in references/',
+    );
+  });
+
+  test('an interrupted run’s staged files are swept and never mistaken for references', async (t) => {
+    // A killed run cannot clean up after itself. What it leaves is a staged
+    // file: derived bytes under a name no reference can have, which the next
+    // import sweeps — it is never the only copy of anything.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    const refs = join(dir, '.visual-diff', 'references');
+    const before = snapshot(refs);
+    const orphan = join(refs, '.11111111-2222-3333-4444-555555555555.staged.tmp');
+    writeFileSync(orphan, 'bytes a killed run never published');
+
+    const logged = [];
+    const result = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      {
+        resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))),
+        fetcher: goodFetcher,
+        log: (line) => logged.push(line),
+      },
+    );
+    assert.deepEqual(result.summary.skipped, ['app'], 'the import runs normally');
+    assert.ok(!existsSync(orphan), 'the staged leftover is swept');
+    assert.ok(logged.some((l) => /swept 1 staged reference file/.test(l)), 'and the sweep is reported');
+    const after = snapshot(refs);
+    assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort(), 'the reference set is untouched');
+    for (const [name, e] of Object.entries(before)) {
+      assert.ok(e.bytes.equals(after[name].bytes), `${name} is byte-identical`);
+      // (a successful import always republishes the manifest itself)
+      if (name !== 'manifest.json') assert.equal(after[name].mtimeMs, e.mtimeMs, `${name} was not rewritten`);
+    }
+  });
+
+  test('a killed run’s lock and provenance temps are swept at the next import’s start', async (t) => {
+    // The startup sweep covers every writer-owned temp family in the directory
+    // its writer stages it in — not just `.staged.tmp` in references/. Two
+    // crash residues stand for the families FR-5 names: a kill during lock
+    // acquisition leaves `.<uuid>.lock.tmp` at the .visual-diff/ root, and a
+    // provenance stage interrupted mid-write (the legacy nested temp, and
+    // still the shape capture-side writeRecord uses) leaves
+    // `.<uuid>.provenance.tmp` among the references.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    const vd = join(dir, '.visual-diff');
+    const refs = join(vd, 'references');
+    const lockTemp = join(vd, '.11111111-2222-3333-4444-555555555555.lock.tmp');
+    const provTemp = join(refs, '.22222222-3333-4444-5555-666666666666.provenance.tmp');
+    writeFileSync(lockTemp, '{"pid":1,"nonce":"dead"}\n');
+    writeFileSync(provTemp, '{"schema":1');
+
+    const logged = [];
+    const result = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      {
+        resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))),
+        fetcher: goodFetcher,
+        log: (line) => logged.push(line),
+      },
+    );
+    assert.deepEqual(result.summary.skipped, ['app'], 'the import runs normally');
+    assert.ok(!existsSync(lockTemp), 'the lock-acquisition temp at the root is swept');
+    assert.ok(!existsSync(provTemp), 'the nested provenance temp in references/ is swept');
+    assert.ok(logged.some((l) => /swept 1 staged lock file/.test(l)), 'the lock sweep is reported');
+    assert.ok(logged.some((l) => /swept 1 staged reference file/.test(l)), 'the reference sweep is reported');
+  });
+
+  test('a killed run’s vendor staging leftovers are swept at the next import’s start', async (t) => {
+    // The vendor pass stages fetched bytes under `.staging-<uuid>/` and writes
+    // the manifest through a `.<uuid>.tmp` temp; a kill between leaves both.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    const vendor = join(dir, '.visual-diff', 'vendor');
+    const stagingDir = join(vendor, '.staging-33333333-4444-5555-6666-777777777777');
+    mkdirSync(stagingDir, { recursive: true });
+    writeFileSync(join(stagingDir, 'sha256-deadbeef.js'), 'fetched but never published');
+    const manifestTemp = join(vendor, '.44444444-5555-6666-7777-888888888888.tmp');
+    writeFileSync(manifestTemp, '{"version":1');
+
+    const logged = [];
+    const result = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      {
+        resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))),
+        fetcher: goodFetcher,
+        log: (line) => logged.push(line),
+      },
+    );
+    assert.deepEqual(result.summary.skipped, ['app'], 'the import runs normally');
+    assert.ok(!existsSync(stagingDir), 'the vendor staging directory is swept');
+    assert.ok(!existsSync(manifestTemp), 'the vendor manifest temp is swept');
+    assert.ok(logged.some((l) => /swept 2 vendor staging leftover/.test(l)), 'and the sweep is reported');
+    // the real vendored set is untouched
+    const manifest = JSON.parse(readFileSync(join(vendor, 'vendor.json'), 'utf8'));
+    assert.ok(manifest.entries[EXTERNAL_URL], 'the vendored dependency survives the sweep');
+  });
+
+  test('a sweep that cannot remove a leftover fails the import instead of claiming it', async (t) => {
+    // The sweep is authoritative: a name is reported as swept only when it is
+    // actually gone, and a removal that fails for a real reason fails the
+    // import (exit 3) rather than letting it claim a cleanup it did not
+    // perform. (Needs a directory the process owns but cannot write — root
+    // bypasses the permission, so the scenario cannot run as root.)
+    if (typeof process.geteuid === 'function' && process.geteuid() === 0) {
+      t.skip('permission-based failure injection cannot fail for root');
+      return;
+    }
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    const refs = join(dir, '.visual-diff', 'references');
+    const orphan = join(refs, '.55555555-6666-7777-8888-999999999999.staged.tmp');
+    writeFileSync(orphan, 'bytes a killed run never published');
+    chmodSync(refs, 0o555);
+    const logged = [];
+    try {
+      await assert.rejects(
+        importZip(
+          { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+          {
+            resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))),
+            fetcher: goodFetcher,
+            log: (line) => logged.push(line),
+          },
+        ),
+        (err) => err instanceof ImportError && err.code === 'sweep-failed' && err.exitCode === 3
+          && err.message.includes('.55555555-6666-7777-8888-999999999999.staged.tmp'),
+      );
+      assert.ok(existsSync(orphan), 'the leftover is still there — nothing claimed otherwise');
+      assert.ok(!logged.some((l) => /swept/.test(l)), 'no sweep was reported');
+    } finally {
+      chmodSync(refs, 0o755);
+    }
+  });
+
+  test('a staged-temp cleanup failure is named in the import failure, not logged aside', async (t) => {
+    // A rollback that cannot remove a staged temp must not be downgraded to an
+    // (optionally logged) warning: the original failure still propagates and
+    // decides the exit code, with the cleanup failure named in its message.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    let shots = 0;
+    let blockedTemp = null;
+    const browser = makeFakeBrowser(() =>
+      makeFakePage({
+        ...defaultPageOpts(),
+        screenshots: (opts) => {
+          shots += 1;
+          if (shots === 3) {
+            // The first screen's PNG + provenance are staged by now. Make one
+            // staged temp unremovable for the rollback — a directory where the
+            // file was (rollback unlinks files; rm without recursive refuses
+            // a directory).
+            const refs = join(dir, '.visual-diff', 'references');
+            blockedTemp = readdirSync(refs).find((n) => n.endsWith('.staged.tmp'));
+            assert.ok(blockedTemp, 'a staged temp exists by the third shot');
+            rmSync(join(refs, blockedTemp));
+            mkdirSync(join(refs, blockedTemp));
+          }
+          if (shots > 3) throw new Error('renderer died mid-pass');
+          return clipSolid(opts);
+        },
+      }),
+    );
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+      ),
+      (err) => /renderer died mid-pass/.test(err.message)
+        && /cleanup afterwards was incomplete/.test(err.message)
+        && /staged/.test(err.message),
+    );
+    assert.ok(existsSync(join(dir, '.visual-diff', 'references', blockedTemp)), 'the residue really was left');
+  });
+
+  test('a scratch prune failure fails the import after commit, naming the residue', async (t) => {
+    // The success-path prune is authoritative too: an import that committed
+    // its set but could not remove an earlier run's scratch does not report a
+    // clean success. (Permission-based — cannot fail for root.)
+    if (typeof process.geteuid === 'function' && process.geteuid() === 0) {
+      t.skip('permission-based failure injection cannot fail for root');
+      return;
+    }
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const first = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    // make the first run's retained tree unremovable for the second run
+    const sealedDir = join(first.summary.tree, 'assets');
+    chmodSync(sealedDir, 0o555);
+    try {
+      await assert.rejects(
+        importZip(
+          { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+          { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+        ),
+        (err) => err instanceof ImportError && err.code === 'scratch-prune' && err.exitCode === 3
+          && /reference set was committed/.test(err.message)
+          && err.message.includes(first.summary.tree.split('/').pop()),
+      );
+      // the commit really did happen — the manifest is intact and current
+      const manifest = JSON.parse(readFileSync(join(dir, '.visual-diff', 'references', 'manifest.json'), 'utf8'));
+      assert.deepEqual(manifest.comps.app.screens.map((s) => s.id), ['01-main', '02-detail']);
+      assert.ok(existsSync(sealedDir), 'the residue is named because it is really still there');
+    } finally {
+      chmodSync(sealedDir, 0o755);
+    }
+  });
+
+  test('a render-stage failure on a fresh project leaves no reference artifacts', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(failingBrowser(3)), fetcher: goodFetcher },
+      ),
+      /renderer died mid-pass/,
+    );
+    // the pin the run committed is legitimately kept (the project IS
+    // initialized) — the scratch and the half-written reference set are not
+    const config = parseConfig(readFileSync(join(dir, '.visual-diff', 'visual-diff.json'), 'utf8')).config;
+    assert.ok(config.browser, 'the committed pin survives');
+    assert.deepEqual(readdirSync(join(dir, '.visual-diff', 'references')), [], 'no reference artifacts, no manifest');
+    assert.deepEqual(importTrees(dir), [], 'no extracted tree left behind');
+  });
+
+  // --- one import per project (the exclusive lock) ---------------------------
+
+  const lockPathOf = (dir) => join(dir, '.visual-diff', IMPORT_LOCK_FILE);
+
+  const until = async (predicate) => {
+    for (let i = 0; i < 2000; i++) {
+      if (predicate()) return;
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    throw new Error('condition never became true');
+  };
+
+  test('a second import of the same project is refused while the first holds the lock', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    // Hold the first import open inside its vendor pass — deterministically
+    // mid-transaction, with the lock taken and its scratch on disk.
+    let openTheGate;
+    const gate = new Promise((r) => { openTheGate = r; });
+    const gatedFetcher = async (url) => {
+      await gate;
+      return goodFetcher(url);
+    };
+    const firstRun = importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: gatedFetcher },
+    );
+    // The gate must be opened whatever happens below, or a failed assertion
+    // would leave the held import (and this process) waiting forever.
+    try {
+      await until(() => existsSync(lockPathOf(dir)) && readFileSync(lockPathOf(dir), 'utf8').endsWith('\n'));
+      const holder = JSON.parse(readFileSync(lockPathOf(dir), 'utf8'));
+      assert.equal(holder.pid, process.pid, 'the lock names its holder');
+      assert.ok(typeof holder.startedAt === 'string');
+
+      // the overlapping import refuses (exit 2) and touches nothing
+      const s2 = mockStreams();
+      const code = await runImport(
+        { projectDir: dir, positionals: [zipPath], values: {}, bools: { 'auto-discover-browser': true }, env: {}, cwd: dir },
+        {
+          resolveBrowser: async () => {
+            throw new Error('must not probe: the second import never gets that far');
+          },
+          fetcher: goodFetcher,
+          streams: s2,
+        },
+      );
+      assert.equal(code, 2, 'the refusal is a usage error, not a trust failure');
+      assert.match(s2.err(), /another import is already running/);
+      assert.match(s2.err(), new RegExp(`pid ${process.pid}`));
+      assert.match(s2.err(), /import\.lock/, 'the refusal names the lock file as the override');
+    } finally {
+      openTheGate();
+    }
+    const first = await firstRun;
+
+    // the first import committed intact: nothing the refused run did (its
+    // scratch, its sweep) touched the holder's transaction
+    const refs = join(dir, '.visual-diff', 'references');
+    const manifest = JSON.parse(readFileSync(join(refs, 'manifest.json'), 'utf8'));
+    assert.deepEqual(manifest.comps.app.screens.map((sc) => sc.id), ['01-main', '02-detail']);
+    for (const screen of ['01-main', '02-detail']) {
+      const prov = JSON.parse(readFileSync(join(refs, `app#${screen}.provenance.json`), 'utf8'));
+      assert.equal(prov.artifact.sha256, sha256(readFileSync(join(refs, `app#${screen}.png`))));
+    }
+    assert.deepEqual(importTrees(dir), [first.summary.tree.split('/').pop()], 'the holder’s tree survived');
+    assert.ok(!existsSync(lockPathOf(dir)), 'the lock is released on the way out');
+  });
+
+  test('a stale lock is refused, never stolen, and naming it is the operator’s override', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    // a lock left by a run that died without releasing it
+    writeFileSync(lockPathOf(dir), JSON.stringify({ pid: 999999, startedAt: '2026-01-01T00:00:00.000Z' }) + '\n');
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+      ),
+      (err) => err instanceof ImportError && err.code === 'import-locked' && err.exitCode === 2
+        && /pid 999999, started 2026-01-01/.test(err.message),
+    );
+    assert.ok(existsSync(lockPathOf(dir)), 'the refused run never steals the lock');
+    // the documented override: remove the file, and the next import runs
+    renameSync(lockPathOf(dir), join(dir, 'taken-away'));
+    const again = await importZip(
+      { projectDir: dir, zipPath: writeZip(dir, 'design-v2.zip', IMPORTABLE_FILES.map((f) =>
+        f.path === 'App.dc.html' ? { path: f.path, data: f.data + '\n<!-- revision two -->\n' } : f,
+      )), autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    assert.deepEqual(again.summary.comps, ['app']);
+  });
+
+  test('a fresh-project cleanup neither deletes a successor’s state nor releases its lock', async (t) => {
+    // The dangerous shape: this run fails before the browser stage and cleans
+    // up a project skeleton it created — while (as far as it can tell) someone
+    // else now owns the lock path and has state of their own under
+    // .visual-diff/. Removing either would let a third import overlap a live
+    // holder. The seam fires while this run still holds its own lock.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const successorLock = JSON.stringify({ pid: 424242, startedAt: '2026-02-02T02:02:02.000Z', nonce: 'successor' }) + '\n';
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        {
+          resolveBrowser: async () => {
+            // A successor initialized the project and took the lock path. It
+            // takes it the only way acquisition can — the old file gone, a NEW
+            // file linked in its place — because link() refuses an existing path.
+            writeFileSync(join(dir, '.visual-diff', 'successor-state'), 'not this run’s to delete');
+            rmSync(lockPathOf(dir), { force: true });
+            writeFileSync(lockPathOf(dir), successorLock);
+            throw new BrowserResolutionError('nothing works', { probes: [], mode: 'native', code: 'NO_NATIVE_RUNG' });
+          },
+          fetcher: goodFetcher,
+        },
+      ),
+      (err) => err && err.code === 'NO_NATIVE_RUNG',
+    );
+    assert.equal(
+      readFileSync(join(dir, '.visual-diff', 'successor-state'), 'utf8'),
+      'not this run’s to delete',
+      'the fresh-project cleanup never recursively deletes a root it no longer owns alone',
+    );
+    assert.equal(readFileSync(lockPathOf(dir), 'utf8'), successorLock, 'the release is ownership-checked');
+    const importsDir = join(dir, '.visual-diff', 'imports');
+    assert.ok(!existsSync(importsDir) || readdirSync(importsDir).length === 0, 'its own scratch is still gone');
+    // and the surviving holder really does keep the next import out
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+      ),
+      (err) => err instanceof ImportError && err.code === 'import-locked' && /pid 424242/.test(err.message),
+    );
+  });
+
+  test('the lock is released only for the exact file this run created', async (t) => {
+    // Byte-identical is not the same as the same file — and neither is a
+    // matching inode number, which many filesystems hand straight back to the
+    // next file created after an unlink. A successor whose lock carries the
+    // same payload AND lands on the recycled inode defeats a recorded payload
+    // and a recorded dev/ino pair together. What defeats the successor is
+    // holding the descriptor: a file with an open descriptor cannot have its
+    // inode recycled, so no successor can obtain it.
+    //
+    // The inode-reuse hunt is only observable where the allocator actually
+    // reuses numbers (ext4 does; btrfs, which allocates monotonically, does
+    // not — on a btrfs scratch the hunt finds nothing and a payload- or
+    // recorded-stat-based release passes the behavioral assertion vacuously).
+    // So the load-bearing assertion is the MECHANISM, observable on every
+    // supported host regardless of allocator: while the run holds the lock,
+    // this process holds a descriptor to the lock file's inode, visible
+    // through /proc/self/fd. Reverting the fix (recording dev/ino at
+    // acquisition and closing the descriptor) fails that assertion
+    // everywhere; reverting to a payload comparison fails the byte-identical
+    // look-alike assertion below.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    let payload = null;
+    let heldDescriptor = null;
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        {
+          resolveBrowser: async () => {
+            const lock = lockPathOf(dir);
+            payload = readFileSync(lock, 'utf8');
+            const { dev, ino } = lstatSync(lock);
+            heldDescriptor = readdirSync('/proc/self/fd').some((name) => {
+              try {
+                const s = fstatSync(Number(name));
+                return s.dev === dev && s.ino === ino;
+              } catch {
+                return false; // a descriptor closed between readdir and fstat
+              }
+            });
+            // a byte-identical look-alike at the same path — NOT this run's
+            // file (the descriptor pins the real inode, so the replacement
+            // gets another one on any filesystem)
+            rmSync(lock, { force: true });
+            writeFileSync(lock, payload);
+            throw new BrowserResolutionError('nothing works', { probes: [], mode: 'native', code: 'NO_NATIVE_RUNG' });
+          },
+          fetcher: goodFetcher,
+        },
+      ),
+      (err) => err && err.code === 'NO_NATIVE_RUNG',
+    );
+    assert.ok(
+      heldDescriptor,
+      'the run pins the lock inode with a live descriptor — a recorded inode or payload could be forged, this cannot',
+    );
+    assert.equal(readFileSync(lockPathOf(dir), 'utf8'), payload, 'a look-alike at the path is never released as ours');
+    assert.deepEqual(
+      readdirSync(join(dir, '.visual-diff')).filter((n) => n.endsWith('.lock.tmp')),
+      [],
+      'and the staged lock file never survives',
+    );
+  });
+
+  test('a lock that cannot be released after a successful commit fails the run, naming the residue', async (t) => {
+    // The release is authoritative too: an import whose reference set
+    // committed but whose lock unlink fails must not return a clean summary —
+    // the leftover lock refuses every later import, so the run fails (exit 3)
+    // naming the lock and the remedy. (Permission-based — cannot fail for
+    // root.)
+    if (typeof process.geteuid === 'function' && process.geteuid() === 0) {
+      t.skip('permission-based failure injection cannot fail for root');
+      return;
+    }
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const vd = join(dir, '.visual-diff');
+    let shots = 0;
+    const browser = makeFakeBrowser(() =>
+      makeFakePage({
+        ...defaultPageOpts(),
+        screenshots: (opts) => {
+          shots += 1;
+          if (shots === 4) {
+            // The last render of the app fixture (two screens, double-rendered).
+            // After it, only the commit — renames inside the still-writable
+            // references/ and imports/ — and the lock release touch disk, so
+            // sealing the .visual-diff root fails the release unlink alone.
+            chmodSync(vd, 0o555);
+          }
+          return clipSolid(opts);
+        },
+      }),
+    );
+    try {
+      await assert.rejects(
+        importZip(
+          { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+          { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher },
+        ),
+        (err) => err instanceof ImportError && err.code === 'lock-release' && err.exitCode === 3
+          && /the import committed/.test(err.message) && /import\.lock/.test(err.message),
+      );
+      assert.ok(existsSync(lockPathOf(dir)), 'the leftover lock is really still there');
+      // the commit itself succeeded — the manifest describes the full set
+      const manifest = JSON.parse(readFileSync(join(vd, 'references', 'manifest.json'), 'utf8'));
+      assert.deepEqual(manifest.comps.app.screens.map((s) => s.id), ['01-main', '02-detail']);
+    } finally {
+      chmodSync(vd, 0o755);
+    }
+    // the documented consequence: the leftover lock refuses the next import…
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+      ),
+      (err) => err instanceof ImportError && err.code === 'import-locked' && err.exitCode === 2,
+    );
+    // …until the operator removes the file the refusal names
+    rmSync(lockPathOf(dir), { force: true });
+    const again = await importZip(
+      { projectDir: dir, zipPath, autoDiscover: true, env: {}, cwd: dir },
+      { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+    );
+    assert.deepEqual(again.summary.skipped, ['app'], 'after the override the import runs normally');
+  });
+
+  test('a lock that cannot be taken leaves no staged file behind', async (t) => {
+    // The staged file's whole lifetime is inside the acquisition: a link that
+    // cannot land (here: something else already occupies the lock path) must
+    // not leak `.<uuid>.lock.tmp` into the project.
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    mkdirSync(join(dir, '.visual-diff'), { recursive: true });
+    mkdirSync(lockPathOf(dir)); // a directory where the lock file goes
+    const streams = mockStreams();
+    const code = await runImport(
+      { projectDir: dir, positionals: [zipPath], values: {}, bools: { 'auto-discover-browser': true }, env: {}, cwd: dir },
+      {
+        resolveBrowser: async () => {
+          throw new Error('must not probe: the lock was never taken');
+        },
+        fetcher: goodFetcher,
+        streams,
+      },
+    );
+    assert.equal(code, 2, 'refused as a usage error');
+    assert.match(streams.err(), /another import is already running/);
+    assert.deepEqual(
+      readdirSync(join(dir, '.visual-diff')).filter((n) => n.endsWith('.lock.tmp')),
+      [],
+      'no staged lock file is left behind',
+    );
+  });
+
+  test('a removal that fails while publishing stops before the manifest', async (t) => {
+    // Publishing is: rename the staged files in, apply the deferred removals,
+    // then rename the manifest LAST. If a removal fails for a real reason, the
+    // manifest must not follow it — a manifest that does not describe an
+    // artifact still on disk is precisely the half-state this design exists to
+    // prevent, so the run stops with the previous manifest still in force.
+    const dir = makeProject(t);
+    const withExtra = [...IMPORTABLE_FILES, { path: 'Extra.dc.html', data: EXTRA_COMP }];
+    const run = (zip) =>
+      importZip(
+        { projectDir: dir, zipPath: zip, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+      );
+    await run(writeZip(dir, 'design.zip', withExtra));
+    const refs = join(dir, '.visual-diff', 'references');
+    const doomed = join(refs, 'extra#01-x.png');
+    assert.ok(existsSync(doomed));
+    // something the tool cannot unlink stands where the stale artifact was
+    rmSync(doomed, { force: true });
+    mkdirSync(doomed);
+    writeFileSync(join(doomed, 'in-the-way'), 'x');
+
+    const before = readFileSync(join(refs, 'manifest.json'), 'utf8');
+    await assert.rejects(
+      run(writeZip(dir, 'design-v2.zip', IMPORTABLE_FILES)),
+      (err) => err instanceof ImportError && err.code === 'commit-incomplete' && err.exitCode === 3
+        && /extra#01-x\.png/.test(err.message) && /manifest was NOT republished/.test(err.message)
+        && /--refresh/.test(err.message),
+    );
+    assert.equal(
+      readFileSync(join(refs, 'manifest.json'), 'utf8'),
+      before,
+      'the manifest still describes the previous set, exactly as the limit says',
+    );
+    assert.ok(JSON.parse(before).comps.extra !== undefined, '(and that set still includes the comp)');
+  });
+
+  test('a successful import keeps its own tree and prunes it on the next one', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const run = (zip) =>
+      importZip(
+        { projectDir: dir, zipPath: zip, autoDiscover: true, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(makeFakeBrowser(() => makeFakePage(defaultPageOpts()))), fetcher: goodFetcher },
+      );
+    const first = await run(zipPath);
+    assert.deepEqual(importTrees(dir), [first.summary.tree.split('/').pop()], 'the run’s own tree is retained');
+    const zipV2 = writeZip(dir, 'design-v2.zip', IMPORTABLE_FILES.map((f) =>
+      f.path === 'App.dc.html' ? { path: f.path, data: f.data + '\n<!-- revision two -->\n' } : f,
+    ));
+    const second = await run(zipV2);
+    assert.notEqual(second.summary.tree, first.summary.tree);
+    assert.deepEqual(importTrees(dir), [second.summary.tree.split('/').pop()], 'the older tree is pruned');
+    assert.ok(existsSync(join(second.summary.tree, 'App.dc.html')));
+  });
+});
+
+// =============================================================================
 // Comp-side anchored masks (FR-36)
 // =============================================================================
 
@@ -2784,6 +3581,10 @@ describe('comp-side anchored masks (FR-36)', () => {
     );
     // the shared record could not be written: no reference provenance exists
     assert.ok(!existsSync(join(dir, '.visual-diff', 'references', 'app#01-main.provenance.json')));
+    // and the alignment failure unwinds like every other pre-commit stage:
+    // the tree this invocation extracted does not survive it
+    const scratch = join(dir, '.visual-diff', 'imports');
+    assert.ok(!existsSync(scratch) || readdirSync(scratch).length === 0, 'no extracted scratch left behind');
   });
 
   test("a driven state's masks resolve against its post-drive @state record — the base render never probes them", async (t) => {
