@@ -228,6 +228,7 @@ function makeFakePage() {
       const src = String(fn);
       calls.evaluate.push({ src, arg });
       if (src.includes('data-vd-mask')) return {}; // no comp-authored mask annotations
+      if (src.includes("f.status === 'error'")) return []; // font-load gate probe: no failed faces
       if (src.includes('.ready')) return undefined; // document.fonts.ready
       if (src.includes('f.family')) return ['Inter', 'Roboto']; // import fontsOf + capture collectFonts
       if (src.includes('script[src]')) return []; // no declared externals

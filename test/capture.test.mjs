@@ -182,6 +182,7 @@ function makeFakePage({
       if (evaluateImpl) return evaluateImpl(fn, arg);
       const src = String(fn);
       if (src.includes('document.fonts.ready')) return undefined;
+      if (src.includes("f.status === 'error'")) return []; // font-load gate probe: no failed faces
       if (src.includes('document.fonts')) return fonts;
       // the FR-38 canvas probe: default huge, so scenarios never grow
       if (src.includes('scrollWidth')) return { width: 100000, height: 100000 };
@@ -1468,6 +1469,7 @@ function probeAnswering(probes, scroll = { x: 0, y: 0 }, canvas = { width: 10000
     if (src.includes('scrollWidth')) return typeof canvas === 'function' ? canvas() : canvas;
     if (src.includes('window.scrollX')) return scroll;
     if (src.includes('document.fonts.ready')) return undefined;
+    if (src.includes("f.status === 'error'")) return []; // font-load gate probe: no failed faces
     if (src.includes('document.fonts')) return [];
     return undefined;
   };

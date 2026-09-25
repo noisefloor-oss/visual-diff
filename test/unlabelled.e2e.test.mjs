@@ -258,6 +258,7 @@ function makeFakePage(browser) {
           capRect: { x: 10, y: 786, width: 400, height: 34 },
         };
       }
+      if (src.includes("f.status === 'error'")) return []; // font-load gate probe: no failed faces
       if (src.includes('.ready')) return undefined; // document.fonts.ready
       if (src.includes('f.family')) return ['Inter']; // import fontsOf + capture collectFonts
       if (src.includes('script[src]')) return []; // no declared externals

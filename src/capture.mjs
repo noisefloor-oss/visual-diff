@@ -232,6 +232,34 @@ export async function collectFonts(page) {
   return [...new Set(families)].sort();
 }
 
+// --- font-load gate ----------------------------------------------------------
+
+// Runs IN the page (Playwright serializes the body — no closure references).
+// document.fonts carries one FontFace per declared @font-face rule, but the
+// FAMILY list proves nothing about load state: a face whose source 404s or
+// fails to decode keeps its family while the page renders fallback glyphs —
+// and collectFonts/fontsOf would record that family as if the face had
+// loaded. The gate reads the STATUS. The policy is deliberately conservative:
+// a face reaches 'error' when a load was ATTEMPTED and failed — by layout
+// referencing it, or by explicit script (document.fonts.load /
+// FontFace.load, which flips an otherwise-unused face to 'error' on a bad
+// source) — so every failed load attempt fails the render, while a
+// declared-but-never-attempted face stays 'unloaded' and passes. (The status
+// set is the whole check: the page offers no finer "which text runs used
+// this face" signal to scope by.)
+export function probeFailedFontFaces() {
+  return [...document.fonts]
+    .filter((f) => f.status === 'error')
+    .map((f) => `${f.family}${f.weight === '400' ? '' : ` ${f.weight}`}${f.style === 'normal' ? '' : ` ${f.style}`}`);
+}
+
+// The font-load gate, shared by capture and import's reference render (which
+// consumes it like waitReady — never re-implemented). Returns the identities
+// of the failed faces ("Family 700 italic" style) for the caller's error.
+export async function failedFontFaces(page) {
+  return page.evaluate(probeFailedFontFaces);
+}
+
 // --- state selection and URL building ----------------------------------------
 
 // Resolve `--state <name>...` against the config. Empty request selects every
@@ -706,7 +734,28 @@ async function renderCapture({
         );
       }
     };
+    // The served-but-failed twin of the abort check above: a font that was
+    // NOT refused by isolation (a 404 from the served implementation tree, a
+    // corrupt woff2, a decode failure) still renders fallback glyphs, which
+    // would read as a visual regression against a healthy reference — or as a
+    // silent false pass against an equally-degraded one. The FontFace status
+    // is the ground truth; fail closed and name the faces. Checked after
+    // readiness AND re-checked after the shot resolves, because a font can be
+    // requested late (during drive steps or the screenshot's own fonts.ready
+    // preparation), never only at navigation.
+    const throwOnFailedFonts = async () => {
+      const failed = await failedFontFaces(page);
+      if (failed.length > 0) {
+        throw new CaptureError(
+          `state ${stateName}: font face(s) failed to load: ${failed.join(', ')} — ` +
+            'the capture would record fallback glyphs, not the design’s ground truth — ' +
+            'restore the font source (it must resolve and decode), or drop the @font-face, and re-capture',
+          { code: 'font-load-failed' },
+        );
+      }
+    };
     throwOnAbortedFonts();
+    await throwOnFailedFonts();
     const fonts = await collectFonts(page);
     // animations:'disabled' is the authoritative FR-14 freeze: Playwright
     // cancels infinite animations to their initial state (and fast-forwards
@@ -818,6 +867,7 @@ async function renderCapture({
       : await page.screenshot({ fullPage: true, clip: clipRect, animations: 'disabled' });
     // re-check after the shot resolves — see throwOnAbortedFonts above
     throwOnAbortedFonts();
+    await throwOnFailedFonts();
     if (clipRect !== undefined) {
       // Delivered-frame gate (mirrors the reference render): Chromium clamps
       // a clip to the document scroll box and returns a short PNG without

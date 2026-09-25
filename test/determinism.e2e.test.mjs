@@ -92,6 +92,7 @@ function makeFakeBrowser({ shot = () => Buffer.from('det-bytes') } = {}) {
         async evaluate(fn) {
           const src = String(fn);
           if (src.includes('document.fonts.ready')) return undefined;
+          if (src.includes("f.status === 'error'")) return []; // font-load gate probe: no failed faces
           if (src.includes('document.fonts')) return ['fixture'];
           return undefined;
         },

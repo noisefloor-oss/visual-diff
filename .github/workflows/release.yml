@@ -63,6 +63,9 @@ jobs:
           - os: ubuntu-latest
             platform: linux
             arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
           - os: macos-14
             platform: darwin
             arch: arm64
@@ -136,15 +139,17 @@ jobs:
         # through the built binary with --auto-discover-browser picking up
         # playwright's managed browser installed above.
         #
-        # Hard-required on linux-x64 — the platform the full test suite
-        # exercises. Best-effort (continue-on-error) on the macos legs: the
-        # version/help smoke above already proves the darwin SEA binary
-        # boots and dispatches, while this step additionally depends on a
-        # browser download + first-launch on hosted macos runners, which
-        # fails for environmental reasons unrelated to the binary often
-        # enough that it should report — visibly, in the run log — rather
-        # than block a release. A darwin regression in the binary itself
-        # would still surface in the mandatory smoke above.
+        # Hard-required on the linux legs — linux-x64 is the platform the
+        # full test suite exercises, and linux-arm64 shares its toolchain,
+        # so both prove the real binary end-to-end. Best-effort
+        # (continue-on-error) on the macos legs: the version/help smoke
+        # above already proves the darwin SEA binary boots and dispatches,
+        # while this step additionally depends on a browser download +
+        # first-launch on hosted macos runners, which fails for
+        # environmental reasons unrelated to the binary often enough that
+        # it should report — visibly, in the run log — rather than block a
+        # release. A darwin regression in the binary itself would still
+        # surface in the mandatory smoke above.
         continue-on-error: ${{ startsWith(matrix.os, 'macos') }}
         run: |
           bin="$GITHUB_WORKSPACE/${{ steps.assets.outputs.bin }}"

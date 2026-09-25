@@ -478,6 +478,7 @@ come from it:
 | `comp-mask-missing` | 3 | `mask "…" compSelector "…" matched <n> elements (<m> visible) … it must match exactly one visible element` | an anchored mask's `compSelector` does not resolve to exactly one visible element in that screen. Retarget it. See [Masks](#masks) |
 | `comp-mask-invalid` | 3 | `data-vd-mask="…" matched <n> elements (<m> visible)`, or `a data-vd-mask annotation … has an empty value` | a comp-authored annotation names zero or several visible elements, or carries an empty value. Fix the annotation in the comp. See [Masks](#masks) |
 | `render-defect` | 3 | `aborted requests — unvendored external or isolation failure`, `aborted requests after load — … re-run import so discovery can vendor it`, or `isolation trust defect while discovering …` | the comp render reached for something the isolation layer refused. Re-run import so discovery vendors it, or drop the external reference from the comp |
+| `font-load-failed` | 3 | `reference render of <url>: font face(s) failed to load: <faces> — the reference would bake in fallback glyphs` | a font the comp used was served but failed to load — a 404 from the export tree, corrupt vendored bytes, or an undecodable file. (The policy is conservative: a face reaches `error` when a load was attempted and failed — by layout or by explicit script such as `document.fonts.load` — while a declared-but-never-attempted face stays `unloaded` and passes.) Fix the font reference or drop the `@font-face`, then re-import |
 | `vendor-fetch` | 3 | `failed to fetch external dependency <url>: <reason>`, `… : HTTP <status> <text>`, or `fetcher for <url> did not return a body Buffer` | vendoring could not download an external the comp declares — the host is offline or the URL is dead. Restore network access to that origin, or remove the external reference from the comp, then re-import |
 | `sri-mismatch` | 3 | fresh fetch: `external dependency <url> failed its declared SRI hash: <integrity> — the CDN served different bytes than the runtime declares`; vendored copy: `declares SRI <integrity> but its vendored copy does not match — the vendored bytes are stale or tampered` | on a fresh fetch the origin served bytes the comp does not declare (fix or re-pin the declaration, or drop the dependency); on a vendored copy the cached bytes drifted — clear the vendor directory and re-import |
 | `vendor-file-missing` | 3 | `declares SRI <integrity> but its vendored copy cannot be read: <file>` | the vendored file was deleted or is unreadable. Clear the vendor directory and re-import |
@@ -501,6 +502,7 @@ come from it:
 | `no-states` | 2 | `no states defined — author .visual-diff/visual-diff.json` | the config has no `states` at all. See [One-time setup](#one-time-setup) |
 | `CAPTURE_FAILED` | 3 | `state <name>: setupScript <path> must export an async default function (page) => Promise<void>`, or any other untyped capture failure verbatim | the class default, carried by capture failures that declare no more specific code — chiefly a `route.setupScript` module with no usable `default`/`setup` export. Anything the script itself throws is reported verbatim and lands in the same trust bucket: nothing is staged or published |
 | `render-defect` | 3 | `aborted external font request(s) — the capture would record fallback glyphs, not the design's ground truth` | an external font was refused, so the capture would compare fallback glyphs. Re-run import so discovery vendors the font, or drop the external `@font-face` |
+| `font-load-failed` | 3 | `state <name>: font face(s) failed to load: <faces> — the capture would record fallback glyphs, not the design’s ground truth` | the candidate's font did not load — a missing file, a 404 from the served tree, or undecodable bytes — and the browser fell back to another font. Comparing would read fallback glyphs as design drift (or, against an equally broken reference, pass silently). Restore the font or drop the `@font-face`, then re-capture |
 | `frame-unstable` | 3 | `clip "<selector>" framed <rect> at the declared viewport but <rect> after the viewport was grown to <w>x<h> to fit it` | the capture-side twin of the import row above: the page reflows under the grown viewport. Fix the page to a static frame, or let the document itself scroll, then re-capture |
 | `frame-truncated` | 3 | `the clipped capture delivered <w>x<h> … but the clip rect requires <w>x<h> — the screenshot clip was clamped to the document scroll box` | the capture-side twin of the import row above. Let the document itself scroll, or size the scroll container to its content, then re-capture |
 | `determinism-failed` | 4 | `determinism self-check FAILED for <state> (…) — re-capture from a fresh context differed (FR-17/NFR-1)`, plus `The capture is not trusted and the run is not published` | the two passes differed (or diverged on the canvas accommodation, which no `selfCheck` budget may absorb). Re-capture; if the same state fails on a quiet host the page is nondeterministic — see the exit-4 row above and [selfCheck](#selfcheck) |
@@ -1036,15 +1038,17 @@ show implemented-vs-reference visually, round by round.
 **From a release artifact**: download the single-file executable for your
 platform from the GitHub release (assets are named
 `noise-visual-diff-<platform>-<arch>`; releases ship **linux-x64**,
-**darwin-arm64**, and **darwin-x64**, built from the tagged source by the
-public release workflow — `.github/workflows/release.yml`). An honest
-caveat: only linux-x64 is exercised by the full test suite; the macOS
-binaries are smoke-tested (version/help plus a best-effort worked-example
-run) at build time. Windows binaries are **not shipped** (untested);
-building from a checkout may work there, but is unverified. Verify your
-download against the release's `SHA256SUMS`, mark it executable, and run
-it directly — it bundles Node and every npm dependency (a browser is still
-required; see Dependencies below).
+**linux-arm64**, **darwin-arm64**, and **darwin-x64**, built from the
+tagged source by the public release workflow —
+`.github/workflows/release.yml`). An honest caveat: only linux-x64 is
+exercised by the full test suite; the other binaries are smoke-tested at
+build time (version/help plus the worked-example walkthrough —
+hard-required on both linux legs, best-effort on the macOS legs). Windows
+binaries are **not shipped** (untested); building from a checkout may work
+there, but is unverified. Verify your download against the release's
+`SHA256SUMS`, mark it executable, and run it directly — it bundles Node
+and every npm dependency (a browser is still required; see Dependencies
+below).
 
 ```sh
 sha256sum -c SHA256SUMS                          # verify the download
@@ -1069,7 +1073,7 @@ node src/cli.mjs <verb> ...
 npm run build:sea
 
 # suite version (deployment gates compare this verbatim)
-noise visual-diff version    # -> noise-visual-diff 0.12.0
+noise visual-diff version    # -> noise-visual-diff 0.12.1
 ```
 
 **Uninstall / data retention:** the tool writes `.visual-diff/` inside the

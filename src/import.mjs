@@ -142,7 +142,7 @@ import { accommodationDivergence, frameShortfall, pngDimensions } from './png.mj
 import { init, guardProjectPath, layoutFor, PathEscapeError } from './artifact-layout.mjs';
 import { ConfigError, effectiveMasks, loadConfig, parseCompRef, stateConfigHash } from './config.mjs';
 import { discoverComps } from './comps.mjs';
-import { waitReady } from './capture.mjs';
+import { waitReady, failedFontFaces } from './capture.mjs';
 import { runDriveSteps } from './drive.mjs';
 import { probeCompAuthoredMasks, probeMaskElements, probeToRegion } from './masks.mjs';
 import { acquireBrowser } from './discover.mjs';
@@ -890,9 +890,32 @@ async function renderCompScreen({
         );
       }
     };
+    // The served-but-failed twin of the abort check: a font that isolation did
+    // NOT refuse — a vendored stylesheet's relative font 404ing from the tree,
+    // corrupt vendored bytes, a decode failure — still reports its family in
+    // document.fonts while the comp renders fallback glyphs. A reference
+    // recorded with fallback glyphs is a WRONG ground truth, not a degraded
+    // one. The FontFace status is the ground truth (shared probe, consumed
+    // from capture.mjs): any face in 'error' had a load ATTEMPTED (by layout
+    // or explicit script) and failed — declared-but-never-attempted faces
+    // stay 'unloaded' and pass. Checked before the
+    // shutter and re-checked after it resolves, mirroring the abort checks.
+    const throwOnFailedFonts = async () => {
+      const failed = await failedFontFaces(page);
+      if (failed.length > 0) {
+        throw trustError(
+          'font-load-failed',
+          `reference render of ${url}: font face(s) failed to load: ${failed.join(', ')} — ` +
+            'the reference would bake in fallback glyphs — fix the font reference (a vendored or relative font ' +
+            'must resolve and decode), or drop the @font-face, and re-import',
+        );
+      }
+    };
     throwOnLateAborts();
+    await throwOnFailedFonts();
     const png = await page.screenshot({ fullPage: true, clip: frame, animations: 'disabled' });
     throwOnLateAborts();
+    await throwOnFailedFonts();
     // Delivered-frame gate: Chromium clamps a clip to the document scroll box
     // and returns a short PNG without error, so a comp that scrolls in an
     // inner container (html,body{height:100%} + an overflow:auto main) would

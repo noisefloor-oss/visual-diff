@@ -305,6 +305,11 @@ function makeFakePage({
         // the FR-38 canvas probe (document canvas the fullPage shot can cover)
         return typeof canvas === 'function' ? canvas(page) : canvas;
       }
+      if (src.includes("f.status === 'error'")) {
+        // the font-load gate probe — BEFORE the 'f.family' catch: the
+        // probe's own source mentions f.family in its mapping callback
+        return [];
+      }
       if (src.includes('f.family')) return [...fonts];
       if (src.includes('script[src]')) return externals;
       if (src.includes('data-screen-label')) {

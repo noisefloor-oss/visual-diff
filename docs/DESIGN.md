@@ -239,9 +239,22 @@ servers, any hard-coded knowledge of a specific design or project
   implementation.
 - **FR-14** Determinism stack: fixed viewport per state (default 1502×818;
   `full-page` mode for scrolling content), `deviceScaleFactor: 2`, frozen
-  all no-argument `Date` forms, anti-animation and instant-scroll hooks,
-  `document.fonts.ready` plus settle
-  delay.
+  `Date` forms (all no-argument calls), anti-animation and instant-scroll
+  hooks, `document.fonts.ready` plus settle
+  delay. After `document.fonts.ready`, every `FontFace` reporting status
+  `error` fails the render closed (exit 3, `font-load-failed`), on import
+  and capture alike: a face whose source 404s or fails to decode keeps its
+  family name in `document.fonts` while the page renders fallback glyphs,
+  so the family list proves nothing about load state. The policy is
+  deliberately conservative: a face reaches `error` when a load was
+  attempted and failed — by layout referencing it, or by explicit script
+  (`document.fonts.load` / `FontFace.load`) — while a
+  declared-but-never-attempted face stays `unloaded` and passes.
+  The check runs before the shutter and again after
+  the screenshot resolves, since a font can be requested late (drive steps,
+  the screenshot's own fonts preparation). (v0.12.1, after an external
+  report: a missing candidate `.woff2` compared 0% against a healthy
+  reference.)
 - **FR-15** Every state and every verification re-capture runs in a fresh
   browser context (never a re-navigated page).
 - **FR-16** Readiness is declared per state: `networkidle`, or
