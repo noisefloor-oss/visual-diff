@@ -248,9 +248,12 @@ export async function collectFonts(page) {
 // set is the whole check: the page offers no finer "which text runs used
 // this face" signal to scope by.)
 export function probeFailedFontFaces() {
+  // weight reports the string '400' for a default face in some engines and
+  // 'normal' in others — both mean "no detail worth printing".
+  const detail = (v, defaults) => (defaults.includes(v) ? '' : ` ${v}`);
   return [...document.fonts]
     .filter((f) => f.status === 'error')
-    .map((f) => `${f.family}${f.weight === '400' ? '' : ` ${f.weight}`}${f.style === 'normal' ? '' : ` ${f.style}`}`);
+    .map((f) => `${f.family}${detail(f.weight, ['400', 'normal'])}${detail(f.style, ['normal'])}`);
 }
 
 // The font-load gate, shared by capture and import's reference render (which

@@ -537,17 +537,19 @@ describe('unlabelled export (FR-40)', () => {
     );
   });
 
-  test('compTarget on a LABELLED comp fails import closed', async () => {
-    const dir = tmpDir('vd-unlabelled-onlabelled');
+  test('compTarget on a LABELLED comp imports a state-scoped whole-comp reference', async () => {
+    const dir = tmpDir('vd-comptarget-labelled');
     const zipPath = writeZip(dir, 'export.zip', [LABELLED_COMP]);
     writeConfig(dir, {
       version: 1,
+      browser: { ...BROWSER_PIN },
       states: { home: unlabelledState({ comp: 'pipe' }) },
     });
-    await assert.rejects(
-      importExport(dir, zipPath, makeFakeBrowser()),
-      (err) => err.code === 'comp-target-invalid' && err.exitCode === 2 && /HAS \[data-screen-label\] screens/.test(err.message),
-    );
+    // Widened FR-40: labels no longer veto the explicit whole-comp frame —
+    // the state-scoped reference renders alongside the labelled screen's.
+    await importExport(dir, zipPath, makeFakeBrowser());
+    assert.ok(existsSync(join(dir, '.visual-diff', 'references', 'pipe@home.png')));
+    assert.ok(existsSync(join(dir, '.visual-diff', 'references', 'pipe#01-home.png')));
   });
 
   test('a compTarget that resolves to nothing fails the render loudly', async () => {

@@ -948,7 +948,9 @@ function resolveReference(manifest, compRef) {
   }
   let screen;
   if (compRef.screen !== undefined) {
-    screen = comp.screens.find((s) => s.id === compRef.screen);
+    // State-scoped FR-40 entries share the array but are never addressable
+    // screens — a state named like a screen id must not shadow it.
+    screen = comp.screens.find((s) => s.id === compRef.screen && s.state === undefined);
     if (!screen) {
       throw usageError(
         'no-screen',
@@ -1040,26 +1042,25 @@ export async function stageState({ layout, runId, state, stateName, manifest, ma
   const { compRef } = state;
   if (!compRef) return null; // capture-only — nothing to compare against
 
-  const { comp, screen } = resolveReference(manifest, compRef);
-
-  // FR-40: an unlabelled comp's references are state-scoped — this state's
-  // own <comp>@<state> render, produced at import time from its explicit
-  // compTarget mapping. There is no base screen and no cross-state sharing.
-  if (comp.unlabelled === true) {
-    if (state.compTarget === undefined) {
+  // FR-40: a compTarget state compares against its own state-scoped
+  // <comp>@<state> reference, produced at import time from its explicit
+  // selector — regardless of whether the comp also has labelled screens
+  // (labels address inner panels; the compTarget frame is the whole app).
+  if (state.compTarget !== undefined) {
+    const comp = manifest.comps.get(compRef.comp);
+    if (!comp) {
       throw usageError(
-        'comp-target-missing',
-        `state ${stateName} maps unlabelled comp ${comp.name} but declares no compTarget — the explicit frame ` +
-          'selector is required (the config drifted from what import rendered); restore compTarget and re-run import --refresh',
+        'no-comp',
+        `state maps to comp ${JSON.stringify(compRef.comp)} but no such comp has imported references`,
       );
     }
     const entry = comp.screens.find((s) => s.state === stateName);
     if (entry === undefined) {
       throw usageError(
         'no-reference',
-        `state ${stateName} maps unlabelled comp ${comp.name}, but the reference manifest holds no ` +
-          `${comp.name}@${stateName} reference — state-scoped references render only under import (a config ` +
-          'change does not alter the comp content hash) — run import --refresh',
+        `state ${stateName} maps comp ${comp.name} with compTarget ${JSON.stringify(state.compTarget)}, but the reference ` +
+          `manifest holds no ${comp.name}@${stateName} reference — state-scoped references render only under ` +
+          'import (a config change does not alter the comp content hash) — run import --refresh',
       );
     }
     const refPngPath = layout.referencePng(comp.name, undefined, stateName);
@@ -1101,6 +1102,18 @@ export async function stageState({ layout, runId, state, stateName, manifest, ma
       refImg: decodePng(ref.bytes),
       capImg: decodePng(cap.bytes),
     };
+  }
+
+  const { comp, screen } = resolveReference(manifest, compRef);
+
+  // An unlabelled comp without a compTarget on this state has no resolvable
+  // reference at all — the config drifted from what import rendered.
+  if (comp.unlabelled === true) {
+    throw usageError(
+      'comp-target-missing',
+      `state ${stateName} maps unlabelled comp ${comp.name} but declares no compTarget — the explicit frame ` +
+        'selector is required (the config drifted from what import rendered); restore compTarget and re-run import --refresh',
+    );
   }
 
   // FR-37: a driven state compares against its @state reference; base states

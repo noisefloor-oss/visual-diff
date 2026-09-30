@@ -106,6 +106,9 @@
 //     "driven": true, "noiseFloor": 0 } —
 // with artifacts at references/<comp>@<state>.png. There is no base
 // reference; the entry is reachable only through the state that declared it.
+// A LABELLED comp a compTarget state maps (FR-40 widened, v0.13.0) carries
+// entries of the same shape alongside its ordinary screen entries — one
+// comp, both reference families.
 //
 // noiseFloor is the fraction of differing pixels between the two independent
 // renders of the screen (0..1; a dimension mismatch between the renders is
@@ -1056,18 +1059,18 @@ async function repairSkippedCompMasks({
       const entry = record.inputs.masks?.[name];
       return entry === undefined || entry.compSelector !== spec.compSelector || entry.shape !== spec.shape;
     });
-  // FR-40: an unlabelled comp has no discovery screens to iterate — its
-  // repair units are the state-scoped references its compTarget mappings
-  // declared at the last render. Each state's compSelector'd masks resolve
-  // against that state's own render (compTarget + readiness + compDrive),
-  // exactly as they did when the reference was made. A mapping state added
-  // AFTER the comp last rendered has no record at all — repair is not its
-  // remedy (compare fails it as no-reference naming import --refresh), so it
-  // is skipped here. compAuthoredMasks needs no repair on this path: the
-  // FR-40 render records it (empty) unconditionally from the first version
-  // that supports unlabelled comps.
-  if (comp.screenless) {
-    for (const { stateName, state } of statesByComp.get(comp.name) ?? []) {
+  // FR-40: state-scoped references (any comp a compTarget state maps) have
+  // no discovery screens to iterate — their repair units are the mapping
+  // states' records. Each state's compSelector'd masks resolve against that
+  // state's own render (compTarget + readiness + compDrive), exactly as they
+  // did when the reference was made. A mapping state added AFTER the comp
+  // last rendered has no record at all — repair is not its remedy (compare
+  // fails it as no-reference naming import --refresh), so it is skipped
+  // here. compAuthoredMasks needs no repair on this path: the FR-40 render
+  // records it (empty) unconditionally.
+  const repairCompTargetStates = async () => {
+    const mappings = (statesByComp.get(comp.name) ?? []).filter((m) => m.state.compTarget !== undefined);
+    for (const { stateName, state } of mappings) {
       const manifestScreen = oldEntry?.screens?.find((s) => s.state === stateName);
       if (manifestScreen === undefined) continue;
       const declared = Object.fromEntries(
@@ -1087,15 +1090,23 @@ async function repairSkippedCompMasks({
       record.inputs.masks = probed.masks;
       await stagedWrites.writeRecord(provPath, record);
     }
+  };
+  if (comp.screenless) {
+    await repairCompTargetStates();
     return;
   }
+  // A labelled comp repairs both families: its screens below, its compTarget
+  // states here.
+  await repairCompTargetStates();
   for (const screen of comp.screens) {
     const key = `${comp.name}#${screen.id}`;
     // A screen the prior import recorded without a base reference has no
     // base record to repair: a skipped (empty-undriven) screen has no
     // artifacts at all, and a driven-only screen's records are its @state
     // records handled in the driven loop below.
-    const manifestScreen = oldEntry?.screens?.find((s) => s.id === screen.id);
+    // State-scoped FR-40 entries share the array but are never SCREEN
+    // records — a state named like a screen id must not shadow it.
+    const manifestScreen = oldEntry?.screens?.find((s) => s.id === screen.id && s.state === undefined);
     if (manifestScreen?.skipped !== undefined) continue;
     const drivenOnly = manifestScreen?.drivenOnly === true;
     const declared = screenCompMasks.get(key);
@@ -1811,6 +1822,102 @@ function closeServer(server) {
 // Orchestration
 // =============================================================================
 
+// FR-40: render one state-scoped <comp>@<state> reference — the whole-comp
+// frame an explicit compTarget selector names, double-rendered with its own
+// measured noise floor, under the state's readiness and compDrive, with
+// provenance identical in shape to an FR-37 driven reference. Used for any
+// comp a compTarget state maps, labelled or not. Returns the manifest entry.
+async function renderCompTargetState({
+  comp, stateName, state, browser, url, vendorEntries, vendorDir,
+  config, configHashValue, renderer, vendorHashes, layout, projectDir, stagedWrites, log,
+}) {
+  const compMasks = Object.fromEntries(
+    Object.entries(effectiveMasks(config, state))
+      .filter(([, m]) => m.selector !== undefined && m.compSelector !== undefined)
+      .map(([name, m]) => [name, { compSelector: m.compSelector, shape: m.shape }]),
+  );
+  log(`import: render ${comp.name}@${stateName} (pass 1/2)`);
+  const first = await renderCompScreen({
+    browser, url, selector: state.compTarget, vendor: vendorEntries, vendorDir,
+    readiness: state.readiness, drive: state.compDrive, compMasks, log,
+  });
+  log(`import: render ${comp.name}@${stateName} (pass 2/2)`);
+  const second = await renderCompScreen({
+    browser, url, selector: state.compTarget, vendor: vendorEntries, vendorDir,
+    readiness: state.readiness, drive: state.compDrive, compMasks, log,
+  });
+  // Same FR-38 x FR-11 structural agreement as any double render.
+  const divergence = (first.canvasGrown === undefined && second.canvasGrown === undefined)
+    ? null
+    : accommodationDivergence(
+      { canvasGrown: first.canvasGrown, effectiveViewport: first.effectiveViewport, frame: first.frame },
+      { canvasGrown: second.canvasGrown, effectiveViewport: second.effectiveViewport, frame: second.frame },
+    );
+  if (divergence !== null) {
+    throw trustError(
+      'canvas-divergent',
+      `double render of ${comp.name}@${stateName} disagreed on the canvas accommodation: ${divergence} — ` +
+        'the two passes must make an identical structural decision (this is a canvas race, not pixel ' +
+        'jitter, and no noise floor may absorb it); the reference cannot be trusted',
+    );
+  }
+  const { floor, note } = measureNoiseFloor(first.png, second.png);
+  if (note) log(`import: warning ${comp.name}@${stateName}: ${note}`);
+  const pngPath = layout.referencePng(comp.name, undefined, stateName);
+  const provPath = layout.referenceProvenance(comp.name, undefined, stateName);
+  await stagedWrites.writeFile(pngPath, first.png);
+  const record = createRecord({
+    kind: 'reference',
+    artifactPath: relative(projectDir, pngPath),
+    artifactBytes: first.png,
+    renderer,
+    inputs: {
+      // Same declared-conditions contract as any reference render:
+      // the shared FR-14 viewport (the compTarget state's capture is
+      // clipped, so the gate's clipped exemption applies) plus the
+      // GATED effective viewport the render actually shot under.
+      viewport: { ...DEFAULT_VIEWPORT, fullPage: true },
+      deviceScaleFactor: DEVICE_SCALE_FACTOR,
+      readiness: {
+        policy: state.readiness.policy ?? 'hydration',
+        timeout: state.readiness.timeout,
+        settle: state.readiness.settle,
+        pathFired: first.pathFired,
+        ...(state.readiness.selector !== undefined ? { selector: state.readiness.selector } : {}),
+        ...(state.readiness.compSelector !== undefined ? { compSelector: state.readiness.compSelector } : {}),
+        ...(first.compSelectorFired !== undefined ? { compSelectorFired: first.compSelectorFired } : {}),
+      },
+      fonts: first.fonts,
+      configHash: configHashValue,
+      // A state-scoped reference belongs to exactly one state.
+      stateConfigHash: stateConfigHash(config, stateName),
+      vendorHashes,
+      // FR-40: the explicit frame selector this reference was
+      // rendered against (informational; gated via stateConfigHash).
+      compTarget: state.compTarget,
+      // Resolved comp-side mask anchors (informational).
+      ...(first.masks !== undefined ? { masks: first.masks } : {}),
+      // Always recorded — empty: a compTarget render never probes
+      // data-vd-mask annotations (no screen element scopes them).
+      compAuthoredMasks: first.compAuthoredMasks,
+      // Delivered-frame evidence (informational; see the base record).
+      frame: first.frame,
+      ...(first.delivered !== null ? { delivered: first.delivered } : {}),
+      ...(first.canvasGrown !== undefined ? { canvasGrown: first.canvasGrown } : {}),
+      effectiveViewport: first.effectiveViewport,
+    },
+  });
+  await stagedWrites.writeRecord(provPath, record);
+  log(`import: wrote ${relative(projectDir, pngPath)} (noise floor ${(floor * 100).toFixed(4)}%)`);
+  return {
+    id: stateName,
+    label: `${comp.name} (@${stateName})`,
+    state: stateName,
+    driven: true,
+    noiseFloor: floor,
+  };
+}
+
 // Cleanup failures never replace the error that triggered the unwind — that
 // error still decides the exit code — but they are never silent either: they
 // are named in that error's message, which the CLI prints, so the tool never
@@ -2055,18 +2162,17 @@ async function runImportTransaction(options, deps, held) {
     // there are no labelled screens to name — and declare a compTarget
     // selector framing the reference. Anything less fails closed: the tool
     // never guesses which element is the screen.
+    //
+    // A compTarget is equally valid on a comp that HAS labelled screens
+    // (FR-40, widened): labels address inner panels, but the reference a
+    // whole-app comparison needs is the app's full frame — header and
+    // navigation included — which no screen names. The explicit selector
+    // decides the frame; labels never veto it. The two reference families
+    // coexist on one comp: comp#screen mappings keep their per-screen
+    // references, compTarget states get state-scoped <comp>@<state> ones.
     comps = comps.filter((comp) => {
       const mappings = statesByComp.get(comp.name) ?? [];
       if (!comp.screenless) {
-        const targeted = mappings.filter((m) => m.state.compTarget !== undefined);
-        if (targeted.length > 0) {
-          throw usageError(
-            'comp-target-invalid',
-            `state(s) ${targeted.map((m) => JSON.stringify(m.stateName)).join(', ')} declare compTarget, but comp ` +
-              `${comp.name} (${comp.path}) HAS [data-screen-label] screens — compTarget frames an unlabelled ` +
-              'comp only; map <comp>#<screen> instead',
-          );
-        }
         return true;
       }
       if (mappings.length === 0) {
@@ -2193,6 +2299,13 @@ async function runImportTransaction(options, deps, held) {
         if (Object.keys(merged).length > 0) screenCompMasks.set(key, merged);
       };
       if (ref.screen === undefined) {
+        // A compTarget state maps NO screen: its readiness/masks apply only
+        // to its own state-scoped <comp>@<state> render (FR-40). Registering
+        // every screen of the comp under them would let the whole-app state
+        // shadow a screen-specific state's readiness (first-in-config wins)
+        // and merge its compSelector masks into screen records the state
+        // never renders against.
+        if (state.compTarget !== undefined) continue;
         const comp = comps.find((c) => c.name === ref.comp);
         if (!comp) continue; // compare will refuse the unknown comp with usage
         for (const screen of comp.screens) {
@@ -2360,111 +2473,34 @@ async function runImportTransaction(options, deps, held) {
         continue;
       }
       const url = served.origin + '/' + comp.path.split('/').map(encodeURIComponent).join('/');
-      // FR-40: a screenless comp has no screens to iterate — its references
-      // are the state-scoped renders its explicit compTarget mappings declare,
-      // one <comp>@<state> reference per mapping state (config order), each
-      // rendered under that state's readiness and compDrive and double-
-      // rendered for its own measured noise floor, exactly like an FR-37
-      // driven reference. There is deliberately NO base reference and no
-      // cross-state uniform-dimensions assertion: distinct interaction states
+      // FR-40: state-scoped compTarget references — one <comp>@<state>
+      // reference per compTarget mapping state (config order), each rendered
+      // under that state's readiness and compDrive and double-rendered for
+      // its own measured noise floor, exactly like an FR-37 driven
+      // reference. Rendered for ANY comp a compTarget state maps: labels
+      // never veto the explicit frame. There is deliberately NO cross-state
+      // uniform-dimensions assertion for these: distinct interaction states
       // legitimately frame distinct geometry.
+      const compTargetMappings = (statesByComp.get(comp.name) ?? []).filter((m) => m.state.compTarget !== undefined);
+      if (compTargetMappings.length > 0) {
+        log(`import: reference render ${comp.name} compTarget (${compTargetMappings.length} state mapping(s))`);
+      }
+      const targetScreens = [];
+      for (const { stateName, state } of compTargetMappings) {
+        targetScreens.push(await renderCompTargetState({
+          comp, stateName, state, browser, url, vendorEntries, vendorDir,
+          config, configHashValue, renderer, vendorHashes, layout, projectDir, stagedWrites, log,
+        }));
+      }
       if (comp.screenless) {
-        const mappings = statesByComp.get(comp.name) ?? [];
-        log(`import: reference render ${comp.name} (unlabelled, ${mappings.length} state mapping(s))`);
-        const screens = [];
-        for (const { stateName, state } of mappings) {
-          const compMasks = Object.fromEntries(
-            Object.entries(effectiveMasks(config, state))
-              .filter(([, m]) => m.selector !== undefined && m.compSelector !== undefined)
-              .map(([name, m]) => [name, { compSelector: m.compSelector, shape: m.shape }]),
-          );
-          log(`import: render ${comp.name}@${stateName} (pass 1/2)`);
-          const first = await renderCompScreen({
-            browser, url, selector: state.compTarget, vendor: vendorEntries, vendorDir,
-            readiness: state.readiness, drive: state.compDrive, compMasks, log,
-          });
-          log(`import: render ${comp.name}@${stateName} (pass 2/2)`);
-          const second = await renderCompScreen({
-            browser, url, selector: state.compTarget, vendor: vendorEntries, vendorDir,
-            readiness: state.readiness, drive: state.compDrive, compMasks, log,
-          });
-          // Same FR-38 x FR-11 structural agreement as any double render.
-          const divergence = (first.canvasGrown === undefined && second.canvasGrown === undefined)
-            ? null
-            : accommodationDivergence(
-              { canvasGrown: first.canvasGrown, effectiveViewport: first.effectiveViewport, frame: first.frame },
-              { canvasGrown: second.canvasGrown, effectiveViewport: second.effectiveViewport, frame: second.frame },
-            );
-          if (divergence !== null) {
-            throw trustError(
-              'canvas-divergent',
-              `double render of ${comp.name}@${stateName} disagreed on the canvas accommodation: ${divergence} — ` +
-                'the two passes must make an identical structural decision (this is a canvas race, not pixel ' +
-                'jitter, and no noise floor may absorb it); the reference cannot be trusted',
-            );
-          }
-          const { floor, note } = measureNoiseFloor(first.png, second.png);
-          if (note) log(`import: warning ${comp.name}@${stateName}: ${note}`);
-          screens.push({
-            id: stateName,
-            label: `${comp.name} (@${stateName})`,
-            state: stateName,
-            driven: true,
-            noiseFloor: floor,
-          });
-          const pngPath = layout.referencePng(comp.name, undefined, stateName);
-          const provPath = layout.referenceProvenance(comp.name, undefined, stateName);
-          await stagedWrites.writeFile(pngPath, first.png);
-          const record = createRecord({
-            kind: 'reference',
-            artifactPath: relative(projectDir, pngPath),
-            artifactBytes: first.png,
-            renderer,
-            inputs: {
-              // Same declared-conditions contract as any reference render:
-              // the shared FR-14 viewport (the compTarget state's capture is
-              // clipped, so the gate's clipped exemption applies) plus the
-              // GATED effective viewport the render actually shot under.
-              viewport: { ...DEFAULT_VIEWPORT, fullPage: true },
-              deviceScaleFactor: DEVICE_SCALE_FACTOR,
-              readiness: {
-                policy: state.readiness.policy ?? 'hydration',
-                timeout: state.readiness.timeout,
-                settle: state.readiness.settle,
-                pathFired: first.pathFired,
-                ...(state.readiness.selector !== undefined ? { selector: state.readiness.selector } : {}),
-                ...(state.readiness.compSelector !== undefined ? { compSelector: state.readiness.compSelector } : {}),
-                ...(first.compSelectorFired !== undefined ? { compSelectorFired: first.compSelectorFired } : {}),
-              },
-              fonts: first.fonts,
-              configHash: configHashValue,
-              // A state-scoped reference belongs to exactly one state.
-              stateConfigHash: stateConfigHash(config, stateName),
-              vendorHashes,
-              // FR-40: the explicit frame selector this reference was
-              // rendered against (informational; gated via stateConfigHash).
-              compTarget: state.compTarget,
-              // Resolved comp-side mask anchors (informational).
-              ...(first.masks !== undefined ? { masks: first.masks } : {}),
-              // Always recorded — empty: a compTarget render never probes
-              // data-vd-mask annotations (no screen element scopes them).
-              compAuthoredMasks: first.compAuthoredMasks,
-              // Delivered-frame evidence (informational; see the base record).
-              frame: first.frame,
-              ...(first.delivered !== null ? { delivered: first.delivered } : {}),
-              ...(first.canvasGrown !== undefined ? { canvasGrown: first.canvasGrown } : {}),
-              effectiveViewport: first.effectiveViewport,
-            },
-          });
-          await stagedWrites.writeRecord(provPath, record);
-          log(`import: wrote ${relative(projectDir, pngPath)} (noise floor ${(floor * 100).toFixed(4)}%)`);
-        }
+        // A screenless comp has no screens to iterate — its references are
+        // exactly the state-scoped renders above.
         nextComps.set(comp.name, {
           name: comp.name,
           relPath: comp.path,
           contentSha256: comp.contentSha256,
           unlabelled: true,
-          screens,
+          screens: targetScreens,
         });
         // Drop stale artifacts for a re-rendered unlabelled comp (FR-12): a
         // state mapping removed from the config loses its reference, and a
@@ -2474,7 +2510,7 @@ async function runImportTransaction(options, deps, held) {
         const old = oldComps ? oldComps.get(comp.name) : undefined;
         if (old) {
           for (const s of old.screens) {
-            const keep = s.state !== undefined && screens.some((ns) => ns.state === s.state);
+            const keep = s.state !== undefined && targetScreens.some((ns) => ns.state === s.state);
             if (!keep) {
               const [pngPath, provPath] = referencePathsFor(layout, comp.name, s);
               stagedWrites.remove(pngPath);
@@ -2485,7 +2521,7 @@ async function runImportTransaction(options, deps, held) {
         continue;
       }
       log(`import: reference render ${comp.name} (${comp.screens.length} screens)`);
-      const screens = [];
+      const screens = [...targetScreens];
       // Every screen of a comp shares the device dimensions of the
       // first, unless the author annotated the screen data-screen-variable-size.
       // A figure that follows its caption's width (or any layout drift) reads
@@ -2776,11 +2812,18 @@ async function runImportTransaction(options, deps, held) {
       // that transitioned to skipped/driven-only has its stale base pruned.
       const old = oldComps ? oldComps.get(comp.name) : undefined;
       if (old) {
-        const keepsBase = (id) => screens.some((ns) => ns.id === id && ns.skipped === undefined && ns.drivenOnly !== true);
+        // Base entries only: driven and state-scoped entries are never base
+        // artifacts, and a state whose name collides with a screen id must
+        // not keep that screen's base reference alive (disjoint paths).
+        const keepsBase = (id) =>
+          screens.some((ns) => ns.id === id && ns.skipped === undefined && ns.drivenOnly !== true && ns.driven !== true);
         for (const s of old.screens) {
-          // A state-scoped FR-40 entry from an earlier UNLABELLED incarnation
-          // of this comp: a labelled comp never keeps it.
-          if (s.state !== undefined || !keepsBase(s.id)) {
+          // A state-scoped FR-40 entry survives only while a compTarget
+          // state still renders it.
+          const keep = s.state !== undefined
+            ? screens.some((ns) => ns.state === s.state)
+            : keepsBase(s.id);
+          if (!keep) {
             // Deferred, not unlinked: a deletion has no stage-and-rename form,
             // so it happens at commit and an abandoned run never performs it.
             const [pngPath, provPath] = referencePathsFor(layout, comp.name, s);

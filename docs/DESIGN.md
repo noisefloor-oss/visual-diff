@@ -484,10 +484,9 @@ servers, any hard-coded knowledge of a specific design or project
   one visible element whose frame becomes the reference (the same
   exactly-one contract as `clip`, which the state must also declare so the
   capture side names its corresponding element). `compTarget` requires a
-  whole-comp mapping and a `clip`, is a config error on a `<comp>#<screen>`
-  or capture-only state, and fails the import (exit 2) when the comp turns
-  out to have labelled screens. Import renders **one state-scoped reference
-  per mapping state** (`<comp>@<state>`, manifest entry
+  whole-comp mapping and a `clip`, and is a config error on a
+  `<comp>#<screen>` or capture-only state. Import renders **one state-scoped
+  reference per mapping state** (`<comp>@<state>`, manifest entry
   `{ state, driven: true, noiseFloor }` under a comp marked
   `unlabelled: true`), each under that state's readiness and FR-37
   `compDrive` (which a `compTarget` satisfies as the required single state
@@ -501,11 +500,21 @@ servers, any hard-coded knowledge of a specific design or project
   2). `compTarget` is semantic configuration: it enters `configHash`/
   `stateConfigHash` and is recorded informationally as `inputs.compTarget`;
   retargeting it invalidates the state's pair through the FR-23 gate.
-  Compare resolves the state's own `<comp>@<state>` reference (a mapping
-  without `compTarget`, or a state the import never rendered, fails closed
-  with the `import --refresh` remedy). Comp-authored `data-vd-mask`
+  Compare resolves the state's own `<comp>@<state>` reference (a state the
+  import never rendered fails closed with the `import --refresh` remedy).
+  Comp-authored `data-vd-mask`
   annotations do not apply (no screen element scopes them); config masks
-  are unchanged.
+  are unchanged. **Widened (v0.13.0):** a `compTarget` is equally valid on a
+  comp that HAS labelled screens — labels address inner panels, but a
+  whole-app comparison needs the app's full frame (header and navigation
+  included), which no screen names. The explicit selector decides the
+  frame; labels never veto it. The reference families coexist on one comp:
+  `comp#screen` mappings keep their per-screen references (the comp is NOT
+  marked `unlabelled`), `compTarget` states get state-scoped entries of the
+  same shape, and compare resolves each state by its own declaration
+  (compTarget present → state-scoped reference; otherwise the screen/base
+  rules). A compTarget state's readiness and masks apply only to its own
+  render — they never register against the comp's screens.
 - **FR-37** A state mapped to a comp screen may declare `compDrive`: an
   ordered list of `{ click: selector }` / `{ hover: selector }` steps that
   `import` executes against the rendered comp — after hydration readiness,

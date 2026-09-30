@@ -165,9 +165,15 @@ through **explicit mappings** (FR-40): each state names the *whole* comp and
 declares a `compTarget` selector whose element frame is the reference,
 paired with a `clip` selector framing the corresponding element on the
 implementation side. The tool never guesses which element is the screen —
-a mapping without `compTarget` fails import with `comp-has-no-screens`,
-and a `compTarget` on a comp that *has* labelled screens fails with
-`comp-target-invalid` (map `<comp>#<screen>` instead).
+a mapping without `compTarget` fails import with `comp-has-no-screens`.
+
+A `compTarget` is equally valid on a comp that **has** labelled screens
+(v0.13.0): labels address inner panels, but a whole-app comparison needs
+the app's full frame — header and navigation included — which no screen
+names. Use `comp: "<comp-name>"`, `compTarget: "body"`, `clip: "body"` (or
+any exact-one selector). The two reference families coexist on one comp:
+`comp#screen` states keep their per-screen references, `compTarget` states
+get state-scoped `<comp>@<state>` ones.
 
 ```json
 "states": {
@@ -461,7 +467,6 @@ come from it:
 | `comp-error` | 2 | any other export-structure message, verbatim | defensive fallback for an export-discovery failure that declares no code of its own. Treat it as the rows above |
 | `no-comps` | 2 | `no .dc.html comps found in the export`, or `no discovered comp matches --only …` | nothing survived discovery: the zip holds no `.dc.html` comp at all, or — for the `--only` wording — every comp the flag named was dropped as screenless-and-unreferenced. An `--only` name that matches nothing never reaches here (`comp-not-found` fires first) |
 | `comp-has-no-screens` | 2 | `declares no [data-screen-label] screens, but state(s) … map it as <comp>#<screen>`, or `declares no [data-screen-label] screens, but state(s) … map it without a compTarget` | a config state maps a comp whose markup has no screens at all. There are no labelled screens to name: map the **whole** comp and give each mapping state an explicit `compTarget` selector (paired with `clip`), or add screens to the comp — see [Unlabelled exports](#unlabelled-exports-no-data-screen-label). An *unreferenced* screenless comp is only a logged warning |
-| `comp-target-invalid` | 2 | `state(s) … declare compTarget, but comp <name> (<file>) HAS [data-screen-label] screens` | `compTarget` frames an unlabelled comp only. The comp has real screens — map `<comp>#<screen>` instead and drop `compTarget` |
 | `comp-target-missing` | 3 | `compTarget "<selector>" matched <n> elements — it must match exactly one`; `compTarget "<selector>" matched an element with no layout box (display:none or detached)`; `compTarget "<selector>" never became visible within <t>ms` | the explicit frame selector resolved to zero or several elements, a hidden element, or never appeared (post-drive, if the state drives). Fix the selector — the reference frame must be a stated fact. See [Unlabelled exports](#unlabelled-exports-no-data-screen-label) |
 | `screen-missing` | 2 | `screen "<id>" not found in <comp file> after hydration` | the screen is in the comp's markup but absent from the hydrated DOM. The first render of a base screen triages absence instead (skip / driven-only), so this fires on a later render of the same screen — a driven render, the second pass, or a record repair — which makes a nondeterministic or drive-sensitive comp the usual cause. Fix or re-export the comp. It is not a config mistake: a `comp` value naming a screen the manifest does not hold fails in compare as `no-screen` |
 | `empty-frame` (undriven) | 2 | `renders empty undriven, but state(s) "…" map it without compDrive` | a runtime-conditional screen is mapped by a state with no `compDrive`, so no undriven reference can exist for it. Give that state a `compDrive` that makes the screen visible (it becomes driven-only), or fix the comp so the screen renders undriven. See [Multi-screen SPA exports](#multi-screen-spa-exports) |
@@ -521,7 +526,7 @@ come from it:
 | `multi-screen` | 2 | `comp <name> has <n> screens — a whole-comp mapping must name one: …` | a whole-comp mapping is ambiguous. Name `<comp>#<screen>`. Only base screens count here — driven, driven-only, and skipped entries never resolve through a whole-comp mapping |
 | `screen-skipped` | 2 | `but import skipped that screen (<reason>: it renders empty undriven and no state mapped it at import time)` | the id is in the manifest but has no artifacts: it rendered empty when it was imported and nothing drove it. Give the state a `compDrive` if it has none, then `import --refresh`. See [Multi-screen SPA exports](#multi-screen-spa-exports) |
 | `driven-only` | 2 | `without compDrive, but that screen is driven-only (it renders empty undriven, so no undriven reference exists)` | the id is in the manifest as driven-only and this state has no `compDrive`, so there is no undriven reference to compare against. Declare a `compDrive` on the state. (This guard and `screen-skipped` test the `drivenOnly` and `skipped` flags only — a driven `<id>@<state>` entry would trip neither, and is kept out of reach by the sanitization noted under `no-screen`.) See [Multi-screen SPA exports](#multi-screen-spa-exports) |
-| `no-reference` | 2 | `no reference PNG at reference <comp>#<screen> — run import before compare`; for a driven state the remedy reads `driven references render only under import --refresh (a config change does not alter the comp content hash)`; for an unlabelled comp, `maps unlabelled comp <name>, but the reference manifest holds no <comp>@<state> reference` | the manifest names the screen but its PNG is absent (or, for an unlabelled comp, no state-scoped reference was ever rendered for this state). Run the import the message names |
+| `no-reference` | 2 | `no reference PNG at reference <comp>#<screen> — run import before compare`; for a driven state the remedy reads `driven references render only under import --refresh (a config change does not alter the comp content hash)`; for a compTarget state, `maps comp <name> with compTarget <selector>, but the reference manifest holds no <comp>@<state> reference` | the manifest names the screen but its PNG is absent (or, for a compTarget state, no state-scoped reference was ever rendered for this state). Run the import the message names |
 | `capture-only` | 2 | `state(s) … are capture-only (no comp mapping) and cannot be compared` | `--state` explicitly selected a state with no `comp`. Drop it from the selection, or give it a mapping |
 | `no-comparable` | 2 | `no selected state maps to a comp — compare needs comp mappings (FR-31)` | nothing in the selection has a `comp` mapping |
 | `no-such-run` | 2 | `no stored report for run "<id>" — looked for diffs/<id>/report.json (compare that run first)` | `--against` / `report --diff` named a well-formed run id whose `report.json` is absent. Compare that run first, or name one that has been compared. See [Run-to-run diff](#run-to-run-diff) |
@@ -1073,7 +1078,7 @@ node src/cli.mjs <verb> ...
 npm run build:sea
 
 # suite version (deployment gates compare this verbatim)
-noise visual-diff version    # -> noise-visual-diff 0.12.1
+noise visual-diff version    # -> noise-visual-diff 0.13.0
 ```
 
 **Uninstall / data retention:** the tool writes `.visual-diff/` inside the
