@@ -1,6 +1,6 @@
 {
   "name": "noise-visual-diff",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Design-fidelity hill-climbing tool for the noise CLI suite",
   "license": "MIT",
   "type": "module",
@@ -21,6 +21,7 @@
     "pngjs": "7.0.0"
   },
   "devDependencies": {
+    "acorn": "8.18.0",
     "esbuild": "0.25.6",
     "postject": "1.0.0-alpha.6"
   }

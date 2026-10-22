@@ -449,7 +449,7 @@ const HELP_FULL = [
   '  # after a tool or browser upgrade: prove zero drift',
   '  noise visual-diff verify-neutral',
   '',
-  'Full documentation: README.md (config schema, report.json fields,',
+  'Full documentation: docs/README.md (config schema, report.json fields,',
   'browser modes, recovery playbook).',
   '',
 ].join('\n');

@@ -44,7 +44,6 @@ const PRIVATE_VOCAB = [
   new RegExp('round' + '[ -]\\d+ (gate|finding|regression)', 'i'),
   new RegExp('(de' + 'ck|item)' + ' handoff|handoff' + ' \\d'),
   new RegExp('NOISE' + 'DE' + 'CK'),
-  new RegExp('\\bde' + 'ck\\b', 'i'),
   new RegExp('blue' + 'print', 'i'),
   new RegExp('/work' + 'space/'),
   new RegExp('noisefloor' + '-app'),
@@ -65,9 +64,17 @@ const PRIVATE_VOCAB = [
   new RegExp('\\bfield[ -]' + 'report\\b', 'i'),
 ];
 
+const PRIVATE_PRODUCT_NAME = new RegExp('\\bde' + 'ck\\b', 'i');
+const PUBLIC_PRODUCT_LINK = '[Deck](https://github.com/noisefloor-oss/deck)';
+
 /** Every banned pattern a line trips, so the rules are testable directly. */
 function privateReferenceHits(line) {
-  return [...EXCLUDED_PATH_REFS, ...PRIVATE_VOCAB].filter((re) => re.test(line));
+  const hits = [...EXCLUDED_PATH_REFS, ...PRIVATE_VOCAB].filter((re) => re.test(line));
+  // Permit the public product link without exempting the rest of its line.
+  if (PRIVATE_PRODUCT_NAME.test(line.replaceAll(PUBLIC_PRODUCT_LINK, ''))) {
+    hits.push(PRIVATE_PRODUCT_NAME);
+  }
+  return hits;
 }
 
 const SCAN_EXT = new Set(['.mjs', '.md', '.yml', '.yaml', '.json']);
@@ -130,5 +137,17 @@ test('export: the rules catch report-context gestures without banning ordinary p
     'a test error is reported with its exit code',
   ]) {
     assert.deepEqual(privateReferenceHits(legit), [], `must stay exportable: ${legit}`);
+  }
+});
+
+test('export: public product links do not exempt private references beside them', () => {
+  assert.deepEqual(privateReferenceHits(`${PUBLIC_PRODUCT_LINK} is a browser workspace.`), []);
+  for (const leak of [
+    'Deck handoff 2',
+    `${PUBLIC_PRODUCT_LINK} /workspace/private`,
+    `${PUBLIC_PRODUCT_LINK} PR #123`,
+    '[Deck](https://github.com/noisefloor-app/deck)',
+  ]) {
+    assert.ok(privateReferenceHits(leak).length > 0, `must be caught: ${leak}`);
   }
 });

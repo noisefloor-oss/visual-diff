@@ -32,4 +32,4 @@ against the actual release payload.
 Releases are **experimental**: the tool is daily-driven by its author
 against real repositories, but interfaces, file formats, and behavior may
 change between releases without a deprecation cycle. Compatibility
-commitments, where they exist, are stated in the README.
+commitments, where they exist, are stated in the README and docs/.
