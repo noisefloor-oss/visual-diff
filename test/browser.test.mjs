@@ -649,7 +649,7 @@ describe('host-platform derivation (1.62.1-equivalent calculatePlatform)', () =>
     assert.deepStrictEqual(res, {
       path:
         `/cache/chromium_headless_shell_debian12_${process.arch}_special-7777/` +
-        `${process.arch === 'arm64' ? 'chrome-headless-shell-linux-arm64' : 'chrome-headless-shell-linux64'}/chrome-headless-shell`,
+        `${process.arch === 'arm64' ? 'chrome-linux/headless_shell' : 'chrome-headless-shell-linux64/chrome-headless-shell'}`,
       browserRevision: '7777',
     });
   });
