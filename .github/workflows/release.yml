@@ -32,7 +32,7 @@ jobs:
     # hand-written notes are preserved. No checkout: this job runs no
     # repository code while holding write authority.
     if: github.repository == 'noisefloor-oss/visual-diff'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64]
     permissions:
       contents: write
     steps:
@@ -61,20 +61,24 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            runner: [self-hosted, Linux, X64, ubuntu-24.04]
             platform: linux
             arch: x64
           - os: ubuntu-24.04-arm
+            runner: [self-hosted, Linux, ARM64]
             platform: linux
             arch: arm64
           - os: macos-14
+            runner: [self-hosted, macOS, ARM64]
             platform: darwin
             arch: arm64
           # macos-13, the last plain macos-NN Intel image, was retired by
           # GitHub; macos-15-intel is the currently offered Intel label.
           - os: macos-15-intel
+            runner: [self-hosted, macOS, X64]
             platform: darwin
             arch: x64
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -194,7 +198,7 @@ jobs:
     # built and smoked, or nothing is attached.
     if: github.repository == 'noisefloor-oss/visual-diff'
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64]
     permissions:
       contents: write
     steps:
