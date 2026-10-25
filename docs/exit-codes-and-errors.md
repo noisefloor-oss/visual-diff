@@ -58,16 +58,16 @@ Three further shapes depart from the coded head, all deliberately:
   verb name — and exits 3, with no usage block (that is what separates it
   from a dispatch refusal). Which failures those are follows from each
   verb's catches, not from the error itself: import maps every typed error
-  it can raise and so always keeps its prefix; capture and compare catch
-  `ConfigError` at config load plus their own error types; report and
-  verify-neutral catch `LayoutError` around the layout, `RunError` around
-  the pointer, and `ReportError` around the report loaders. Everything else
-  arrives verbless. Reachable today: `PATH_ESCAPE` from a `.visual-diff`
-  symlink pointing outside the project (capture, compare, report, and
-  verify-neutral all resolve artifact paths lazily, after those catches),
-  `manifest-invalid` from compare (raised by the import module compare
-  shares), and `RUN_INCOMPLETE` from compare's publish step. Each has a row
-  below; the missing verb name is the only difference.
+  it can raise and so always keeps its prefix; capture catches `ConfigError`
+  at config load plus its own error types, and compare additionally catches
+  `RunError`; report and verify-neutral catch `LayoutError` around the
+  layout, `RunError` around the pointer, and `ReportError` around the report
+  loaders. Everything else arrives verbless. Reachable today: `PATH_ESCAPE`
+  from a `.visual-diff` symlink pointing outside the project (capture,
+  compare, report, and verify-neutral all resolve artifact paths lazily,
+  after those catches), and `manifest-invalid` from compare (raised by the
+  import module compare shares). Each has a row below; the missing verb name
+  is the only difference.
 
 Two indexes over the same ground: by exit code, when all you have is the
 status; by code and message text, when you have the report. **The names in
@@ -171,6 +171,7 @@ come from it:
 | `frame-truncated` | 3 | `the render delivered <w>x<h> device px but the screen frame requires <w>x<h> — the screenshot clip was clamped to the document scroll box` | the browser clamped the requested frame to the document scroll box, so the delivered PNG is short. The tool grows the canvas automatically for the common inner-scroll case (`html,body` at `height:100%` with an `overflow:auto` region), so this is the residual failure: the grow could not bring the frame inside the document canvas. Let the document itself scroll, or size the scroll container to its content, then re-import. Provenance `inputs.frame` + `inputs.delivered` carry both dimensions (FR-38) |
 | `canvas-divergent` | 3 | `double render of <comp>#<screen> disagreed on the canvas accommodation` | the two passes of the reference's double render made different structural decisions (one grew the viewport, the other did not, or they grew differently). That is a canvas race, not pixel jitter, so no noise floor may absorb it and the reference is refused. Re-run import on a quiet host; if it repeats, give the comp a static frame so no grow is needed |
 | `comp-mask-missing` | 3 | `mask "…" compSelector "…" matched <n> elements (<m> visible) … it must match exactly one visible element` | an anchored mask's `compSelector` does not resolve to exactly one visible element in that screen. Retarget it. See [Masks](project-config.md#masks) |
+| `comp-mask-radius-unsupported` | 3 | `mask "…" compSelector "…" has unsupported computed border-…-radius "…" — use plain px or % radius components` | the comp ring anchor's computed radius contains `calc()` or another component the tool cannot resolve without guessing. Replace it with plain `px`/`%` radii; the import refuses to record a rectangular ring fallback. See [Masks](project-config.md#masks) |
 | `comp-mask-invalid` | 3 | `data-vd-mask="…" matched <n> elements (<m> visible)`, or `a data-vd-mask annotation … has an empty value` | a comp-authored annotation names zero or several visible elements, or carries an empty value. Fix the annotation in the comp. See [Masks](project-config.md#masks) |
 | `render-defect` | 3 | `aborted requests — unvendored external or isolation failure`, `aborted requests after load — … re-run import so discovery can vendor it`, or `isolation trust defect while discovering …` | the comp render reached for something the isolation layer refused. Re-run import so discovery vendors it, or drop the external reference from the comp |
 | `font-load-failed` | 3 | `reference render of <url>: font face(s) failed to load: <faces> — the reference would bake in fallback glyphs` | a font the comp used was served but failed to load — a 404 from the export tree, corrupt vendored bytes, or an undecodable file. (The policy is conservative: a face reaches `error` when a load was attempted and failed — by layout or by explicit script such as `document.fonts.load` — while a declared-but-never-attempted face stays `unloaded` and passes.) Fix the font reference or drop the `@font-face`, then re-import |
@@ -193,6 +194,7 @@ come from it:
 | `drive-target-missing` | 3 | `drive step <i> (<action> "<selector>") never became visible within <t>ms — the implementation cannot be driven into this state; refusing to record a frame of the wrong state (FR-39)` | the implementation never entered the state. Fix the selector, or raise `readiness.timeout`/`settle`. See [compDrive and drive](project-config.md#compdrive-and-drive) |
 | `READINESS_SELECTOR_TIMEOUT` | 3 | `readiness selector "…" never became visible within <t>ms — refusing to record a frame of the wrong state (FR-16)` | `readiness.selector` never became visible. Fix the selector, or raise the timeout. See [Readiness](project-config.md#readiness) |
 | `MASK_SELECTOR_MATCH` | 3 | `mask "…" selector "…" matched <n> elements (<m> visible) — it must match exactly one visible element` | an anchored mask does not resolve to exactly one visible element on the capture page. Retarget it. See [Masks](project-config.md#masks) |
+| `MASK_RADIUS_UNSUPPORTED` | 3 | `state <name>: mask "…" selector "…" has unsupported computed border-…-radius "…" — use plain px or % radius components` | a ring anchor's computed radius contains `calc()` or another component the tool cannot resolve without guessing. Replace it with plain `px`/`%` radii; capture refuses to record a rectangular ring fallback. See [Masks](project-config.md#masks) |
 | `unknown-state` | 2 | `unknown state(s): <names> (valid: <names>)` | `--state` named a state the config does not define. The valid list is printed |
 | `no-states` | 2 | `no states defined — author .visual-diff/visual-diff.json` | the config has no `states` at all. See [One-time setup](setup-and-import.md#one-time-setup) |
 | `CAPTURE_FAILED` | 3 | `state <name>: setupScript <path> must export an async default function (page) => Promise<void>`, or any other untyped capture failure verbatim | the class default, carried by capture failures that declare no more specific code — chiefly a `route.setupScript` module with no usable `default`/`setup` export. Anything the script itself throws is reported verbatim and lands in the same trust bucket: nothing is staged or published |
@@ -228,7 +230,7 @@ come from it:
 | `capture-missing` | 3 | `capture artifact missing at <artifact label>`, or `run <id> holds no capture for the selected state(s) …` | the published run holds no capture for what you selected. Re-capture, or select states the run holds |
 | `provenance-unreadable`, `provenance-tamper` | 3 | `<artifact> provenance cannot be trusted: …`, or `artifact content hash mismatch — the artifact or its record was tampered` | a record is unreadable, or does not match its PNG. Never repair a record by hand: re-import / re-capture |
 | `png-decode` | 3 | `cannot decode PNG: …` | a reference or capture PNG cannot be decoded for comparison. Re-import / re-capture |
-| `RUN_INCOMPLETE` | 3 | `run <id> is not complete (missing <artifacts>) — current-run was not updated` | the scoring finished but the run could not be published: an artifact of the staged set is missing. The previous published pointer is left untouched. Re-capture and compare again. Compare does not catch this one, so it prints **without** the verb prefix |
+| `RUN_INCOMPLETE` | 3 | `run <id> is not complete (missing <artifacts>) — current-run was not updated` | an existing report belongs to a run whose artifact set is now incomplete, so compare refuses before writing; publication also re-checks after scoring. The previous report, diff artifacts, and published pointer are left untouched by an early refusal. Re-capture and compare again |
 
 **verify-neutral** — the upgrade check: it re-compares the published run
 with the binary you are holding and exits 0 only on zero numeric drift
@@ -261,6 +263,7 @@ failures are the published run's, not the project's:
 | `REPORT_JSON_SHAPE` | 3 | `published run <id> report.json is not an object`; `… has no states object`; `… has no valid exit field (expected 0 or 1, got <v>)`; `… state <name>: <what>` | the report parses but does not hold the shape the schema requires — including a per-state score field that is missing or non-numeric. Re-compare rather than editing it |
 | `REPORT_JSON_MISMATCH` | 3 | `published run <id> report.json names run "<other>" — pointer and report disagree` | `current-run` and the report it points at name different runs. Re-compare; do not reconcile them by hand |
 | `bad-diff-args` | 2 | `--diff requires exactly two run ids: report --diff <runIdA> <runIdB>` | `report --diff` takes the run id under the flag plus one positional |
+| `bad-diff-order` | 2 | `--diff must precede both run ids: report --diff <runIdA> <runIdB>` | a positional run id appeared before `--diff`; put the flag first so the diff remains A-to-B |
 | `no-such-run`, `bad-run-id` | 2 | as in the compare rows above | `report --diff` shares the run-diff loader with `compare --against`, and raises the same two failures under the report verb's name |
 
 ## Exit codes

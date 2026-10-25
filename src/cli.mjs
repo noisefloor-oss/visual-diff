@@ -31,7 +31,8 @@ import { pathToFileURL } from 'node:url';
 // the single version source in both the dev entry and the packaged binary.
 import pkg from '../package.json' with { type: 'json' };
 
-import { PINNED_CLIENT_VERSION } from './browser.mjs';
+import { PINNED_CLIENT_VERSION, validateBrowserMode } from './browser.mjs';
+import { ConfigError } from './config.mjs';
 import { runCapture } from './capture.mjs';
 import { runCompare } from './compare.mjs';
 import { runImport } from './import.mjs';
@@ -115,7 +116,8 @@ class UsageError extends Error {
 
 // Parse argv into { verb, positionals, values, bools }. Throws UsageError on
 // an unknown verb, an unknown flag for a verb, a value flag missing its
-// argument, or a boolean flag given an inline value. A leading `--version`
+// argument, a boolean flag given an inline value, or report --diff following
+// a positional. A leading `--version`
 // is the suite-convention alias for the `version` verb; a leading `--help`
 // aliases the `help` verb. `--help` anywhere else is just an unknown flag
 // for that verb (parse() stays single-pass) — help is first-position only.
@@ -169,6 +171,12 @@ export function parse(argv) {
           throw new UsageError('flag-missing-value', `flag --${name} requires a value`);
         }
         val = argv[++i];
+      }
+      if (verb === 'report' && name === 'diff' && positionals.length > 0) {
+        throw new UsageError(
+          'bad-diff-order',
+          '--diff must precede both run ids: report --diff <runIdA> <runIdB>',
+        );
       }
       if (spec.multi.has(name)) values[name].push(val);
       else values[name] = val;
@@ -539,6 +547,7 @@ export function run(
   let parsed, proj;
   try {
     parsed = parse(argv);
+    validateBrowserMode(parsed.values.browser);
     // The version meta command prints the exact line and exits 0 in any
     // environment — a deployment gate must not depend on project-dir validity —
     // and help is pure documentation, so both skip the host-contract
@@ -547,7 +556,7 @@ export function run(
       ? { dir: cwd, source: 'cwd' }
       : resolveProjectDir(env, cwd);
   } catch (e) {
-    if (!(e instanceof UsageError)) throw e;
+    if (!(e instanceof UsageError) && !(e instanceof ConfigError)) throw e;
     stderr.write(errorLine('noise visual-diff', e));
     usage(stderr);
     return EXIT.USAGE;

@@ -2,9 +2,9 @@
 //
 // One reusable render primitive shared by import and capture. Every render —
 // import and capture alike — runs with Playwright route interception installed
-// at browser-context scope (context.route), so EVERY page the context creates
-// — the entry page and any popup an untrusted comp opens via window.open —
-// runs the same policy:
+// at browser-context scope (context.route and context.routeWebSocket), so EVERY
+// page the context creates — the entry page and any popup an untrusted comp
+// opens via window.open — runs the same policy:
 //
 //   data:/blob: requests continue        (they never touch the network)
 //   vendored URLs are fulfilled from .visual-diff/vendor/
@@ -455,6 +455,7 @@ export async function renderPage({
   // window.open() a live external. context.route installs the shared policy on
   // EVERY page the context creates — the entry page and any popup alike.
   await context.route('**/*', handle);
+  await context.routeWebSocket('**/*', (webSocket) => handleWebSocket({ webSocket, log: logFn, result }));
   // Fail closed on any page the context creates beyond the entry page: close
   // the popup immediately and, when it somehow carries a live external URL
   // (loaded without a routed request), record the reach as an 'external'
@@ -570,6 +571,20 @@ async function handleRequest({ route, request, entryPage, entryUrl, entries, ven
   if (DEFECT_REASONS.has(rec.reason)) result.defects.push(rec);
   log(`render isolation: abort ${rec.resourceType} ${url} (${rec.reason})`);
   return route.abort('blockedbyclient');
+}
+
+async function handleWebSocket({ webSocket, log, result }) {
+  const url = webSocket.url();
+  const decision = classifyRequest(url);
+  if (decision.action === 'continue') {
+    webSocket.connectToServer();
+    return;
+  }
+  const rec = { url, resourceType: 'websocket', method: 'GET', reason: decision.reason };
+  result.aborted.push(rec);
+  if (DEFECT_REASONS.has(rec.reason)) result.defects.push(rec);
+  log(`render isolation: abort websocket ${url} (${rec.reason})`);
+  await webSocket.close();
 }
 
 // Fail closed on every page the context creates beyond the entry page (popups

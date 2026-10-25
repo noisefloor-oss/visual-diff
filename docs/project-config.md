@@ -173,7 +173,11 @@ match exactly one visible element, fail-loud), and the resolved geometry is
 recorded in each side's provenance. Without `compSelector` the
 capture-resolved rect maps onto the reference by the geometry ratio.
 `shape: "ring"` masks the element's border band — rounded corners included
-— for device bezels a rectangle cannot express. A top-level `masks` block
+— for device bezels a rectangle cannot express. Radius measurement supports
+plain computed `px` and `%` components (horizontal percentages use the border
+box width, vertical percentages its height). A computed `calc()` or other
+unsupported component fails capture/import with a typed exit-3 error; it is
+never treated as a zero-radius rectangular ring. A top-level `masks` block
 declares shared masks once (device chrome is a category); a state-local
 mask of the same name overrides. Masks are **compare-time
 configuration**: they never enter the config hash, so editing a mask

@@ -276,6 +276,7 @@ function makeFakeBrowser() {
         async route(pattern, handler) {
           ctx._routes.push({ pattern, handler });
         },
+        async routeWebSocket() {},
         on(event, fn) {
           (ctx._listeners[event] ||= []).push(fn);
         },

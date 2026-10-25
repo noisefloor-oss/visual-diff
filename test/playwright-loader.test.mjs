@@ -6,16 +6,21 @@
 // corrupt reuse. Driven with a fake node:sea asset source so no real
 // SEA binary is needed.
 
-import { test, before, after } from 'node:test';
+import { test, before } from 'node:test';
 import { strict as assert } from 'node:assert';
+import { fork } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpDir } from './helpers/tmp.mjs';
-import { join } from 'node:path';
 
 import { materializeToCache } from '../src/playwright-loader.mjs';
 
@@ -122,9 +127,13 @@ test('warm cache: a marker from a foreign manifest is refused', async () => {
 
 test('no marker: incomplete cache is wiped and re-materialized', async () => {
   const { sea, manifest } = fakeSea(ASSETS, { version: '9.9.9-reextract' });
+  const cacheDir = cacheDirOf(manifest);
   const nm = await materializeToCache(sea, cacheRoot);
-  rmSync(join(cacheDirOf(manifest), '.complete'));
+  rmSync(join(cacheDir, '.complete'));
   writeFileSync(join(nm, 'stray.txt'), 'leftover from an aborted run\n');
+  const staleStaging = join(dirname(cacheDir), `.${basename(cacheDir)}.tmp-abandoned`);
+  mkdirSync(staleStaging, { recursive: true });
+  writeFileSync(join(staleStaging, 'partial'), 'interrupted extraction\n');
   const again = await materializeToCache(sea, cacheRoot);
   assert.equal(again, nm);
   assert.equal(
@@ -132,6 +141,7 @@ test('no marker: incomplete cache is wiped and re-materialized', async () => {
     ASSETS['playwright/index.mjs'],
   );
   assert.throws(() => readFileSync(join(nm, 'stray.txt')), /ENOENT/);
+  assert.equal(existsSync(staleStaging), false);
 });
 
 test('embedded asset hash mismatch aborts before the marker is written', async () => {
@@ -141,8 +151,149 @@ test('embedded asset hash mismatch aborts before the marker is written', async (
     () => materializeToCache(sea, cacheRoot),
     /SEA asset integrity mismatch/,
   );
-  assert.throws(
-    () => readFileSync(join(cacheDirOf(manifest), '.complete')),
-    /ENOENT/,
-  );
+  const cacheDir = cacheDirOf(manifest);
+  assert.throws(() => readFileSync(join(cacheDir, '.complete')), /ENOENT/);
+  assert.deepEqual(readdirSync(dirname(cacheDir)), [], 'staging and lock files are cleaned up');
 });
+
+test('a stale lock times out with a manual-removal diagnostic and is preserved', { timeout: 1000 }, async () => {
+  const { sea, manifest } = fakeSea(ASSETS, { version: '9.9.9-stale-lock' });
+  const cacheDir = cacheDirOf(manifest);
+  const lockPath = `${cacheDir}.lock`;
+  const ownerPath = join(lockPath, 'owner.json');
+  mkdirSync(lockPath, { recursive: true });
+  writeFileSync(ownerPath, JSON.stringify({ pid: 424242, nonce: 'abandoned' }));
+  await assert.rejects(
+    () => materializeToCache(sea, cacheRoot, { lockTimeoutMs: 20 }),
+    (err) => {
+      assert.match(err.message, /timed out waiting for SEA asset cache lock/);
+      assert.match(err.message, /owner pid 424242/);
+      assert.match(err.message, /remove .*\.lock manually and retry/);
+      return true;
+    },
+  );
+  assert.equal(existsSync(cacheDir), false);
+  assert.equal(readFileSync(ownerPath, 'utf8'), JSON.stringify({ pid: 424242, nonce: 'abandoned' }));
+  assert.deepEqual(readdirSync(dirname(cacheDir)), [`${basename(cacheDir)}.lock`]);
+});
+
+test('concurrent cold processes publish one complete cache', { timeout: 30000 }, async (t) => {
+  const { manifest } = fakeSea(ASSETS, { version: '9.9.9-concurrent-cold' });
+  const results = await runWorkers(t, manifest, 6, { holdFirstAsset: true });
+  for (const result of results) assert.equal(result.ok, true, result.error);
+  assert.equal(
+    results.filter((result) => result.extractionReads > 0).length,
+    1,
+    'only the lock holder reads file assets',
+  );
+  assert.equal(
+    results.reduce((sum, result) => sum + result.extractionReads, 0),
+    manifest.files.length,
+  );
+  const cacheDir = cacheDirOf(manifest);
+  for (const result of results) assert.equal(result.nodeModulesDir, join(cacheDir, 'node_modules'));
+  assertCacheComplete(cacheDir, manifest);
+  assert.deepEqual(readdirSync(dirname(cacheDir)), [basename(cacheDir)]);
+});
+
+test('concurrent warm processes verify without re-extracting', { timeout: 30000 }, async (t) => {
+  const { sea, manifest } = fakeSea(ASSETS, { version: '9.9.9-concurrent-warm' });
+  await materializeToCache(sea, cacheRoot);
+  const results = await runWorkers(t, manifest, 6);
+  for (const result of results) {
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.extractionReads, 0);
+  }
+  const cacheDir = cacheDirOf(manifest);
+  assertCacheComplete(cacheDir, manifest);
+  assert.deepEqual(readdirSync(dirname(cacheDir)), [basename(cacheDir)]);
+});
+
+function assertCacheComplete(cacheDir, manifest) {
+  assert.equal(readFileSync(join(cacheDir, '.complete'), 'utf8'), manifest.sha256);
+  for (const [name, content] of Object.entries(ASSETS)) {
+    assert.equal(readFileSync(join(cacheDir, 'node_modules', name), 'utf8'), content);
+  }
+}
+
+async function runWorkers(t, manifest, count, { holdFirstAsset = false } = {}) {
+  const fixtureDir = tmpDir(`vd-sea-workers-${manifest.version}`);
+  const manifestPath = join(fixtureDir, 'manifest.json');
+  const assetsPath = join(fixtureDir, 'assets.json');
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  writeFileSync(assetsPath, JSON.stringify(ASSETS));
+  const start = (hold) => startWorker(t, cacheRoot, manifestPath, assetsPath, hold);
+  if (!holdFirstAsset) {
+    const workers = Array.from({ length: count }, () => start(false));
+    await Promise.all(workers.map((worker) => worker.next('ready')));
+    const pendingResults = workers.map((worker) => worker.next('result'));
+    for (const worker of workers) worker.child.send({ type: 'go' });
+    const results = await Promise.all(pendingResults);
+    await Promise.all(workers.map((worker) => worker.finish()));
+    return results;
+  }
+
+  const holder = start(true);
+  await holder.next('ready');
+  const firstExtraction = holder.next('extracting');
+  const holderResult = holder.next('result');
+  holder.child.send({ type: 'go' });
+  await firstExtraction;
+  const contenders = Array.from({ length: count - 1 }, () => start(false));
+  await Promise.all(contenders.map((worker) => worker.next('ready')));
+  const contenderResults = contenders.map((worker) => worker.next('result'));
+  for (const worker of contenders) worker.child.send({ type: 'go' });
+  holder.child.send({ type: 'release' });
+  const results = await Promise.all([holderResult, ...contenderResults]);
+  await Promise.all([holder, ...contenders].map((worker) => worker.finish()));
+  return results;
+}
+
+function startWorker(t, cacheDir, manifestPath, assetsPath, holdFirstAsset) {
+  const child = fork(
+    fileURLToPath(new URL('./fixtures/sea-cache-worker.mjs', import.meta.url)),
+    [cacheDir, manifestPath, assetsPath, ...(holdFirstAsset ? ['--hold-first-asset'] : [])],
+    { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] },
+  );
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  t.after(() => {
+    if (child.exitCode === null) child.kill();
+  });
+  return {
+    child,
+    next(type) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`timed out waiting for worker ${type}; stderr: ${stderr}`));
+        }, 15000);
+        const onMessage = (message) => {
+          if (message.type !== type) return;
+          cleanup();
+          resolve(message);
+        };
+        const onExit = (code, signal) => {
+          cleanup();
+          reject(new Error(`worker exited before ${type} (${code ?? signal}); stderr: ${stderr}`));
+        };
+        const cleanup = () => {
+          clearTimeout(timer);
+          child.off('message', onMessage);
+          child.off('exit', onExit);
+        };
+        child.on('message', onMessage);
+        child.once('exit', onExit);
+      });
+    },
+    async finish() {
+      if (child.connected) child.disconnect();
+      if (child.exitCode === null) {
+        await new Promise((resolve) => child.once('exit', resolve));
+      }
+    },
+  };
+}

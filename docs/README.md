@@ -15,6 +15,7 @@ Each step of the loop is explained under [Setup and import](setup-and-import.md#
 
 - [Overview](overview.md): what the tool is for and how an agent drives it.
 - [Install and run](install.md): release binary, checkout, uninstall, dependencies.
+- [Install/update skill](../skills/install-update-visual-diff/SKILL.md): verified standalone installation or upgrade.
 - [Setup and import](setup-and-import.md): first import, multi-screen SPA exports, unlabelled exports.
 - [The hill-climb round](hill-climb.md): capture, compare, iterate, and archive the PR proof.
 - [Reading compare results](compare-results.md): `compare --json`, thresholds, attribution, run-to-run diff.

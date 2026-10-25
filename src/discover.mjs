@@ -16,9 +16,9 @@
 //     the pinned locator (raised by resolveBrowser).
 //
 // Errors are typed exactly like the config/browser modules: ConfigError (exit 2
-// at the CLI boundary) for the ws+flag usage conflict, BrowserResolutionError
-// (exit 3) for every native resolution failure. This module never calls
-// process.exit.
+// at the CLI boundary) for an invalid mode or the ws+flag usage conflict,
+// BrowserResolutionError (exit 3) for every native resolution failure. This
+// module never calls process.exit.
 //
 // Verb ordering: the verbs load+validate the config BEFORE any
 // probe (malformed → exit 2, zero probing, no rewrite); this module runs after
@@ -26,7 +26,7 @@
 // committed config (returned to the verb), and the verb proceeds.
 
 import { layoutFor } from './artifact-layout.mjs';
-import { BrowserResolutionError, resolveBrowser } from './browser.mjs';
+import { BrowserResolutionError, resolveBrowser, validateBrowserMode } from './browser.mjs';
 import { ConfigError, configHash, configToDocument, loadConfig, writeConfigAtomic } from './config.mjs';
 
 /**
@@ -35,6 +35,7 @@ import { ConfigError, configHash, configToDocument, loadConfig, writeConfigAtomi
  * mode only, never discovery. Returns 'ws' | 'native'.
  */
 export function effectiveMode({ mode, env }) {
+  validateBrowserMode(mode);
   if (mode === 'ws') return 'ws';
   if (mode === 'native') return 'native';
   return env.NOISE_BROWSER_WS ? 'ws' : 'native';
@@ -61,14 +62,12 @@ function describePin(pin) {
   return `${pin.backend} rung ${pin.rung} ${JSON.stringify(pin.locator)} (browserRevision ${String(pin.browserRevision)})`;
 }
 
-// Merge the accepted pin into the (normalized) config, creating a bootstrap
-// config (version 1, empty states) when none exists. Operator-authored states
-// are preserved semantically — the same object identity as validateConfig
-// produced, serialized via configToDocument on write.
+// Merge the accepted pin into the complete normalized config, creating a
+// bootstrap config (version 1, empty states) when none exists. Every other
+// top-level block is preserved semantically and serialized by configToDocument.
 function withBrowserPin(config, pin) {
   return {
-    version: config ? config.version : 1,
-    states: config ? config.states : {},
+    ...(config ?? { version: 1, states: {} }),
     browser: pin,
   };
 }
@@ -93,7 +92,7 @@ function withBrowserPin(config, pin) {
  * @returns {Promise<{browser, backend, probes, config, hash, pinned, mode}>}
  *   `pinned` is true when a pin was committed this run (the verb must reload the
  *   committed config); `config`/`hash` are the (reloaded) config to use.
- * @throws {ConfigError} ws + --auto-discover-browser (usage, exit 2).
+ * @throws {ConfigError} invalid mode or ws + --auto-discover-browser (usage, exit 2).
  * @throws {BrowserResolutionError} no pin / stale pin / failed ladder (exit 3).
  */
 export async function acquireBrowser({

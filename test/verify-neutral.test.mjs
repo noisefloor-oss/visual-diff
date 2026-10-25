@@ -78,7 +78,7 @@ function mockStreams() {
 
 // A temp project with one published compare run (run r1) over the given
 // reference/capture pair.
-async function makePublishedProject({ rects = [] } = {}) {
+async function makePublishedProject({ rects = [], values = {}, bools = {}, noiseFloor = 0, againstRunId = null } = {}) {
   const dir = tmpDir('vd-verify-neutral');
   await init(dir);
   const layout = layoutFor(dir);
@@ -101,18 +101,31 @@ async function makePublishedProject({ rects = [] } = {}) {
     renderer: RENDERER,
     inputs,
   }));
-  await mkdir(join(dir, '.visual-diff', 'captures', 'r1'), { recursive: true });
-  await writeFile(layout.capturePng('r1', 'home'), cap);
-  await writeRecord(layout.captureProvenance('r1', 'home'), createRecord({
-    kind: 'capture',
-    artifactPath: '.visual-diff/captures/r1/home.png',
-    artifactBytes: cap,
-    renderer: RENDERER,
-    inputs,
-  }));
-  await writeFile(join(dir, '.visual-diff', 'references', 'manifest.json'), JSON.stringify(MANIFEST, null, 2));
+  async function writeCapture(runId, image = cap) {
+    await mkdir(join(dir, '.visual-diff', 'captures', runId), { recursive: true });
+    await writeFile(layout.capturePng(runId, 'home'), image);
+    await writeRecord(layout.captureProvenance(runId, 'home'), createRecord({
+      kind: 'capture',
+      artifactPath: `.visual-diff/captures/${runId}/home.png`,
+      artifactBytes: image,
+      renderer: RENDERER,
+      inputs,
+    }));
+  }
+  const manifest = structuredClone(MANIFEST);
+  manifest.comps.app.screens[0].noiseFloor = noiseFloor;
+  await writeFile(join(dir, '.visual-diff', 'references', 'manifest.json'), JSON.stringify(manifest, null, 2));
+  if (againstRunId !== null) {
+    await writeCapture(againstRunId, ref);
+    const prior = await runCompare(
+      { projectDir: dir, json: false, values: {}, bools: {} },
+      { ...mockStreams(), runId: againstRunId },
+    );
+    assert.notEqual(prior.report, null, 'against baseline compare published');
+  }
+  await writeCapture('r1');
   const s = mockStreams();
-  const res = await runCompare({ projectDir: dir, json: false, values: {}, bools: {} }, { ...s, runId: 'r1' });
+  const res = await runCompare({ projectDir: dir, json: false, values, bools }, { ...s, runId: 'r1' });
   assert.notEqual(res.report, null, 'baseline compare published');
   return { dir, layout, baseline: res.report };
 }
@@ -135,6 +148,52 @@ describe('verify-neutral', () => {
     assert.equal(res.streams.err(), '');
     // the pointer never moved
     assert.equal((await readCurrentRun(layout)).runId, 'r1');
+  });
+
+  test('replays a published threshold override without report leaf drift', async () => {
+    const { dir, baseline } = await makePublishedProject({
+      rects: [[0, 0, 2, 1, BLACK]],
+      values: { threshold: '20' },
+    });
+    assert.equal(baseline.thresholdOverride, 20);
+    assert.equal(baseline.states.home.threshold, 20);
+    assert.equal(baseline.states.home.thresholdUsed, 20);
+    assert.equal(baseline.states.home.override, 20);
+    const res = await verifyAt(dir);
+    assert.equal(res.code, 0);
+    assert.deepEqual(res.rows[0].drifts, []);
+    assert.equal(res.streams.err(), '');
+  });
+
+  test('replays the published against run id and preserves per-state deltas', async () => {
+    const { dir, baseline } = await makePublishedProject({
+      rects: [[0, 0, 2, 1, BLACK]],
+      values: { against: 'r0' },
+      againstRunId: 'r0',
+    });
+    assert.equal(baseline.diff.againstRunId, 'r0');
+    assert.equal(baseline.states.home.vs.runId, 'r0');
+    assert.equal(baseline.states.home.vs.mismatchDelta, 0.125);
+    const res = await verifyAt(dir);
+    assert.equal(res.code, 0);
+    assert.deepEqual(res.rows[0].drifts, []);
+    assert.equal(res.streams.err(), '');
+  });
+
+  test('replays required force for a threshold override below the noise floor', async () => {
+    const { dir, layout, baseline } = await makePublishedProject({
+      values: { threshold: '0.5' },
+      bools: { force: true },
+      noiseFloor: 0.3,
+    });
+    assert.equal(baseline.thresholdOverride, 0.5);
+    assert.equal(baseline.forced, true);
+    const original = await readFile(layout.reportJson('r1'), 'utf8');
+    const res = await verifyAt(dir);
+    assert.equal(res.code, 0);
+    assert.deepEqual(res.rows[0].drifts, []);
+    assert.equal(await readFile(layout.reportJson('r1'), 'utf8'), original);
+    assert.equal(res.streams.err(), '');
   });
 
   test('a tampered baseline number reads as DRIFT with exit 1 and names the field', async () => {

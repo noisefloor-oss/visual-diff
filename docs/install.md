@@ -5,10 +5,10 @@ platform from the GitHub release (assets are named
 `noise-visual-diff-<platform>-<arch>`; releases ship **linux-x64**,
 **linux-arm64**, **darwin-arm64**, and **darwin-x64**, built from the
 tagged source by the public release workflow —
-`.github/workflows/release.yml`). An honest caveat: only linux-x64 is
-exercised by the full test suite; the other binaries are smoke-tested at
-build time (version/help plus the worked-example walkthrough —
-hard-required on both linux legs, best-effort on the macOS legs). Windows
+`.github/workflows/release.yml`). CI runs the full suite on Linux ARM64 and
+native filesystem race tests on macOS ARM64. Each release platform must build its SEA executable and pass
+the embedded static-helper smoke and version/help checks. The worked-example
+walkthrough is required on both Linux platforms and best-effort on macOS. Windows
 binaries are **not shipped** (untested); building from a checkout may work
 there, but is unverified. Verify your download against the release's
 `SHA256SUMS`, mark it executable, and run it directly — it bundles Node
@@ -27,7 +27,8 @@ no Gatekeeper quarantine attribute is set; if you downloaded through a
 browser instead, `xattr -d com.apple.quarantine noise-visual-diff-darwin-<arch>`
 is the remedy (the binaries are ad-hoc signed, not notarized).
 
-**From a checkout:**
+**From a checkout:** also install Go 1.26.10 — `build:sea` and source-mode
+capture build the first-party static-file helper from `native/` on demand.
 
 ```sh
 # from a checkout (Node pinned in .nvmrc)
@@ -38,7 +39,7 @@ node src/cli.mjs <verb> ...
 npm run build:sea
 
 # suite version (deployment gates compare this verbatim)
-noise visual-diff version    # -> noise-visual-diff 0.14.0
+noise visual-diff version    # -> noise-visual-diff 0.14.1
 ```
 
 **Uninstall / data retention:** the tool writes `.visual-diff/` inside the
@@ -50,6 +51,13 @@ that cache directory, and the binary to remove every trace the tool
 created. Browsers installed by your discovery rung (Playwright's managed
 cache, a system browser, agent-browser) belong to those tools and are
 never installed or removed by this one.
+
+## Install or update with an agent
+
+Use the [install/update skill](../skills/install-update-visual-diff/SKILL.md)
+for verified standalone downloads, replacement and rollback. It also explains
+when [Deck](https://github.com/noisefloor-oss/deck) manages the executable and
+browser versions together.
 
 ## Dependencies
 

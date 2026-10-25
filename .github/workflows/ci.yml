@@ -5,14 +5,25 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'noisefloor-oss/visual-diff' && '["ubuntu-24.04-arm"]' || '["self-hosted","Linux","ARM64"]') }}
     steps:
+      - name: Reject external fork source on persistent runners
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Import this change into a same-repository branch before running self-hosted CI." >&2
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
       - name: Install and test
         run: |
           npm ci
@@ -28,16 +39,26 @@ jobs:
     # writes into a live libexec root. The smoke step dispatches the built
     # binary directly so a build that cannot exec (missing postjection,
     # broken bundle) fails here.
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'noisefloor-oss/visual-diff' && '["ubuntu-24.04-arm"]' || '["self-hosted","Linux","ARM64"]') }}
     steps:
+      - name: Reject external fork source on persistent runners
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Import this change into a same-repository branch before running self-hosted CI." >&2
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
       - name: Install
         run: npm ci
       - name: Build the SEA payload
         run: npm run build:sea
+      - name: Exercise embedded static server and parent-exit cleanup
+        run: node scripts/sea-static-smoke.mjs
       - name: Smoke-run the built entry
         run: |
           ./dist/noise-visual-diff report | grep -q 'no published run'
@@ -54,3 +75,26 @@ jobs:
           name: noise-visual-diff-sea
           path: dist/
           if-no-files-found: error
+
+  macos-static-root:
+    runs-on: ${{ fromJSON(github.repository == 'noisefloor-oss/visual-diff' && '["macos-15"]' || '["self-hosted","macOS","ARM64"]') }}
+    steps:
+      - name: Reject external fork source on persistent runners
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Import this change into a same-repository branch before running self-hosted CI." >&2
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+      - run: npm ci
+      - name: Exercise native filesystem boundary
+        run: cd native && go test -race ./...
+      - name: Build and exercise the macOS SEA helper
+        run: |
+          npm run build:sea
+          node scripts/sea-static-smoke.mjs

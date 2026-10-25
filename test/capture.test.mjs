@@ -4,8 +4,8 @@
 // browser whose fresh contexts expose a scriptable page, so the full
 // capture+verify sequence is exercised without any browser or network. Files
 //ystem use is limited to tiny temp projects under TMPDIR. The live end-to-end
-// double-capture test at the bottom runs only when both the playwright client
-// is resolvable and NOISE_BROWSER_WS is set; otherwise it skips cleanly.
+// double-capture tests run only when both the playwright client is resolvable
+// and NOISE_BROWSER_WS is set; otherwise they skip cleanly.
 //
 // Run: node --test test/   (with TMPDIR set so /tmp does not fill)
 
@@ -225,6 +225,7 @@ function makeFakeBrowser({ shot = (_idx, opts) => defaultShot(opts), fonts = [],
         async route(pattern, handler) {
           ctx._routes.push({ pattern, handler });
         },
+        async routeWebSocket() {},
         on(event, fn) {
           (ctx._listeners[event] ||= []).push(fn);
         },
@@ -1562,6 +1563,30 @@ describe('anchored masks at capture time (FR-36)', () => {
     await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-anchor-hidden', 'home.png')), /ENOENT/);
   });
 
+  test('an unsupported computed radius fails with a typed measurement error, no artifact written', async () => {
+    const dir = await projWithConfig({
+      version: 1,
+      states: { home: { ...BASE_STATE, masks: { bezel: { selector: '[data-phone-frame]', shape: 'ring' } } } },
+    });
+    const probe = {
+      matches: 1,
+      visible: 1,
+      radiusError: { property: 'border-top-left-radius', value: 'calc(50% + 10px)' },
+    };
+    const browser = makeFakeBrowser({ shot: () => Buffer.from('png'), evaluateImpl: probeAnswering({ bezel: probe }) });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-anchor-radius', log: sink() },
+    );
+    assert.equal(r.code, EXIT.TRUST, s.err());
+    assert.equal(s.out(), '');
+    assert.match(s.err(), /^noise visual-diff capture \[MASK_RADIUS_UNSUPPORTED\]: /m);
+    assert.match(s.err(), /mask "bezel".*border-top-left-radius "calc\(50% \+ 10px\)"/);
+    assert.match(s.err(), /refusing to guess ring geometry with a sharp-corner fallback/);
+    await assert.rejects(() => readFile(join(dir, '.visual-diff', 'captures', 'r-anchor-radius', 'home.png')), /ENOENT/);
+  });
+
   test('with clip set, the recorded region is relative to the clip origin', async () => {
     const dir = await projWithConfig({
       version: 1,
@@ -1668,6 +1693,30 @@ describe('delivered-frame gate (FR-38)', () => {
   };
   const clipBox = { x: 100, y: 200, width: 300, height: 600 };
   const elements = { '[data-phone]': [{ boundingBox: async () => clipBox }] };
+
+  test('a fractional clip is rounded once for the screenshot, delivered-frame gate, and provenance', async () => {
+    const dir = await projWithConfig({ version: 1, states: { home: clippedState } });
+    const fractionalBox = { x: 100.25, y: 200.75, width: 300.75, height: 600.5 };
+    const roundedFrame = { x: 100, y: 201, width: 301, height: 601 };
+    const fractionalElements = { '[data-phone]': [{ boundingBox: async () => fractionalBox }] };
+    const browser = makeFakeBrowser({
+      shot: (_idx, opts) => headerPng(Math.floor(opts.clip.width) * 2, Math.floor(opts.clip.height) * 2),
+      evaluateImpl: probeAnswering({}),
+      elements: fractionalElements,
+    });
+    const s = mockStreams();
+    const r = await runCapture(
+      { projectDir: dir, values: {} },
+      { stdout: s.stdout, stderr: s.stderr, acquire: fakeAcquire(browser), runId: 'r-fractional-clip', log: sink() },
+    );
+    assert.equal(r.code, EXIT.OK, s.err());
+    for (const ctx of browser._contexts) {
+      assert.deepEqual(ctx._page._calls.screenshot[0].clip, roundedFrame);
+    }
+    const rec = await readRecord(join(dir, '.visual-diff', 'captures', 'r-fractional-clip', 'home.provenance.json'));
+    assert.deepEqual(rec.inputs.clipFrame, roundedFrame);
+    assert.deepEqual(rec.inputs.delivered, { width: 602, height: 1202 });
+  });
 
   test('a clipped capture whose delivered PNG is short of the clip frame fails the run (exit 3)', async () => {
     const dir = await projWithConfig({ version: 1, states: { home: { ...BASE_STATE, clip: '[data-phone]' } } });
@@ -2284,6 +2333,51 @@ describe(
       assert.equal(rec.kind, 'capture');
       assert.equal(rec.inputs.deviceScaleFactor, 2);
       assert.equal(rec.inputs.readiness.pathFired, 'networkidle');
+    });
+
+    test('a fractional CSS clip at DPR2 captures without a false frame-truncated failure', async () => {
+      const dir = tmpDir('vd-capture-live-fractional');
+      const s = mockStreams();
+      await init(dir);
+      await mkdir(join(dir, 'web'), { recursive: true });
+      const html = [
+        '<!doctype html><meta charset="utf-8"><title>live-fractional-clip</title>',
+        '<style>html,body{margin:0}#target{position:absolute;left:100.25px;top:200.75px;width:300.75px;height:600.5px;background:#36c}</style>',
+        '<div id="target"></div>',
+      ].join('\n');
+      await writeFile(join(dir, 'web', 'index.html'), html);
+      await writeFile(
+        join(dir, '.visual-diff', 'visual-diff.json'),
+        JSON.stringify({
+          version: 1,
+          states: {
+            probe: {
+              route: { staticDir: 'web' },
+              clip: '#target',
+              readiness: { policy: 'domcontentloaded', timeout: 10000, settle: 0 },
+              threshold: 1,
+            },
+          },
+        }),
+      );
+      const r = await runCapture(
+        { projectDir: dir, values: {} },
+        {
+          stdout: s.stdout,
+          stderr: s.stderr,
+          client: liveClient,
+          clientVersion: liveVersion,
+          env: { ...process.env, NOISE_BROWSER_WS: LIVE_ENDPOINT },
+          runId: 'r-fractional-live',
+          log: sink(),
+        },
+      );
+      assert.equal(r.code, EXIT.OK, s.err());
+      assert.equal(r.captures[0].verified, true);
+      const rec = await readRecord(join(dir, '.visual-diff', 'captures', r.runId, 'probe.provenance.json'));
+      assert.equal(rec.inputs.deviceScaleFactor, 2);
+      assert.deepEqual(rec.inputs.clipFrame, { x: 100, y: 201, width: 301, height: 601 });
+      assert.deepEqual(rec.inputs.delivered, { width: 602, height: 1202 });
     });
   },
 );

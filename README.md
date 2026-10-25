@@ -52,10 +52,18 @@ chmod +x noise-visual-diff
 ./noise-visual-diff help
 ```
 
+Source development and SEA builds require Go 1.26.10 in addition to the pinned
+Node runtime. Go builds the first-party static-file helper that keeps capture
+responses inside the selected directory during concurrent filesystem changes.
+Released executables embed that helper and do not require Go to be installed.
+
 Or run from a checkout (Node pinned in `.nvmrc`): `npm ci`, then
 `node src/cli.mjs <verb> ...`. `import` and `capture` need a browser, which is
 never bundled. See [Install and run](docs/install.md) for platforms, macOS
 quarantine, uninstalling, and dependencies.
+
+For an existing installation, use the
+[install/update skill](skills/install-update-visual-diff/SKILL.md).
 
 ## First run
 

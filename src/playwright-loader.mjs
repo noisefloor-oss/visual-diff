@@ -13,13 +13,16 @@
 // manifest — a tampered or incomplete cache is refused, never used.
 
 import { createRequire } from 'node:module';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { mkdir, writeFile, rm, readFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const CACHE_ROOT = process.env.XDG_CACHE_HOME || join(homedir(), '.cache');
 const CACHE_NS = 'noise-visual-diff-sea';
+const LOCK_RETRY_MS = 25;
+const LOCK_TIMEOUT_MS = 120000;
 
 function sha256hex(buf) {
   return createHash('sha256').update(buf).digest('hex');
@@ -59,31 +62,102 @@ async function verifyCache(cacheDir, marker, manifest) {
   return true;
 }
 
+// Only the mkdir winner owns the lock, and only that owner removes it after
+// the critical section. Contenders never reclaim another owner's lock: a killed
+// run leaves a stale directory whose manual removal is the explicit override.
+async function acquireCacheLock(cacheDir, timeoutMs) {
+  const lockPath = `${cacheDir}.lock`;
+  const ownerPath = join(lockPath, 'owner.json');
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let acquired = false;
+    try {
+      await mkdir(lockPath);
+      acquired = true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+    if (acquired) {
+      try {
+        await writeFile(ownerPath, JSON.stringify({ pid: process.pid, nonce: randomUUID() }));
+      } catch (err) {
+        await rm(lockPath, { recursive: true, force: true });
+        throw err;
+      }
+      return {
+        async release() {
+          await rm(lockPath, { recursive: true, force: true });
+        },
+      };
+    }
+    if (Date.now() >= deadline) {
+      const holder = await readFile(ownerPath, 'utf8')
+        .then((text) => JSON.parse(text))
+        .catch(() => null);
+      const owner = Number.isInteger(holder?.pid) ? ` (owner pid ${holder.pid})` : '';
+      throw new Error(
+        `timed out waiting for SEA asset cache lock ${lockPath}${owner}; ` +
+          'another process may still be materializing the cache. If no other ' +
+          `noise-visual-diff process is running, remove ${lockPath} manually and retry`,
+      );
+    }
+    await delay(Math.min(LOCK_RETRY_MS, Math.max(0, deadline - Date.now())));
+  }
+}
+
+async function sweepStagingDirs(parent, prefix) {
+  const entries = await readdir(parent, { withFileTypes: true });
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
+      .map((entry) => rm(join(parent, entry.name), { recursive: true, force: true })),
+  );
+}
+
 // Exported for the loader unit tests; production callers go through
 // createPlaywrightRequire (cache root injectable for sandboxed tests).
-export async function materializeToCache(sea, cacheRoot = CACHE_ROOT) {
+export async function materializeToCache(
+  sea,
+  cacheRoot = CACHE_ROOT,
+  { lockTimeoutMs = LOCK_TIMEOUT_MS } = {},
+) {
   const manifest = JSON.parse(await (await sea.getAssetAsBlob('manifest')).text());
   const cacheDir = join(cacheRoot, CACHE_NS, manifest.version, manifest.sha256);
   const marker = join(cacheDir, '.complete');
-  if (await verifyCache(cacheDir, marker, manifest)) {
-    return join(cacheDir, 'node_modules');
-  }
-  await rm(cacheDir, { recursive: true, force: true });
-  for (const entry of manifest.files) {
-    const buf = Buffer.from(await (await sea.getAssetAsBlob(entry.name)).arrayBuffer());
-    const sha = sha256hex(buf);
-    if (sha !== entry.sha256) {
-      throw new Error(
-        `SEA asset integrity mismatch for ${entry.rel} ` +
-          `(want ${entry.sha256}, got ${sha})`,
-      );
+  const nodeModulesDir = join(cacheDir, 'node_modules');
+  if (await verifyCache(cacheDir, marker, manifest)) return nodeModulesDir;
+
+  const parent = dirname(cacheDir);
+  await mkdir(parent, { recursive: true });
+  const lock = await acquireCacheLock(cacheDir, lockTimeoutMs);
+  const stagingPrefix = `.${basename(cacheDir)}.tmp-`;
+  let stagingDir = null;
+  try {
+    if (await verifyCache(cacheDir, marker, manifest)) return nodeModulesDir;
+    await sweepStagingDirs(parent, stagingPrefix);
+    stagingDir = await mkdtemp(join(parent, stagingPrefix));
+    for (const entry of manifest.files) {
+      const buf = Buffer.from(await (await sea.getAssetAsBlob(entry.name)).arrayBuffer());
+      const sha = sha256hex(buf);
+      if (sha !== entry.sha256) {
+        throw new Error(
+          `SEA asset integrity mismatch for ${entry.rel} ` +
+            `(want ${entry.sha256}, got ${sha})`,
+        );
+      }
+      const dest = join(stagingDir, entry.rel);
+      await mkdir(dirname(dest), { recursive: true });
+      await writeFile(dest, buf);
     }
-    const dest = join(cacheDir, entry.rel);
-    await mkdir(dirname(dest), { recursive: true });
-    await writeFile(dest, buf);
+    await writeFile(join(stagingDir, '.complete'), manifest.sha256);
+    await rm(cacheDir, { recursive: true, force: true });
+    await rename(stagingDir, cacheDir);
+    stagingDir = null;
+    return nodeModulesDir;
+  } finally {
+    if (stagingDir !== null) await rm(stagingDir, { recursive: true, force: true });
+    await lock.release();
   }
-  await writeFile(marker, manifest.sha256);
-  return join(cacheDir, 'node_modules');
 }
 
 // The require anchor is dual-mode: esbuild flattens this module to CJS for the

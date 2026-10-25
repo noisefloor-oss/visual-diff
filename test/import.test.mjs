@@ -417,6 +417,7 @@ function makeFakeBrowser(pageFactory) {
         async route(pattern, handler) {
           ctx._routes.push({ pattern, handler });
         },
+        async routeWebSocket() {},
         on(event, fn) {
           (ctx._listeners[event] ||= []).push(fn);
         },
@@ -1186,6 +1187,49 @@ describe('incremental re-import (FR-12)', () => {
     // fresh provenance: the record's artifact hash now matches the refreshed bytes
     const prov = JSON.parse(readFileSync(join(dir, '.visual-diff', 'references', 'app#01-main.provenance.json'), 'utf8'));
     assert.equal(prov.artifact.sha256, sha256(readFileSync(join(dir, '.visual-diff', 'references', 'app#01-main.png'))));
+  });
+
+  test('an added compDrive state skips unchanged-comp repair until --refresh creates its reference', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    const configPath = join(dir, '.visual-diff', 'visual-diff.json');
+    const config = {
+      version: 1,
+      browser: { backend: 'playwright-managed', rung: 1, locator: { executablePath: '/fake/browser' }, browserRevision: '1234' },
+      states: {},
+    };
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(config) + '\n');
+    const run = (refresh = false) => {
+      const browser = makeFakeBrowser(() => makeFakePage(makeEnv()));
+      return importZip(
+        { projectDir: dir, zipPath, refresh, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher, log: () => {} },
+      ).then((result) => ({ browser, result }));
+    };
+    await run();
+
+    config.states['menu-open'] = {
+      route: { url: 'http://127.0.0.1:5999/preview.html' },
+      comp: 'app#01-main',
+      compDrive: [{ click: '.open-menu' }],
+      readiness: { policy: 'domcontentloaded', timeout: 5000, settle: 0 },
+      threshold: 1,
+    };
+    writeFileSync(configPath, JSON.stringify(config) + '\n');
+    const second = await run();
+    assert.deepEqual(second.result.summary.skipped, ['app']);
+    const drivenPng = join(dir, '.visual-diff', 'references', 'app#01-main@menu-open.png');
+    const drivenProv = join(dir, '.visual-diff', 'references', 'app#01-main@menu-open.provenance.json');
+    assert.ok(!existsSync(drivenPng), 'incremental import leaves the new state without a reference');
+    assert.ok(!existsSync(drivenProv), 'no absent provenance record is read or invented');
+
+    const refreshed = await run(true);
+    assert.deepEqual(refreshed.result.summary.comps, ['app']);
+    assert.ok(existsSync(drivenPng), '--refresh renders the added driven reference');
+    assert.ok(existsSync(drivenProv), '--refresh writes its provenance');
+    const manifest = JSON.parse(readFileSync(join(dir, '.visual-diff', 'references', 'manifest.json'), 'utf8'));
+    assert.ok(manifest.comps.app.screens.some((s) => s.id === '01-main@menu-open' && s.driven === true));
   });
 
   test('a comp removed from the zip revision has its references pruned (full import only)', async (t) => {
@@ -3562,6 +3606,33 @@ describe('comp-side anchored masks (FR-36)', () => {
         /mask "bezel" compSelector .*data-comp-frame.* matched 0 elements \(0 visible\)/.test(err.message) &&
         /must match exactly one visible element/.test(err.message),
     );
+  });
+
+  test('an unsupported computed comp radius fails with a typed measurement error (exit 3)', async (t) => {
+    const dir = makeProject(t);
+    const zipPath = writeZip(dir, 'design.zip', IMPORTABLE_FILES);
+    writeConfig(dir, {
+      home: mappedState({ bezel: { selector: '[data-phone-frame]', compSelector: '[data-comp-frame]', shape: 'ring' } }),
+    });
+    const probe = {
+      matches: 1,
+      visible: 1,
+      radiusError: { property: 'border-top-left-radius', value: 'calc(50% + 10px)' },
+    };
+    const browser = makeFakeBrowser(() => makeFakePage({ ...defaultPageOpts(), maskProbes: { bezel: probe } }));
+    await assert.rejects(
+      importZip(
+        { projectDir: dir, zipPath, env: {}, cwd: dir },
+        { resolveBrowser: fakeResolve(browser), fetcher: goodFetcher, log: () => {} },
+      ),
+      (err) =>
+        err instanceof ImportError &&
+        err.code === 'comp-mask-radius-unsupported' &&
+        err.exitCode === 3 &&
+        /mask "bezel".*border-top-left-radius "calc\(50% \+ 10px\)"/.test(err.message) &&
+        /refusing to guess ring geometry with a sharp-corner fallback/.test(err.message),
+    );
+    assert.ok(!existsSync(join(dir, '.visual-diff', 'references', 'app#01-main.png')));
   });
 
   test('two states mapping one screen with the same mask name but different compSelectors are a usage error (exit 2)', async (t) => {
