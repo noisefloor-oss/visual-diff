@@ -495,10 +495,10 @@ describe('locator + browserRevision (FR-33)', () => {
 });
 
 // ===========================================================================
-// Rung-1 registry semantics (1.62.1-equivalent)
+// Rung-1 registry semantics (1.64.1-equivalent)
 // ===========================================================================
 
-describe('rung 1 registry semantics (1.62.1-equivalent)', () => {
+describe('rung 1 registry semantics (1.64.1-equivalent)', () => {
   // A distinct chromium revision proves entry selection: the resolver must
   // pin the headless-shell entry, never the full chromium one.
   const BROWSERS = {
@@ -514,6 +514,13 @@ describe('rung 1 registry semantics (1.62.1-equivalent)', () => {
     hostPlatform: 'ubuntu24.04-x64',
     env: { HOME: '/home/u', PATH: '' },
   };
+
+  test('Linux arm64 resolves the pinned client headless-shell layout', async () => {
+    const res = await resolveManagedShellExecutable({ ...BASE, hostPlatform: 'debian12-arm64' });
+    assert.equal(res.path,
+      '/home/u/.cache/ms-playwright/chromium_headless_shell-1234/' +
+      'chrome-headless-shell-linux-arm64/chrome-headless-shell');
+  });
 
   test('default cache root: resolves the headless-SHELL path, not the full chromium entry', async () => {
     const res = await resolveManagedShellExecutable(BASE);
@@ -614,7 +621,7 @@ describe('rung 1 registry semantics (1.62.1-equivalent)', () => {
   });
 });
 
-describe('host-platform derivation (1.62.1-equivalent calculatePlatform)', () => {
+describe('host-platform derivation (1.64.1-equivalent calculatePlatform)', () => {
   // Derived through resolveManagedShellExecutable WITHOUT an explicit
   // hostPlatform — the derivation itself is under test, keyed by injected
   // os-release content. A revision override per label proves the derived
@@ -639,29 +646,28 @@ describe('host-platform derivation (1.62.1-equivalent calculatePlatform)', () =>
       env: { PLAYWRIGHT_BROWSERS_PATH: '/cache', ...env },
     });
 
-  test('debian 12 x64: derives debian12-x64 and picks the OS-specific override', async () => {
-    // The review repro: base revision 1234, override debian12-x64=7777. A
-    // hard-coded ubuntu24.04 label resolves the BASE dir; the correct
-    // derivation resolves the _special dir.
+  test('debian 12: derives the current architecture and picks the OS-specific override', async () => {
+    // A distribution-specific revision must beat the base revision on
+    // both x64 and ARM64 Linux runners.
     const res = await derive({
       osReleaseText: OS_RELEASE('debian', '12'),
-      browsersJson: OVERRIDDEN('debian12-x64', '7777'),
+      browsersJson: OVERRIDDEN(`debian12-${process.arch}`, '7777'),
     });
     assert.deepStrictEqual(res, {
       path:
-        '/cache/chromium_headless_shell_debian12_x64_special-7777/' +
-        'chrome-headless-shell-linux64/chrome-headless-shell',
+        `/cache/chromium_headless_shell_debian12_${process.arch}_special-7777/` +
+        `${process.arch === 'arm64' ? 'chrome-headless-shell-linux-arm64' : 'chrome-headless-shell-linux64'}/chrome-headless-shell`,
       browserRevision: '7777',
     });
   });
 
   test('ubuntu-family buckets: 22.04 → ubuntu22.04, pop 24.04 → ubuntu24.04, ≥28 verbatim', async () => {
     for (const [id, version, label] of [
-      ['ubuntu', '22.04', 'ubuntu22.04-x64'],
-      ['pop', '24.04', 'ubuntu24.04-x64'],
-      ['neon', '20.04', 'ubuntu20.04-x64'],
-      ['ubuntu', '26.10', 'ubuntu26.04-x64'], // 26/27 bucket to ubuntu26.04
-      ['tuxedo', '28.04', 'ubuntu28.04-x64'], // ≥28 keeps the verbatim version
+      ['ubuntu', '22.04', `ubuntu22.04-${process.arch}`],
+      ['pop', '24.04', `ubuntu24.04-${process.arch}`],
+      ['neon', '20.04', `ubuntu20.04-${process.arch}`],
+      ['ubuntu', '26.10', `ubuntu26.04-${process.arch}`], // 26/27 bucket to ubuntu26.04
+      ['tuxedo', '28.04', `ubuntu28.04-${process.arch}`], // ≥28 keeps the verbatim version
     ]) {
       const res = await derive({
         osReleaseText: OS_RELEASE(id, version),
@@ -673,10 +679,10 @@ describe('host-platform derivation (1.62.1-equivalent calculatePlatform)', () =>
 
   test('linuxmint maps to its ubuntu base; debian/raspbian map to debianXX', async () => {
     for (const [id, version, label] of [
-      ['linuxmint', '21', 'ubuntu22.04-x64'],
-      ['linuxmint', '22', 'ubuntu24.04-x64'],
-      ['debian', '11', 'debian11-x64'],
-      ['raspbian', '13', 'debian13-x64'],
+      ['linuxmint', '21', `ubuntu22.04-${process.arch}`],
+      ['linuxmint', '22', `ubuntu24.04-${process.arch}`],
+      ['debian', '11', `debian11-${process.arch}`],
+      ['raspbian', '13', `debian13-${process.arch}`],
     ]) {
       const res = await derive({
         osReleaseText: OS_RELEASE(id, version),
@@ -689,9 +695,9 @@ describe('host-platform derivation (1.62.1-equivalent calculatePlatform)', () =>
   test('unrecognized distro and missing version fall back to ubuntu24.04 (base revision)', async () => {
     const res = await derive({
       osReleaseText: OS_RELEASE('arch', 'rolling'),
-      browsersJson: OVERRIDDEN('ubuntu24.04-x64', '5555'),
+      browsersJson: OVERRIDDEN(`ubuntu24.04-${process.arch}`, '5555'),
     });
-    assert.ok(res.path.includes('chromium_headless_shell_ubuntu24.04_x64_special-5555'));
+    assert.ok(res.path.includes(`chromium_headless_shell_ubuntu24.04_${process.arch}_special-5555`));
   });
 
   test('PLAYWRIGHT_HOST_PLATFORM_OVERRIDE wins over os-release derivation', async () => {
@@ -1023,6 +1029,25 @@ describe('mode override --browser (FR-29)', () => {
         return true;
       },
     );
+  });
+
+  test('defined modes outside exact ws/native are usage errors, never environment defaults', async () => {
+    for (const mode of ['natve', 'Native', 'WS', '', null]) {
+      await assert.rejects(
+        () => resolveBrowser({
+          mode,
+          env: { NOISE_BROWSER_WS: 'ws://127.0.0.1:3000/' },
+          client: makeClient({}),
+        }),
+        (err) => {
+          assert.strictEqual(err.name, 'ConfigError');
+          assert.strictEqual(err.exitCode, 2);
+          assert.match(err.message, /^--browser: expected exactly "ws" or "native"/);
+          return true;
+        },
+        JSON.stringify(mode),
+      );
+    }
   });
 });
 

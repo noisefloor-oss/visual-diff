@@ -1099,12 +1099,12 @@ export async function loadConfig(projectDir) {
 }
 
 // Serialize a NORMALIZED config back to an author-able document (the FR-33
-// boundary: re-pinning preserves operator-authored states semantically): the
-// internal per-state compRef is dropped, comp null is
-// omitted, and the browser block round-trips in full (including discoveredAt).
-// Key order and spelled-out defaults may normalize; states are never added,
-// dropped, or revalued. Parsing + validateConfig on the result yields a config
-// deep-equal to the input.
+// boundary: re-pinning preserves operator-authored configuration semantically):
+// the internal per-state compRef is dropped, comp null is omitted, and the
+// browser block round-trips in full (including discoveredAt). Key order and
+// spelled-out defaults may normalize; configuration is never added, dropped, or
+// revalued. Parsing + validateConfig on the result yields a config deep-equal to
+// the input.
 export function configToDocument(config) {
   const doc = { version: config.version, states: {} };
   for (const name of Object.keys(config.states)) {
@@ -1143,7 +1143,7 @@ export function configToDocument(config) {
 // Atomically write the project config (temp file + rename, the atomicity
 // doctrine): an interrupted write never corrupts the operator-authored config.
 // `config` must be NORMALIZED (validateConfig output); it is serialized via
-// configToDocument, so operator-authored states survive semantically. The
+// configToDocument, so operator-authored configuration survives semantically. The
 // .visual-diff directory is created on demand — a fresh project gets its first
 // config.
 export async function writeConfigAtomic(projectDir, config) {

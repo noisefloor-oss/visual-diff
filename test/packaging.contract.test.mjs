@@ -22,7 +22,7 @@
 //
 // The test skips cleanly when no postject-able node binary is available
 // (Node ≥ 20; `NOISE_VD_SEA_NODE` overrides, else the test-runner node —
-// the repo-pinned v24.18.1 in dev/CI via .nvmrc), or when the build-time
+// the repo-pinned v24.22.1 in dev/CI via .nvmrc), or when the build-time
 // devDependencies (esbuild/postject) are missing.
 
 import { test, before, after } from 'node:test';
@@ -221,7 +221,7 @@ before(async () => {
 test('packaging: prerequisite discovery finds a postject-able node binary', (t) => {
   if (!node) {
     return t.skip(
-      'no postject-able node binary — install Node ≥ 20 (pinned v24.18.1) to run the contract test',
+      'no postject-able node binary — install Node ≥ 20 (pinned v24.22.1) to run the contract test',
     );
   }
   assert.ok(node);

@@ -1,10 +1,11 @@
 name: release
 
-# Tag-triggered multi-platform release builds.
+# Multi-platform candidate qualification and tag-triggered release builds.
 #
 # This workflow ships in the public snapshot and runs ONLY in the public
-# mirror (noisefloor-oss/visual-diff), on free hosted runners: every job is
-# guarded on github.repository, so pushing a v* tag anywhere else (the
+# mirror (noisefloor-oss/visual-diff), on approved free standard GitHub-hosted
+# runners for Linux and macOS, on ARM64 and X64.
+# Every job is guarded on github.repository, so pushing a v* tag elsewhere (the
 # private development repo, a fork) is a no-op. Building releases in the
 # public repo gives public provenance — anyone can follow a release asset
 # back to the tagged source and the logged run that produced it.
@@ -14,6 +15,7 @@ name: release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch: {}
 
 # Least privilege by default; jobs opt in below. Only the two jobs that
 # talk to the GitHub release (create it, attach assets to it) hold
@@ -31,8 +33,8 @@ jobs:
     # hand (e.g. drafted with curated notes), this is a no-op and the
     # hand-written notes are preserved. No checkout: this job runs no
     # repository code while holding write authority.
-    if: github.repository == 'noisefloor-oss/visual-diff'
-    runs-on: ubuntu-latest
+    if: github.repository == 'noisefloor-oss/visual-diff' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
     steps:
@@ -51,30 +53,33 @@ jobs:
     # jobs execute repository code, so they never hold release-writing
     # authority — they only upload workflow artifacts, and the publish job
     # below attaches everything to the release after the whole matrix
-    # succeeds.
+    # succeeds. Manual dispatch builds the same artifacts without creating
+    # a release or granting any job release-writing authority.
     if: github.repository == 'noisefloor-oss/visual-diff'
-    needs: release
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
+            runner: ubuntu-24.04
             platform: linux
             arch: x64
           - os: ubuntu-24.04-arm
+            runner: ubuntu-24.04-arm
             platform: linux
             arch: arm64
-          - os: macos-14
+          - os: macos-15
+            runner: macos-15
             platform: darwin
             arch: arm64
-          # macos-13, the last plain macos-NN Intel image, was retired by
-          # GitHub; macos-15-intel is the currently offered Intel label.
+          # Standard public-repository runners only; no larger runners.
           - os: macos-15-intel
+            runner: macos-15-intel
             platform: darwin
             arch: x64
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -84,6 +89,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: native/go.mod
       - name: Install
         run: npm ci
       - name: Build the SEA payload
@@ -93,6 +101,8 @@ jobs:
         # refuses to execute a binary whose signature no longer covers its
         # contents. The script fails loud if codesign is unavailable.
         run: npm run build:sea
+      - name: Exercise embedded static server and parent-exit cleanup
+        run: node scripts/sea-static-smoke.mjs
       - name: Name the assets from the manifest platform/arch
         id: assets
         run: |
@@ -112,18 +122,27 @@ jobs:
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
       - name: Smoke-run version and help
         run: |
-          # A shakeout tag (v1.2.3-rc.1) carries a pre-release suffix the
-          # binary's package version never has — strip it, so rc tags smoke
-          # the same build a real tag would, while a genuine version mismatch
-          # (tag v0.9.0 on a 0.8.1 tree) still fails.
-          base="${GITHUB_REF_NAME%%-*}"
-          expected="noise-visual-diff ${base#v}"
+          # Dispatch compares the binary against package.json. Tag pushes
+          # also check the tag base, allowing a shakeout suffix such as
+          # v1.2.3-rc.1 while rejecting a tag on the wrong package version.
+          version=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            base="${GITHUB_REF_NAME%%-*}"
+            if [ "${base#v}" != "$version" ]; then
+              echo "tag $GITHUB_REF_NAME does not match package version $version" >&2
+              exit 1
+            fi
+          fi
+          expected="noise-visual-diff $version"
           actual=$("./${{ steps.assets.outputs.bin }}" version)
           if [ "$actual" != "$expected" ]; then
-            echo "version smoke failed: got '$actual', want '$expected' (tag $GITHUB_REF_NAME)" >&2
+            echo "version smoke failed: got '$actual', want '$expected' (ref $GITHUB_REF_NAME)" >&2
             exit 1
           fi
           "./${{ steps.assets.outputs.bin }}" help
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: native/go.mod
       - name: Install playwright managed browser
         # Best-effort on macos for the same reason as the walkthrough below.
         continue-on-error: ${{ startsWith(matrix.os, 'macos') }}
@@ -139,13 +158,13 @@ jobs:
         # through the built binary with --auto-discover-browser picking up
         # playwright's managed browser installed above.
         #
-        # Hard-required on the linux legs — linux-x64 is the platform the
-        # full test suite exercises, and linux-arm64 shares its toolchain,
+        # Hard-required on the linux legs — linux-arm64 is the platform the
+        # full test suite exercises, and linux-x64 uses the same source,
         # so both prove the real binary end-to-end. Best-effort
         # (continue-on-error) on the macos legs: the version/help smoke
         # above already proves the darwin SEA binary boots and dispatches,
         # while this step additionally depends on a browser download +
-        # first-launch on hosted macos runners, which fails for
+        # first-launch on macOS runners, which fails for
         # environmental reasons unrelated to the binary often enough that
         # it should report — visibly, in the run log — rather than block a
         # release. A darwin regression in the binary itself would still
@@ -192,9 +211,9 @@ jobs:
     # code runs under it — and gating on the FULL matrix via `needs` means
     # no partial asset set ever reaches the release: either every platform
     # built and smoked, or nothing is attached.
-    if: github.repository == 'noisefloor-oss/visual-diff'
-    needs: build
-    runs-on: ubuntu-latest
+    if: github.repository == 'noisefloor-oss/visual-diff' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [release, build]
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
     steps:

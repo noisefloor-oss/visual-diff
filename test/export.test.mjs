@@ -97,6 +97,10 @@ test('export: git archive payload has no dangling refs or private vocabulary', (
   });
   execFileSync('tar', ['-x', '-C', out], { input: tar });
 
+  const payloadPaths = [...walk(out, out)];
+  assert.ok(!payloadPaths.some((p) => p.startsWith('.' + 'noise/')),
+    'private review configuration must not enter a public archive');
+
   const findings = [];
   for (const rel of walk(out, out)) {
     if (SKIP_FILES.has(rel)) continue;

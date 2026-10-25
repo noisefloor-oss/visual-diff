@@ -31,7 +31,9 @@
 // border radii/widths. Radii are ELLIPTICAL per the CSS spec: each corner is
 // { rx, ry } — both components of the computed shorthand pair (the second
 // defaults to the first), with percentages resolved against the element's box
-// (horizontal % of width, vertical % of height), in CSS px.
+// (horizontal % of width, vertical % of height), in CSS px. An unsupported
+// computed component returns radiusError without radii: ring callers fail
+// closed, while box masks can still use the valid border box.
 export function probeMaskElements(selectors) {
   // The animation freeze enforced before measuring — the same no-animation
   // computed state the FR-14 init script injects and the screenshot's
@@ -70,18 +72,18 @@ export function probeMaskElements(selectors) {
   };
   // One corner of a computed border-*-radius shorthand: "h", "h v", with %
   // resolved against the box (horizontal against width, vertical against
-  // height) — the element's own border geometry, not a hand-computed number.
-  const radius = (v, width, height) => {
+  // height). Only plain computed px/% components have unambiguous geometry
+  // here; calc() and other functions stay symbolic in Chromium when they
+  // contain percentages, so report them instead of guessing a sharp corner.
+  const radius = (v, width, height, property) => {
     const comp = (s, basis) => {
-      const str = String(s);
-      if (str.endsWith('%')) {
-        const n = Number.parseFloat(str);
-        return Number.isFinite(n) ? (n / 100) * basis : 0;
-      }
-      const n = Number.parseFloat(str);
-      return Number.isFinite(n) ? n : 0;
+      const str = String(s).trim();
+      const match = /^((?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(px|%)$/i.exec(str);
+      const n = match === null ? NaN : Number(match[1]);
+      if (!Number.isFinite(n)) throw { property, value: String(v) };
+      return match[2].toLowerCase() === '%' ? (n / 100) * basis : n;
     };
-    const parts = String(v).split(' ').filter((p) => p !== '');
+    const parts = String(v).trim().split(/\s+/);
     const rx = comp(parts[0], width);
     // a single component means h == v in the shorthand — but a single
     // PERCENTAGE still resolves against its own axis's basis
@@ -104,16 +106,24 @@ export function probeMaskElements(selectors) {
       continue;
     }
     const { r, cs } = visible[0];
+    const box = { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height };
+    let radii;
+    try {
+      radii = {
+        tl: radius(cs.borderTopLeftRadius, r.width, r.height, 'border-top-left-radius'),
+        tr: radius(cs.borderTopRightRadius, r.width, r.height, 'border-top-right-radius'),
+        br: radius(cs.borderBottomRightRadius, r.width, r.height, 'border-bottom-right-radius'),
+        bl: radius(cs.borderBottomLeftRadius, r.width, r.height, 'border-bottom-left-radius'),
+      };
+    } catch (radiusError) {
+      out[name] = { matches: els.length, visible: 1, box, radiusError };
+      continue;
+    }
     out[name] = {
       matches: els.length,
       visible: 1,
-      box: { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height },
-      radii: {
-        tl: radius(cs.borderTopLeftRadius, r.width, r.height),
-        tr: radius(cs.borderTopRightRadius, r.width, r.height),
-        br: radius(cs.borderBottomRightRadius, r.width, r.height),
-        bl: radius(cs.borderBottomLeftRadius, r.width, r.height),
-      },
+      box,
+      radii,
       border: {
         top: px(cs.borderTopWidth),
         right: px(cs.borderRightWidth),

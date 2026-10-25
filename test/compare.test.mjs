@@ -2015,6 +2015,44 @@ test('a partial run compares what it holds and reports the rest as skipped', asy
       // The written report.json carries the same skipped record.
       const written = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
       assert.deepEqual(written.skipped, [{ state: 'settings', reason: 'no-capture-in-run' }]);
+
+      const recompare = await compareAt(dir);
+      assert.equal(recompare.code, 0, 'a legitimate published subset run remains re-comparable');
+      assert.deepEqual(recompare.report.skipped, [{ state: 'settings', reason: 'no-capture-in-run' }]);
+    },
+  );
+});
+
+test('a refused recompare of a damaged published run preserves its report and diff artifacts', async () => {
+  const ref = pngBuffer(4, 4);
+  await withProject(
+    SUBSET_CONFIG,
+    { 'app#01-main': ref },
+    { r1: { home: ref, settings: ref } },
+    async ({ dir, layout }) => {
+      const published = await compareAt(dir);
+      assert.equal(published.code, 0);
+      const artifacts = [
+        layout.reportJson('r1'),
+        layout.diffPng('r1', 'home'),
+        layout.diffPng('r1', 'settings'),
+      ];
+      const before = await Promise.all(artifacts.map((path) => readFile(path)));
+      assert.deepEqual((await readCurrentRun(layout)).runId, 'r1');
+
+      await rm(layout.capturePng('r1', 'settings'));
+      const refused = await compareAt(dir);
+      assert.equal(refused.code, 3);
+      assert.equal(refused.runId, 'r1');
+      assert.equal(refused.report, null);
+      assert.equal(refused.streams.out(), '');
+      assert.match(refused.streams.err(), /^noise visual-diff compare \[RUN_INCOMPLETE\]: /);
+      assert.match(refused.streams.err(), /settings\.png \(provenance without capture\)/);
+      assert.match(refused.streams.err(), /current-run was not updated/);
+
+      const after = await Promise.all(artifacts.map((path) => readFile(path)));
+      assert.deepEqual(after, before, 'the last good report and every diff heatmap survive byte-for-byte');
+      assert.deepEqual((await readCurrentRun(layout)).runId, 'r1');
     },
   );
 });

@@ -387,6 +387,32 @@ test('parser: import --only repeats and keeps the positional zip', () => {
   assert.deepEqual(p.positionals, ['x.zip']);
 });
 
+test('parser: report --diff accepts only run ids after the flag', () => {
+  for (const argv of [
+    ['report', '--diff', 'a', 'b'],
+    ['report', '--diff=a', 'b'],
+    ['report', '--json', '--diff', 'a', 'b'],
+    ['report', '--diff', 'a', '--json', 'b'],
+  ]) {
+    const p = parse(argv);
+    assert.equal(p.values.diff, 'a', JSON.stringify(argv));
+    assert.deepEqual(p.positionals, ['b'], JSON.stringify(argv));
+  }
+
+  for (const argv of [
+    ['report', 'a', '--diff', 'b'],
+    ['report', 'a', '--diff=b'],
+    ['report', 'a', '--json', '--diff', 'b'],
+    ['report', '--json', 'a', '--diff=b'],
+  ]) {
+    assert.throws(
+      () => parse(argv),
+      (err) => err.code === 'bad-diff-order' && err.exitCode === EXIT.USAGE,
+      JSON.stringify(argv),
+    );
+  }
+});
+
 // --- --browser + --auto-discover-browser (FR-29, FR-33) ----------------------
 
 test('browser flags: import accepts --browser and --auto-discover-browser', () => {
@@ -434,10 +460,28 @@ test('browser flags: --browser requires a value and never swallows a following -
   assert.throws(() => parse(['import', 'x.zip', '--browser', '--only', 'a']), /requires a value/);
 });
 
-test('browser flags: a bad --browser value is still a parser-accepted string (semantic check lives in the verb)', () => {
-  // The parser only shapes flags; the effective-mode semantics reject nonsense
-  // modes in the verbs/browser resolver. A well-formed unknown value parses.
+test('browser flags: the parser shapes values and dispatch rejects an invalid mode before the verb', () => {
+  // Parsing stays syntactic; dispatch and both browser-mode resolvers enforce
+  // the closed ws/native set, so direct verb and resolver calls fail closed too.
   assert.equal(parse(['capture', '--browser', 'ie']).values.browser, 'ie');
+  for (const verb of ['import', 'capture']) {
+    for (const mode of ['natve', 'Native']) {
+      const bag = {};
+      const s = mockStreams();
+      const code = run(
+        [verb, '--browser', mode],
+        { NOISE_BROWSER_WS: 'ws://127.0.0.1:3000/' },
+        CWD,
+        s,
+        capturingHandlers(verb, bag),
+      );
+      assert.equal(code, EXIT.USAGE, `${verb} --browser ${mode}`);
+      assert.equal(bag.options, undefined, 'the verb handler is never reached');
+      assert.equal(s.out(), '');
+      assert.match(s.err(), /^noise visual-diff \[CONFIG_ERROR\]: --browser: expected exactly "ws" or "native"/m);
+      assert.match(s.err(), /usage: noise visual-diff/);
+    }
+  }
 });
 
 test('plumbing: --browser and --auto-discover-browser reach the capture verb handler', () => {
@@ -584,6 +628,70 @@ test('e2e: real process exits 0 with an empty-state report when nothing is publi
   assert.equal(r.stderr, '');
 });
 
+test('e2e: report --diff rejects reversed and interleaved spellings before reading runs', () => {
+  for (const argv of [
+    ['report', 'a', '--diff', 'b'],
+    ['report', 'a', '--diff=b'],
+    ['report', 'a', '--json', '--diff', 'b'],
+    ['report', '--json', 'a', '--diff=b'],
+  ]) {
+    const r = spawnSync(process.execPath, [cliPath, ...argv], {
+      cwd: CWD,
+      encoding: 'utf8',
+      env: { ...process.env, NOISE_PROJECT_DIR: CWD },
+    });
+    assert.equal(r.status, EXIT.USAGE, JSON.stringify(argv));
+    assert.equal(r.stdout, '', JSON.stringify(argv));
+    assert.match(
+      r.stderr,
+      /^noise visual-diff \[bad-diff-order\]: --diff must precede both run ids: report --diff <runIdA> <runIdB>\n/,
+      JSON.stringify(argv),
+    );
+  }
+});
+
+test('e2e: documented report --diff spellings preserve A-to-B semantics', () => {
+  const dir = tmpDir('vd-cli-report-diff');
+  const runA = '20261024-000000-aaaaaa';
+  const runB = '20261024-000001-bbbbbb';
+  for (const [runId, mismatch, verdict] of [[runA, 0.4, 'fail'], [runB, 0.1, 'pass']]) {
+    const reportDir = join(dir, '.visual-diff', 'diffs', runId);
+    mkdirSync(reportDir, { recursive: true });
+    writeFileSync(join(reportDir, 'report.json'), JSON.stringify({
+      schema: 1,
+      runId,
+      command: 'compare',
+      states: {
+        home: {
+          frame: { mismatch, differingPixels: mismatch * 100, totalPixels: 100, verdict, notes: [] },
+          thresholdUsed: 1,
+          verdict,
+        },
+      },
+      exit: 0,
+    }));
+  }
+
+  for (const argv of [
+    ['report', '--json', '--diff', runA, runB],
+    ['report', `--diff=${runA}`, runB, '--json'],
+    ['report', '--diff', runA, '--json', runB],
+  ]) {
+    const r = spawnSync(process.execPath, [cliPath, ...argv], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: { ...process.env, NOISE_PROJECT_DIR: dir },
+    });
+    assert.equal(r.status, EXIT.OK, r.stderr);
+    assert.equal(r.stderr, '');
+    const output = JSON.parse(r.stdout);
+    assert.equal(output.diff.from, runA, JSON.stringify(argv));
+    assert.equal(output.diff.to, runB, JSON.stringify(argv));
+    assert.ok(Math.abs(output.diff.states.home.mismatchDelta + 0.3) < 1e-12);
+    assert.deepEqual(output.diff.flips, ['home']);
+  }
+});
+
 test('e2e: real process prints the exact suite version line', () => {
   for (const argv of [['version'], ['--version']]) {
     const r = spawnSync(process.execPath, [cliPath, ...argv], { encoding: 'utf8' });
@@ -609,6 +717,25 @@ test('e2e: real process exits 2 for an unknown verb', () => {
   const r = spawnSync(process.execPath, [cliPath, 'bogus'], { encoding: 'utf8' });
   assert.equal(r.status, EXIT.USAGE);
   assert.match(r.stderr, /unknown verb/);
+});
+
+test('e2e: real process rejects --browser typos and case variants as usage errors', () => {
+  for (const verb of ['import', 'capture']) {
+    for (const mode of ['natve', 'Native']) {
+      const r = spawnSync(process.execPath, [cliPath, verb, '--browser', mode], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          NOISE_PROJECT_DIR: CWD,
+          NOISE_BROWSER_WS: 'ws://127.0.0.1:3000/',
+        },
+      });
+      assert.equal(r.status, EXIT.USAGE, `${verb} --browser ${mode}: ${r.stderr}`);
+      assert.equal(r.stdout, '');
+      assert.match(r.stderr, /--browser: expected exactly "ws" or "native"/);
+      assert.match(r.stderr, /usage: noise visual-diff/);
+    }
+  }
 });
 
 test('e2e: real process exits 2 on an invalid NOISE_PROJECT_DIR', () => {

@@ -1,3 +1,4 @@
+import { startStaticRoot } from './static-root.mjs';
 // src/capture.mjs
 // The `capture` verb: deterministic screenshots of configured
 // implementation states, with per-capture provenance and byte-exact
@@ -47,9 +48,8 @@
 // in-process with the pinned Playwright page handle of the fresh FR-15 context.
 // Config validation already requires the file to exist.
 
-import { createServer } from 'node:http';
 import { mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { ConfigError, effectiveMasks, loadConfig, stateConfigHash } from './config.mjs';
@@ -303,135 +303,24 @@ export function buildStateUrl(state, port) {
 
 // --- static-directory serving (FR-32) -----------------------------------------
 
-const STATIC_MIME = {
-  '.html': 'text/html',
-  '.htm': 'text/html',
-  '.js': 'text/javascript',
-  '.mjs': 'text/javascript',
-  '.cjs': 'text/javascript',
-  '.css': 'text/css',
-  '.json': 'application/json',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.ttf': 'font/ttf',
-  '.otf': 'font/otf',
-  '.txt': 'text/plain',
-};
-
 // `candidate` is inside `boundary` when it equals the boundary or has the
 // boundary as a path segment. Both paths must be canonical (realpath'd).
 function isContainedIn(boundary, candidate) {
   return candidate === boundary || candidate.startsWith(boundary + sep);
 }
 
-// Serve `root` (an absolute directory) on 127.0.0.1 with an ephemeral port.
-// The served surface is exactly the real (symlink-resolved) static dir, and
-// containment is enforced AFTER symlink resolution, not lexically:
-//
-//   1. `root` is canonicalized with realpath, and when `projectDir` is given
-//      the real root must stay inside the real project directory — a
-//      staticDir that is itself a symlink escaping the project is a typed
-//      config error (exit 2), failing closed before anything is served.
-//   2. Every request joins the URL path onto the real root, realpaths the
-//      candidate target (and, for directory requests, the resolved index
-//      file), and refuses anything whose real target leaves the real root
-//      with a 403 — never a 200 with outside bytes. Dangling symlinks
-//      (realpath ENOENT) are not-found. The lexical traversal check stays as
-//      a fast path ahead of the realpath.
-//
-// Returns { port, close }.
+// Every response is opened through the helper's held os.Root. Project
+// containment is checked here for a typed config error and again by the
+// anchored project open in the helper, before it starts listening.
 export async function serveStaticDir(root, { projectDir, configPath = 'route.staticDir', log = () => {} } = {}) {
   const realRoot = await realpath(root);
-  if (projectDir !== undefined) {
-    const realProject = await realpath(projectDir);
-    if (!isContainedIn(realProject, realRoot)) {
-      throw new ConfigError(
-        configPath,
-        `static directory resolves outside the project directory: ${root} -> ${realRoot}`,
-      );
-    }
+  const realProject = projectDir === undefined ? undefined : await realpath(projectDir);
+  if (realProject !== undefined && !isContainedIn(realProject, realRoot)) {
+    throw new ConfigError(configPath, `static directory resolves outside the project directory: ${root} -> ${realRoot}`);
   }
-  const server = createServer(async (req, res) => {
-    try {
-      let pathname;
-      try {
-        pathname = decodeURIComponent((req.url || '/').split('?')[0]);
-      } catch {
-        res.statusCode = 400;
-        res.end('bad request');
-        return;
-      }
-      const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-      const full = resolve(realRoot, rel);
-      if (!isContainedIn(realRoot, full)) {
-        res.statusCode = 403;
-        res.end('forbidden');
-        return;
-      }
-      let real;
-      try {
-        real = await realpath(full);
-      } catch (err) {
-        if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
-          res.statusCode = 404;
-          res.end('not found');
-          return;
-        }
-        throw err;
-      }
-      if (!isContainedIn(realRoot, real)) {
-        res.statusCode = 403;
-        res.end('forbidden');
-        return;
-      }
-      let st;
-      try {
-        st = await stat(real);
-      } catch {
-        res.statusCode = 404;
-        res.end('not found');
-        return;
-      }
-      let file = real;
-      if (st.isDirectory()) {
-        try {
-          file = await realpath(resolve(real, 'index.html'));
-        } catch (err) {
-          if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
-            res.statusCode = 404;
-            res.end('not found');
-            return;
-          }
-          throw err;
-        }
-        if (!isContainedIn(realRoot, file)) {
-          res.statusCode = 403;
-          res.end('forbidden');
-          return;
-        }
-      }
-      const body = await readFile(file);
-      res.setHeader('content-type', STATIC_MIME[extname(file)] || 'application/octet-stream');
-      res.setHeader('content-length', body.length);
-      res.end(body);
-    } catch {
-      res.statusCode = 500;
-      res.end('internal server error');
-    }
-  });
-  await new Promise((resolveListen, rejectListen) => {
-    server.once('error', rejectListen);
-    server.listen(0, '127.0.0.1', resolveListen);
-  });
-  const port = server.address().port;
-  log(`capture: serving ${realRoot} at http://127.0.0.1:${port}/`);
-  return { port, close: () => new Promise((r) => server.close(r)) };
+  const server = await startStaticRoot(realRoot, realProject);
+  log(`capture: serving ${realRoot} at http://127.0.0.1:${server.port}/`);
+  return server;
 }
 
 // --- --serve: one ephemeral server rooted at a build's distDir -------------
@@ -665,6 +554,14 @@ async function resolveAnchoredMasks(page, masks, clipRect, stateName, { fullPage
         { code: 'MASK_SELECTOR_MATCH' },
       );
     }
+    if (mask.shape === 'ring' && probe.radiusError !== undefined) {
+      throw new CaptureError(
+        `state ${stateName}: mask ${JSON.stringify(name)} selector ${JSON.stringify(mask.selector)} has unsupported computed ` +
+          `${probe.radiusError.property} ${JSON.stringify(probe.radiusError.value)} — use plain px or % radius components; ` +
+          'refusing to guess ring geometry with a sharp-corner fallback',
+        { code: 'MASK_RADIUS_UNSUPPORTED' },
+      );
+    }
     resolved[name] = {
       selector: mask.selector,
       shape: mask.shape,
@@ -790,9 +687,17 @@ async function renderCapture({
       // boundingBox() is VIEWPORT-relative; the full-page screenshot clip and
       // the mask probes below are DOCUMENT-relative — after a setupScript
       // scroll the raw box is off by the scroll offset (shifting every
-      // anchored mask by scroll*dpr). Normalize into document coordinates.
+      // anchored mask by scroll*dpr). Normalize into document coordinates,
+      // then round once as import does so the screenshot, masks, canvas
+      // accommodation, and delivered-frame gate all use the same rect.
       const scroll = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
       clipRect = { x: box.x + scroll.x, y: box.y + scroll.y, width: box.width, height: box.height };
+      clipRect = {
+        x: Math.round(clipRect.x),
+        y: Math.round(clipRect.y),
+        width: Math.round(clipRect.width),
+        height: Math.round(clipRect.height),
+      };
     }
     // FR-38 canvas accommodation (mirrors the reference render): a page that
     // scrolls in an inner container (html,body at height:100% + overflow:auto
@@ -1321,9 +1226,9 @@ export async function runCapture(options, ctx = {}) {
     // artifact write) and any unexpected error abort the run: a run that
     // cannot be trusted must not publish, and its captures must not be
     // mistaken for a verified run. Typed errors keep their class; everything
-    // else is reported verbatim and still lands in the trust bucket. The one
-    // usage error the acquire step can raise (--auto-discover-browser under an
-    // effective service mode, FR-33) keeps the exit-2 contract.
+    // else is reported verbatim and still lands in the trust bucket. Usage
+    // errors from the acquire step (an invalid browser mode, or
+    // --auto-discover-browser under an effective service mode) keep exit 2.
     if (err instanceof ConfigError) {
       stderr.write(errorLine('noise visual-diff capture', err));
       return { code: EXIT.USAGE, runId, captures };

@@ -98,6 +98,20 @@ describe('effectiveMode (FR-33)', () => {
     assert.equal(effectiveMode({ mode: undefined, env: { NOISE_BROWSER_WS: 'ws://x/' } }), 'ws');
     assert.equal(effectiveMode({ mode: undefined, env: {} }), 'native');
   });
+  test('defined modes outside exact ws/native are usage errors', () => {
+    for (const mode of ['natve', 'Native', 'WS', '', null]) {
+      assert.throws(
+        () => effectiveMode({ mode, env: { NOISE_BROWSER_WS: 'ws://x/' } }),
+        (err) => {
+          assert.equal(err.name, 'ConfigError');
+          assert.equal(err.exitCode, 2);
+          assert.match(err.message, /^--browser: expected exactly "ws" or "native"/);
+          return true;
+        },
+        JSON.stringify(mode),
+      );
+    }
+  });
 });
 
 describe('pinFromBackend', () => {
@@ -222,6 +236,37 @@ describe('acquireBrowser matrix', () => {
     assert.deepEqual(after.states.home.route, { url: 'http://localhost:5173/' });
     assert.deepEqual(after.browser.locator, { executablePath: '/fake/browser' });
     assert.deepEqual(after.browser.rung, 1);
+  });
+
+  test('native + --auto-discover-browser re-pin preserves the complete normalized config on disk', async (t) => {
+    const dir = makeProject(t);
+    const initial = parseConfig(JSON.stringify({
+      ...STATE_DOC,
+      masks: {
+        bezel: { selector: '[data-phone-frame]', shape: 'ring', reason: 'shared device chrome' },
+      },
+      capture: { suppressCaret: true, pinAnimationPhase: true },
+    })).config;
+    await writeConfigAtomic(dir, initial);
+    const before = (await loadConfig(dir)).config;
+
+    const acquired = await acquireBrowser({
+      projectDir: dir,
+      config: before,
+      mode: 'native',
+      autoDiscover: true,
+      env: {},
+      resolveBrowser: resolveWith(),
+      now: NOW,
+    });
+
+    const committed = JSON.parse(readFileSync(configPath(dir), 'utf8'));
+    assert.deepEqual(committed.masks, before.masks, 'top-level masks survive the atomic re-pin');
+    assert.deepEqual(committed.capture, before.capture, 'capture flags survive the atomic re-pin');
+
+    const after = (await loadConfig(dir)).config;
+    assert.deepEqual(after, { ...before, browser: after.browser }, 'only the browser pin changes');
+    assert.deepEqual(acquired.config, after, 'the verb receives the complete reloaded config');
   });
 
   test('native + no flag + pin: the resolver receives the pin and reuses the config hash', async (t) => {

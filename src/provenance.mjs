@@ -63,13 +63,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { canonicalStringify, configHash } from './config.mjs';
-import { guardProjectPath, layoutFor } from './artifact-layout.mjs';
+import { guardProjectPath } from './artifact-layout.mjs';
 
 export const PROVENANCE_SCHEMA_VERSION = 1;
 export const KINDS = Object.freeze(['reference', 'capture']);
 export const MODES = Object.freeze(['ws', 'native']);
 export const OVERRIDES = Object.freeze(['ws', 'native']);
-export const BACKENDS = Object.freeze(['service-ws', 'playwright', 'agent-browser']);
 export const READINESS_POLICIES = Object.freeze(['networkidle', 'domcontentloaded', 'hydration']);
 export const RUNG_IDS = Object.freeze([1, 2, 3]);
 
@@ -715,16 +714,6 @@ function sameVendorHashes(a, b) {
     if (ka[i] !== kb[i] || a[ka[i]] !== b[kb[i]]) return false;
   }
   return true;
-}
-
-// Record paths come from the artifact layout — consumed, not
-// re-implemented.
-export function referenceRecordPath(projectDir, comp, screen) {
-  return layoutFor(projectDir).referenceProvenance(comp, screen);
-}
-
-export function captureRecordPath(projectDir, runId, state) {
-  return layoutFor(projectDir).captureProvenance(runId, state);
 }
 
 // Content hash of every file in the vendor directory, keyed by file name —

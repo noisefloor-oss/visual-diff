@@ -324,7 +324,8 @@ export function validateDependencies(html, treeRoot, compRelPath, { path: displa
  * addressing). A screen carrying the boolean `data-screen-variable-size`
  * attribute reports `variableSize: true` — the author's opt-out of the
  * importer's uniform-device-dimensions assertion. Unrecognized
- * nesting or a count outside 1–13 is a ScreenStructureError.
+ * nesting, duplicate labels or sanitized ids, or a count outside 1–13 is a
+ * ScreenStructureError.
  */
 export function enumerateScreens(html, { path: displayPath = '<comp>', allowEmpty = false } = {}) {
   if (typeof html !== 'string') {
@@ -332,6 +333,7 @@ export function enumerateScreens(html, { path: displayPath = '<comp>', allowEmpt
   }
   const screens = [];
   const seen = new Set();
+  const labelById = new Map();
   const stack = [];
   for (const tok of scanHtml(html)) {
     if (tok.type === 'open') {
@@ -384,7 +386,14 @@ export function enumerateScreens(html, { path: displayPath = '<comp>', allowEmpt
             `${displayPath}: duplicate screen label ${JSON.stringify(label)}`,
           );
         }
+        if (labelById.has(id)) {
+          throw new ScreenStructureError(
+            `${displayPath}: screen labels ${JSON.stringify(labelById.get(id))} and ` +
+              `${JSON.stringify(label)} collide on sanitized screen id ${JSON.stringify(id)}`,
+          );
+        }
         seen.add(label);
+        labelById.set(id, label);
         const variableSize = tok.attrs.has('data-screen-variable-size');
         screens.push(variableSize ? { label, id, variableSize: true } : { label, id });
         stack.push({ name: tok.name, screen: true });

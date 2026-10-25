@@ -302,6 +302,7 @@ function makeFakeBrowser({ failedFaces = [], lateFailedFaces = null, shot = SHOT
       return {
         async addInitScript() {},
         async route() {},
+        async routeWebSocket() {},
         on() {},
         async newPage() {
           const page = {

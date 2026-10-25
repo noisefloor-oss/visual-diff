@@ -21,7 +21,7 @@
 // browserRevision for pinning. Rung 1 is not a bare chromium.launch() — a
 // default headless launch resolves the registry's chromium-headless-shell
 // executable, so the candidate pins exactly that shell, derived through
-// 1.62.1-equivalent registry semantics.
+// 1.64.1-equivalent registry semantics.
 //
 // Launch verification (FR-27): a candidate only counts once it has actually
 // launched AND responded (browser.version()). File/existence checks never count
@@ -36,16 +36,17 @@
 // `playwright` is loaded lazily via createPlaywrightRequire() inside
 // loadPlaywrightClient(), so importing this module never requires the
 // dependency; tests inject a fake `client` and never touch the real one. The
-// CLI boundary (src/cli.mjs) maps BrowserResolutionError to exit 3; this
-// module throws, it never exits.
+// CLI boundary (src/cli.mjs) maps BrowserResolutionError to exit 3 and an
+// invalid --browser ConfigError to exit 2; this module throws, it never exits.
 
 import { createPlaywrightRequire } from './playwright-loader.mjs';
+import { ConfigError } from './config.mjs';
 import { access, constants, readFile } from 'node:fs/promises';
 import { homedir, release, cpus } from 'node:os';
 import { delimiter, join, dirname, isAbsolute, resolve } from 'node:path';
 
 /** Exact-pinned playwright client version (must match package.json / sidecar). */
-export const PINNED_CLIENT_VERSION = '1.62.1';
+export const PINNED_CLIENT_VERSION = '1.64.1';
 /** Connect timeout for the remote browser service WebSocket endpoint (ms). */
 export const SERVICE_CONNECT_TIMEOUT_MS = 10000;
 
@@ -147,7 +148,7 @@ async function defaultAgentBrowserExe({ which, env }) {
 // (playwright-core lib/coreBundle.js Chromium.getExecutableName), while
 // pw.chromium.executablePath() returns the full chromium entry. This tool
 // always launches headless, so the candidate must pin the headless shell by
-// construction. The path below is derived with playwright-core@1.62.1-
+// construction. The path below is derived with playwright-core@1.64.1-
 // equivalent registry semantics — executable entry selection, host/short
 // platform, executable suffix, cache root, PLAYWRIGHT_BROWSERS_PATH (incl.
 // the =0 package-local form), and browsers.json revision overrides — never by
@@ -157,7 +158,7 @@ async function defaultAgentBrowserExe({ which, env }) {
 const HEADLESS_SHELL_EXECUTABLE_PATHS = {
   '<unknown>': undefined,
   'linux-x64': ['chrome-headless-shell-linux64', 'chrome-headless-shell'],
-  'linux-arm64': ['chrome-linux', 'headless_shell'],
+  'linux-arm64': ['chrome-headless-shell-linux-arm64', 'chrome-headless-shell'],
   'mac-x64': ['chrome-headless-shell-mac-x64', 'chrome-headless-shell'],
   'mac-arm64': ['chrome-headless-shell-mac-arm64', 'chrome-headless-shell'],
   'win-x64': ['chrome-headless-shell-win64', 'chrome-headless-shell.exe'],
@@ -222,7 +223,7 @@ function parseOSReleaseText(text) {
 }
 
 /**
- * Derive the playwright host-platform label with playwright-core@1.62.1-
+ * Derive the playwright host-platform label with playwright-core@1.64.1-
  * equivalent semantics (hostPlatform.ts calculatePlatform):
  * PLAYWRIGHT_HOST_PLATFORM_OVERRIDE wins; macOS derives the mac major from
  * the Darwin kernel version and appends -arm64 on Apple silicon (mac 11+);
@@ -329,7 +330,7 @@ function managedShellDescriptor({ browsersJson, hostPlatform, registryDir }) {
 
 /**
  * Resolve the effective executable a headless chromium launch uses, through
- * playwright-core@1.62.1-equivalent registry semantics: executable entry
+ * playwright-core@1.64.1-equivalent registry semantics: executable entry
  * selection (chromium-headless-shell under this tool's always-headless
  * launch), host/short platform, executable suffix, cache root, and
  * PLAYWRIGHT_BROWSERS_PATH including the =0 package-local form, plus
@@ -408,7 +409,7 @@ async function managedPackageRoot() {
   return _managedPackageRoot;
 }
 
-/** Production rung-1 resolver: 1.62.1-equivalent registry semantics. */
+/** Production rung-1 resolver: 1.64.1-equivalent registry semantics. */
 async function defaultResolveManaged({ env }) {
   return resolveManagedShellExecutable({ env, packageRoot: await managedPackageRoot() });
 }
@@ -556,12 +557,20 @@ function assertClientVersion(version) {
 
 // --- mode selection --------------------------------------------------------
 
+export function validateBrowserMode(mode) {
+  if (mode !== undefined && mode !== 'ws' && mode !== 'native') {
+    const received = typeof mode === 'string' ? JSON.stringify(mode) : String(mode);
+    throw new ConfigError('--browser', `expected exactly "ws" or "native", got ${received}`);
+  }
+}
+
 /**
  * Resolve which mode to run. `--browser <ws|native>` (opts.mode) overrides the
  * environment-derived default. Returns { mode: 'ws'|'native', endpoint?,
  * override }.
  */
 function selectMode({ mode, env }) {
+  validateBrowserMode(mode);
   if (mode === 'native') {
     return { mode: 'native', override: 'native' };
   }
@@ -993,10 +1002,11 @@ function formatNativeFailure(probes, fixCommand) {
  * @param {function} [opts.agentBrowserExe] — injectable rung-3 resolver.
  * @param {function} [opts.resolveManaged] — injectable rung-1 resolver
  *   `({env}) => { path, browserRevision }|null`; default derives the
- *   chromium-headless-shell path through 1.62.1-equivalent registry semantics.
+ *   chromium-headless-shell path through 1.64.1-equivalent registry semantics.
  * @returns {Promise<{browser, backend, probes}>}
  *   backend: { mode, rung, backend, clientVersion, browserVersion, browserType, override, locator, browserRevision, endpoint? }
  *   probes:  structured launch-verification log (FR-26)
+ * @throws {ConfigError} on a defined mode other than exact ws/native (exit 2).
  * @throws {BrowserResolutionError} on any resolution failure (FR-25/FR-28).
  */
 export async function resolveBrowser(opts = {}) {

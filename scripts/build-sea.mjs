@@ -118,7 +118,13 @@ const assetManifestPath = join(buildDir, 'sea-assets.json');
 writeFileSync(assetManifestPath, JSON.stringify(assetManifestDoc));
 
 console.log(`[3/6] writing sea-config.json (main + assets)`);
-const assets = { manifest: assetManifestPath };
+const helperPath = join(buildDir, 'static-root');
+execFileSync('go', ['build', '-trimpath', '-ldflags=-s -w', '-o', helperPath, './static-root'], {
+  cwd: join(repoRoot, 'native'), env: { ...process.env, CGO_ENABLED: '0' }, stdio: 'inherit',
+});
+const helperHashPath = join(buildDir, 'static-root.sha256');
+writeFileSync(helperHashPath, createHash('sha256').update(readFileSync(helperPath)).digest('hex'));
+const assets = { manifest: assetManifestPath, 'static-root': helperPath, 'static-root-sha256': helperHashPath };
 for (const f of assetManifest) assets[f.name] = join(repoRoot, f.rel);
 const seaConfigPath = join(buildDir, 'sea-config.json');
 writeFileSync(

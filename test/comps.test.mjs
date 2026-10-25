@@ -334,6 +334,48 @@ test('screens: dynamic shape keeps empty, duplicate, unsanitizable, and count va
   );
 });
 
+test('screens: case-distinct labels with colliding sanitized ids fail deterministically', () => {
+  const html = '<body><figure data-screen-label="Canvas"></figure>' +
+    '<figure data-screen-label="canvas"></figure></body>';
+  assert.throws(() => enumerateScreens(html, { path: 'case.dc.html' }), (err) => {
+    assert.ok(err instanceof ScreenStructureError);
+    assert.equal(err.code, 'comp-screen-structure');
+    assert.equal(
+      err.message,
+      'case.dc.html: screen labels "Canvas" and "canvas" collide on sanitized screen id "canvas"',
+    );
+    return true;
+  });
+});
+
+test('screens: punctuation-distinct labels with colliding sanitized ids fail deterministically', () => {
+  const html = '<body><x-dc><div data-screen-label="Foo Bar"></div>' +
+    '<section data-screen-label="foo-bar"></section></x-dc></body>';
+  assert.throws(() => enumerateScreens(html, { path: 'punctuation.dc.html' }), (err) => {
+    assert.ok(err instanceof ScreenStructureError);
+    assert.equal(
+      err.message,
+      'punctuation.dc.html: screen labels "Foo Bar" and "foo-bar" collide on sanitized screen id "foo-bar"',
+    );
+    return true;
+  });
+});
+
+test('discover: rejects colliding screen ids before returning ambiguous comp records', (t) => {
+  const dir = makeTempTree(t, {
+    'colliding.dc.html': '<body><figure data-screen-label="Foo Bar"></figure>' +
+      '<figure data-screen-label="foo_bar"></figure></body>',
+  });
+  assert.throws(() => discoverComps(dir), (err) => {
+    assert.ok(err instanceof ScreenStructureError);
+    assert.equal(
+      err.message,
+      'colliding.dc.html: screen labels "Foo Bar" and "foo_bar" collide on sanitized screen id "foo-bar"',
+    );
+    return true;
+  });
+});
+
 test('screens: SCREEN_LIMITS pins the 1–13 contract', () => {
   assert.equal(SCREEN_LIMITS.min, 1);
   assert.equal(SCREEN_LIMITS.max, 13);

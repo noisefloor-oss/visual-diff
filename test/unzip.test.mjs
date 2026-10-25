@@ -197,6 +197,39 @@ test('happy path: deflate + stored, nested dirs, project tree preserved', (t) =>
   assert.equal(result.summary.totalBytes, total);
 });
 
+test('empty deflated files extract successfully', (t) => {
+  const dir = makeTempDir(t);
+  const zipPath = writeZip(dir, 'empty-deflate.zip', buildZip([
+    { path: 'empty.txt', data: Buffer.alloc(0), method: 'deflate' },
+  ]));
+
+  const result = extractDesignZip(zipPath, join(dir, 'out'));
+
+  assert.equal(readFileSync(join(dir, 'out', 'empty.txt')).length, 0);
+  assert.equal(result.entries[0].size, 0);
+  assert.equal(result.entries[0].method, 'deflate');
+  assert.deepEqual(result.summary, { files: 1, directories: 0, totalBytes: 0 });
+  assertNoTmpLeftovers(dir);
+});
+
+test('deflate output exceeding a lying declared size is a limit failure', (t) => {
+  const dir = makeTempDir(t);
+  const zipPath = writeZip(dir, 'lying-size.zip', buildZip([
+    { path: 'bomb.bin', data: 'not empty', method: 'deflate', forceUncompSize: 0 },
+  ]));
+
+  assert.throws(
+    () => extractDesignZip(zipPath, join(dir, 'out')),
+    (err) => {
+      assert.ok(err instanceof ZipLimitError);
+      assert.equal(err.code, 'zip-limit');
+      assert.match(err.message, /deflate stream exceeds its declared size/);
+      return true;
+    },
+  );
+  assertNotPublished(dir, 'out');
+});
+
 test('manifest hashes match sha256 of extracted content', (t) => {
   const dir = makeTempDir(t);
   const a = Buffer.from('payload-a');

@@ -128,6 +128,27 @@ test('probeMaskElements: radii are elliptical { rx, ry }; percentages resolve ag
   assert.deepEqual(mixedPct.m.radii.br, { rx: 10, ry: 10 });
 });
 
+test('probeMaskElements: unsupported computed radii fail measurement instead of becoming zero', () => {
+  for (const value of ['calc(50% + 10px)', 'min(10px, 20%)', '10px nonsense', '1em']) {
+    const out = probeWithFakeDom(
+      { m: '#a' },
+      { '#a': [EL({ left: 0, top: 0, width: 100, height: 50 }, { borderTopLeftRadius: value })] },
+    );
+    assert.deepEqual(out.m, {
+      matches: 1,
+      visible: 1,
+      box: { x: 0, y: 0, width: 100, height: 50 },
+      radiusError: { property: 'border-top-left-radius', value },
+    });
+    assert.equal(out.m.radii, undefined, 'no rectangular ring geometry is available downstream');
+    assert.deepEqual(
+      probeToRegion(out.m, { originX: 0, originY: 0, dpr: 1, shape: 'box' }),
+      { shape: 'box', x: 0, y: 0, width: 100, height: 50 },
+      'box masks do not consume radii and keep working',
+    );
+  }
+});
+
 test('probeMaskElements: geometry is measured under the enforced animation freeze', () => {
   // An anchor whose position is CSS-animation-dependent: getBoundingClientRect
   // returns the LIVE, timing-dependent position until the freeze stylesheet

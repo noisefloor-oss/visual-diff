@@ -78,7 +78,7 @@ import { deriveRegion, fractionToRegion, regionBounds, regionContains } from './
 import { incompatibleFields, ProvenanceError, readRecord, verifyRecord } from './provenance.mjs';
 import { readReferenceManifest, REFERENCE_MANIFEST_FILE } from './import.mjs';
 import { selectStates } from './capture.mjs';
-import { publishRun, runStatus } from './run.mjs';
+import { publishRun, RunError, runStatus } from './run.mjs';
 import { computeRunDiff, loadRunReportForDiff, renderRunDiff } from './run-diff.mjs';
 import { codedLine, errorLine } from './cli-error.mjs';
 
@@ -1531,6 +1531,17 @@ export async function runCompare(options, deps = {}) {
       throw usageError('no-comparable', 'no selected state maps to a comp — compare needs comp mappings (FR-31)');
     }
 
+    // A first compare has no report yet and is expected to be incomplete until
+    // scoring stages its artifacts. An existing report on an incomplete run is
+    // instead a published baseline that must survive this refusal untouched.
+    const initialStatus = await runStatus(layout, runId);
+    if (initialStatus.report && !initialStatus.complete) {
+      throw new RunError(
+        'RUN_INCOMPLETE',
+        `run ${runId} is not complete (missing ${initialStatus.missing.join(', ')}) — current-run was not updated`,
+      );
+    }
+
     // Subset runs: a run published by `capture --state X` holds
     // only the states it captured. Compare the selected states the run
     // actually holds and report the rest as skipped; fail closed only when
@@ -1538,7 +1549,7 @@ export async function runCompare(options, deps = {}) {
     // capture was deleted from a complete run still fails here when it was
     // the only one, and a dangling provenance record makes the run
     // unpublishable at the end — tampering cannot pass as a partial run).
-    const { captures: runCaptures } = await runStatus(layout, runId);
+    const { captures: runCaptures } = initialStatus;
     const heldSet = new Set(runCaptures);
     const absent = comparables.filter((name) => !heldSet.has(name));
     const held = comparables.filter((name) => heldSet.has(name));
@@ -1808,7 +1819,7 @@ export async function runCompare(options, deps = {}) {
     }
     return { code: report.exit, runId, report };
   } catch (err) {
-    if (err instanceof CompareError) {
+    if (err instanceof CompareError || err instanceof RunError) {
       stderr.write(errorLine('noise visual-diff compare', err));
       return { code: err.exitCode, runId, report: null };
     }

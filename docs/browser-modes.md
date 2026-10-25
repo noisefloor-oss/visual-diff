@@ -2,7 +2,7 @@
 
 - **Service mode (remote browser service):** set `NOISE_BROWSER_WS` to the
   `ws://` endpoint of any Playwright browser server — for example,
-  `npx playwright@1.62.1 run-server` prints one (the server's Playwright
+  `npx playwright@1.64.1 run-server` prints one (the server's Playwright
   version must match the tool's pinned client version). visual-diff connects
   to that WebSocket endpoint and only that one. If it is set but refused,
   the verb exits 3 — it never falls back to a local browser, and it never

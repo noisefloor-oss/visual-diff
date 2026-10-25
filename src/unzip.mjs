@@ -374,9 +374,10 @@ function inflateEntry(buf, e) {
     try {
       // maxOutputLength caps the deflate stream at the declared size, so a
       // lying header can never turn a small archive into a decompression bomb.
-      out = inflateRawSync(compressed, { maxOutputLength: e.uncompSize });
+      // zlib requires a positive cap even when the declared size is zero.
+      out = inflateRawSync(compressed, { maxOutputLength: Math.max(1, e.uncompSize) });
     } catch (err) {
-      if (err instanceof RangeError) {
+      if (err.code === 'ERR_BUFFER_TOO_LARGE') {
         throw new ZipLimitError(
           `entry ${quote(e.name)}: deflate stream exceeds its declared size`,
         );

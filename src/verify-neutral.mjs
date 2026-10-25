@@ -142,7 +142,15 @@ export async function runVerifyNeutral(options, deps = {}) {
   try {
     const compare = deps.runCompare ?? runCompare;
     res = await compare(
-      { projectDir: options.projectDir, json: false, values: {}, bools: {} },
+      {
+        projectDir: options.projectDir,
+        json: false,
+        values: {
+          threshold: baseline.thresholdOverride != null ? String(baseline.thresholdOverride) : undefined,
+          against: baseline.diff?.againstRunId,
+        },
+        bools: { force: baseline.forced === true },
+      },
       { stdout: sink, stderr: sink, log: () => {}, runId, env: options.env },
     );
   } catch (err) {

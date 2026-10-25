@@ -106,6 +106,7 @@ function makeFakeBrowser({ shot = () => Buffer.from('det-bytes') } = {}) {
         _closed: false,
         async addInitScript() {},
         async route() {},
+        async routeWebSocket() {},
         on() {},
         async newPage() {
           return page;

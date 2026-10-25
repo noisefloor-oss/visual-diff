@@ -446,8 +446,8 @@ servers, any hard-coded knowledge of a specific design or project
   otherwise), and `discoveredAt`. Effective mode resolves `--browser`
   first, then `NOISE_BROWSER_WS`, then native; discovery with effective
   mode `ws` is a usage error (exit 2). A failed ladder writes nothing and
-  leaves any existing config byte-identical; re-pinning preserves
-  operator-authored states semantically. Discovery verifies, pins, and
+  leaves any existing config byte-identical; re-pinning preserves all
+  operator-authored configuration semantically. Discovery verifies, pins, and
   reuses the same concrete executable (rung 1 pins the resolved
   headless-shell path, never the client-default full-chromium entry).
 - **FR-34** With a pin present and no `--auto-discover-browser`, the verb
@@ -553,8 +553,10 @@ servers, any hard-coded knowledge of a specific design or project
   resolve to pixel geometry at capture/import render time, recorded in each
   side's provenance (`inputs.masks`); `shape: "ring"` masks the element's
   border band for device bezels, corners following the element's computed
-  elliptical radii (`{ rx, ry }` per corner, percentages resolved at probe
-  time). A top-level
+  elliptical radii (`{ rx, ry }` per corner, horizontal/vertical percentages
+  resolved at probe time against the border-box width/height). Computed radii
+  must have plain `px`/`%` components: `calc()` and other unsupported values
+  fail render measurement (exit 3), never a zero-radius fallback. A top-level
   `masks` block declares masks shared by every state (state-local same-name
   overrides). Anchors must resolve to exactly one **visible** element at
   render time (exit 3 otherwise); only pixels masked on **both** sides of the

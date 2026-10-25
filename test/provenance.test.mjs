@@ -9,12 +9,10 @@ import { configHash, parseConfig, stateConfigHash } from '../src/config.mjs';
 import {
   PROVENANCE_SCHEMA_VERSION,
   ProvenanceError,
-  captureRecordPath,
   createRecord,
   hashFile,
   incompatibleFields,
   readRecord,
-  referenceRecordPath,
   sha256Hex,
   stringifyRecord,
   vendorHashesFor,
@@ -432,14 +430,6 @@ test('createRecord rejects misuse with an argument error (exit 2)', () => {
   argErr(() => createRecord({ kind: 'capture', artifactPath: 'x.png', artifactBytes: 'b', renderer: RENDERER, inputs: { ...INPUTS, viewport: undefined } }));
   argErr(() => createRecord({ kind: 'capture', artifactPath: 'x.png', artifactBytes: 'b', renderer: RENDERER, inputs: { ...INPUTS, readiness: { policy: 'networkidle', timeout: 0, settle: 0 } } }));
   argErr(() => createRecord({ kind: 'capture', artifactPath: 'x.png', artifactBytes: 'b', renderer: RENDERER, inputs: { ...INPUTS, vendorHashes: { bad: 'nope' } } }));
-});
-
-test('record paths come from the artifact layout', async () => {
-  await withProject(async (proj) => {
-    assert.equal(referenceRecordPath(proj, 'comp', 'screen'), join(proj, '.visual-diff', 'references', 'comp#screen.provenance.json'));
-    assert.equal(referenceRecordPath(proj, 'comp'), join(proj, '.visual-diff', 'references', 'comp.provenance.json'));
-    assert.equal(captureRecordPath(proj, '20260812T153000Z', 'dashboard'), join(proj, '.visual-diff', 'captures', '20260812T153000Z', 'dashboard.provenance.json'));
-  });
 });
 
 test('vendorHashesFor hashes every vendor file deterministically', async () => {

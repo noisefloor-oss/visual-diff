@@ -963,6 +963,14 @@ async function renderCompScreen({
               `in ${url} (${targetDesc}) — it must match exactly one visible element`,
           );
         }
+        if (m.shape === 'ring' && probe.radiusError !== undefined) {
+          throw trustError(
+            'comp-mask-radius-unsupported',
+            `mask ${JSON.stringify(name)} compSelector ${JSON.stringify(m.compSelector)} has unsupported computed ` +
+              `${probe.radiusError.property} ${JSON.stringify(probe.radiusError.value)} in ${url} (${targetDesc}) — ` +
+              'use plain px or % radius components; refusing to guess ring geometry with a sharp-corner fallback',
+          );
+        }
         masks[name] = {
           compSelector: m.compSelector,
           shape: m.shape,
@@ -1132,6 +1140,8 @@ async function repairSkippedCompMasks({
     }
     }
     for (const { stateName, state } of drivenStates.get(key) ?? []) {
+      const manifestScreen = oldEntry?.screens?.find((s) => s.id === `${screen.id}@${stateName}`);
+      if (manifestScreen === undefined) continue;
       const driveMasks = Object.fromEntries(
         Object.entries(effectiveMasks(config, state))
           .filter(([, m]) => m.selector !== undefined && m.compSelector !== undefined)

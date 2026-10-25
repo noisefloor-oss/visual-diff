@@ -313,6 +313,7 @@ function makeFakeBrowser({ implDrift = false } = {}) {
       const ctx = {
         async addInitScript() {},
         async route() {},
+        async routeWebSocket() {},
         on() {},
         async newPage() {
           return makeFakePage(browser);
