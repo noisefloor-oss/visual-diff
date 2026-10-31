@@ -1587,7 +1587,10 @@ export async function runCompare(options, deps = {}) {
     for (const s of staged) {
       const units = sectionScope.length > 0
         ? sectionScope.map((name) => ({ label: `${s.stateName} section ${name}`, threshold: effectiveThreshold(s.state.sections[name], override) }))
-        : [{ label: s.stateName, threshold: effectiveThreshold(s.state, override) }];
+        : [
+            { label: s.stateName, threshold: effectiveThreshold(s.state, override) },
+            ...Object.keys(s.state.sections).map((name) => ({ label: `${s.stateName} section ${name}`, threshold: effectiveThreshold(s.state.sections[name], override) })),
+          ];
       for (const unit of units) {
         if (thresholdFraction(unit.threshold) < s.noiseFloor) {
           offenders.push(`${unit.label}: threshold ${unit.threshold}% < noise floor ${(s.noiseFloor * 100).toFixed(4)}%`);

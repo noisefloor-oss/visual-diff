@@ -1869,6 +1869,19 @@ test('a known delta scores exactly and flips the exit code over/under threshold'
   });
 });
 
+test('an unscoped run refuses a section threshold below the noise floor', async () => {
+  const ref = pngBuffer(4, 4);
+  const config = structuredClone(FLOOR_CONFIG);
+  config.states.home.threshold = 100;
+  config.states.home.sections = { header: { x: 0, y: 0, width: 1, height: 1, threshold: 20 } };
+  await withProject(config, { 'app#01-main': ref }, { r1: { home: ref } }, async ({ dir }) => {
+    const res = await compareAt(dir);
+    assert.equal(res.code, 2);
+    assert.equal(res.report, null);
+    assert.match(res.streams.err(), /home section header: threshold 20% < noise floor 30\.0000%/);
+  }, { manifest: FLOORY_MANIFEST });
+});
+
 test('--section scopes BOTH the evaluated sections and the exit code (FR-20/21)', async () => {
   // left half red: frame mismatch 0.5, header (left) 1.0, footer (right) 0
   const ref = pngBuffer(4, 4);

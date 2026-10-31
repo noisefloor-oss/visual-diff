@@ -211,6 +211,26 @@ const REVIEWED_SITES = [
       'literal fallback is the only code this site can introduce.',
     codes: ['comp-error'],
   },
+  {
+    file: 'src/playwright-loader.mjs',
+    snippet: 'throw refusal(',
+    reason:
+      'verifyCache uses one local refusal factory for every integrity failure; the ' +
+      'factory assigns the same code to marker, missing-file, and hash mismatches.',
+    codes: ['sea-cache-integrity'],
+  },
+  {
+    file: 'src/playwright-loader.mjs',
+    snippet: '`timed out waiting for SEA asset cache lock ${lockPath}${owner}; `',
+    reason: 'The lock timeout attaches its stable code directly to the thrown error.',
+    codes: ['sea-cache-lock-timeout'],
+  },
+  {
+    file: 'src/playwright-loader.mjs',
+    snippet: '`SEA asset integrity mismatch for ${entry.rel} `',
+    reason: 'The embedded asset mismatch attaches its stable code directly to the thrown error.',
+    codes: ['sea-asset-mismatch'],
+  },
 ];
 
 const surface = collectErrorSurface(join(repoRoot, 'src'), repoRoot, { allowlist: REVIEWED_SITES });

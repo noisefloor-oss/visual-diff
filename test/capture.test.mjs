@@ -323,7 +323,14 @@ describe('selectStates', () => {
 // ===========================================================================
 
 describe('buildStateUrl', () => {
-  test('a route.url is used verbatim', () => {
+  test('a route.url keeps its path and gains configured params', () => {
+    assert.equal(
+      buildStateUrl({ route: { url: 'https://example.test/path?old=1#frag', params: { mode: 'a b', count: 2 } } }),
+      'https://example.test/path?old=1&mode=a+b&count=2#frag',
+    );
+  });
+
+  test('a route.url without params retains its components', () => {
     assert.equal(buildStateUrl({ route: { url: 'https://example.com/app?x=1' } }, undefined), 'https://example.com/app?x=1');
   });
 
@@ -360,7 +367,7 @@ describe('determinism stack', () => {
     const fn = freezeDateNowInitScript();
     const src = fn.toString();
     assert.match(src, /1700000000000/);
-    assert.match(src, /globalThis\.Date = new Proxy/);
+    assert.match(src, /globalThis\.Date = FrozenDate/);
   });
 
   test('antiAnimationInitScript serializes the kill-switch stylesheet', () => {
@@ -382,7 +389,7 @@ describe('determinism stack', () => {
     const ctx = browser._contexts[0];
     assert.equal(ctx._initScripts.length, 3, 'Date freeze, anti-animation, and instant-scroll scripts');
     // The freeze script bakes a fixed clock; the stylesheet kills animation.
-    assert.match(ctx._initScripts[0].toString(), /globalThis\.Date = new Proxy/);
+    assert.match(ctx._initScripts[0].toString(), /globalThis\.Date = FrozenDate/);
     assert.match(ctx._initScripts[1].toString(), /createElement\("style"\)/);
     assert.match(ctx._initScripts[2].toString(), /scrollIntoView/);
   });
@@ -2557,7 +2564,7 @@ describe('capture --serve', () => {
   test('a loopback route URL is rewritten onto the ephemeral server (path + query kept)', async () => {
     const dir = await projWithDist({
       states: {
-        home: { route: { url: 'http://127.0.0.1:8899/app?tab=a' }, readiness: READY, threshold: 1 },
+        home: { route: { url: 'http://127.0.0.1:8899/app?tab=a', params: { tab: 'settings', mode: 'a b', enabled: true } }, readiness: READY, threshold: 1 },
       },
     });
     const browser = makeFakeBrowser({ shot: () => Buffer.from('png') });
@@ -2568,7 +2575,7 @@ describe('capture --serve', () => {
     );
     assert.equal(r.code, EXIT.OK, s.err());
     const opened = browser._contexts[0]._page._calls.goto[0].url;
-    assert.match(opened, /^http:\/\/127\.0\.0\.1:\d+\/app\?tab=a$/);
+    assert.match(opened, /^http:\/\/127\.0\.0\.1:\d+\/app\?tab=settings&mode=a\+b&enabled=true$/);
     assert.doesNotMatch(opened, /:8899/, 'the configured origin never answers');
   });
 

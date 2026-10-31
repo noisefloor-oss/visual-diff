@@ -335,6 +335,7 @@ export function enumerateScreens(html, { path: displayPath = '<comp>', allowEmpt
   const seen = new Set();
   const labelById = new Map();
   const stack = [];
+  const voidElements = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
   for (const tok of scanHtml(html)) {
     if (tok.type === 'open') {
       if (tok.attrs.has('data-screen-label')) {
@@ -396,10 +397,10 @@ export function enumerateScreens(html, { path: displayPath = '<comp>', allowEmpt
         labelById.set(id, label);
         const variableSize = tok.attrs.has('data-screen-variable-size');
         screens.push(variableSize ? { label, id, variableSize: true } : { label, id });
-        stack.push({ name: tok.name, screen: true });
+        if (!tok.selfClosing && !voidElements.has(tok.name)) stack.push({ name: tok.name, screen: true });
         continue;
       }
-      stack.push({ name: tok.name });
+      if (!tok.selfClosing && !voidElements.has(tok.name)) stack.push({ name: tok.name });
     } else if (tok.type === 'close') {
       const idx = stack.map((frame) => frame.name).lastIndexOf(tok.name);
       if (idx >= 0) stack.splice(idx);

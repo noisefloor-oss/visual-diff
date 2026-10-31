@@ -10,12 +10,10 @@
 //
 //   noise visual-diff verify-neutral
 //
-// Safety: the published run's diffs/<run-id>/ directory is moved aside before
-// the re-compare and RESTORED when the re-run drifts or refuses — a drifting
-// verification must never destroy the baseline it is checked against (review
-// contract). A neutral re-run regenerates byte-identical artifacts by
-// determinism, so the fresh directory simply stays and the pointer never
-// moves.
+// Safety: the re-compare writes an isolated run, so a drifting, interrupted,
+// or refusing verification can never destroy the published baseline. Cleanup
+// waits for the writer to stop, removes only the isolated output, and restores
+// the published pointer.
 //
 // Exit codes returned by runVerifyNeutral():
 //   0  neutral: every number reproduced exactly
@@ -24,13 +22,13 @@
 //   3  trust: the published report.json is unreadable/corrupt, or the
 //      re-compare itself refused (provenance gate, config error, ...)
 
-import { rename, rm } from 'node:fs/promises';
+import { access, cp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { LayoutError, layoutFor } from './artifact-layout.mjs';
 import { loadPublishedReport, ReportError } from './report.mjs';
-import { readCurrentRun, RunError } from './run.mjs';
+import { isRunComplete, publishRun, readCurrentRun, RunError } from './run.mjs';
 import { runCompare } from './compare.mjs';
 import { codedLine, errorLine } from './cli-error.mjs';
 
@@ -80,7 +78,7 @@ function diffState(name, oldS, newS) {
  * re-run). Never throws past the typed boundary and never calls process.exit.
  */
 export async function runVerifyNeutral(options, deps = {}) {
-  const { stdout = process.stdout, stderr = process.stderr } = deps;
+  const { stdout = process.stdout, stderr = process.stderr, process: host = process } = deps;
 
   let layout;
   try {
@@ -126,36 +124,75 @@ export async function runVerifyNeutral(options, deps = {}) {
     throw err;
   }
 
-  // Move the published run's diff directory aside: a drifting or refusing
-  // re-compare must leave the shipped numbers on disk untouched.
-  const runDir = join(layout.diffsDir, runId);
-  const backupDir = join(layout.diffsDir, `${runId}.verify-neutral-backup-${randomUUID()}`);
-  await rename(runDir, backupDir);
+  const requiredArtifacts = Object.keys(baseline.states).flatMap((name) => [
+    layout.capturePng(runId, name),
+    layout.captureProvenance(runId, name),
+    layout.diffPng(runId, name),
+  ]);
+  const artifactsPresent = await Promise.all(requiredArtifacts.map((path) => access(path).then(() => true, () => false)));
+  if (!(await isRunComplete(layout, runId)) || artifactsPresent.some((present) => !present)) {
+    stderr.write(
+      codedLine(
+        'noise visual-diff verify-neutral',
+        'recompare-refused',
+        `re-compare of run ${runId} refused (exit 3) — the published baseline is incomplete and was restored untouched`,
+      ),
+    );
+    return { code: 3, runId, rows: [] };
+  }
+
+  // Verification writes into an isolated run, so an active writer can never
+  // damage the published baseline. Finalization waits for that writer to stop,
+  // restores the published pointer, then removes only the isolated output.
+  const verificationRunId = `verify-${randomUUID()}`;
+  const verificationDir = join(layout.diffsDir, verificationRunId);
+  await cp(layout.captureDir(runId), layout.captureDir(verificationRunId), { recursive: true });
+  let comparePromise;
+  let restoration = null;
+  const restoreBaseline = () => {
+    restoration ??= (async () => {
+      await comparePromise.catch(() => {});
+      if ((await readCurrentRun(layout))?.runId !== runId) await publishRun(layout, runId);
+      await rm(verificationDir, { recursive: true, force: true });
+      await rm(layout.captureDir(verificationRunId), { recursive: true, force: true });
+    })();
+    return restoration;
+  };
+  const restoreOnSignal = async (signal) => {
+    await restoreBaseline();
+    host.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  host.once('SIGINT', restoreOnSignal);
+  host.once('SIGTERM', restoreOnSignal);
+  const clearSignalHandlers = () => {
+    host.removeListener('SIGINT', restoreOnSignal);
+    host.removeListener('SIGTERM', restoreOnSignal);
+  };
+  try {
 
   // Re-run compare over the same run's captures with the CURRENT binary.
   // compare's own stdout is swallowed; this command prints the verdict table.
-  // ANY failure after the rename — refusal or an unexpected throw — restores
-  // the baseline: verification can never strand the published run.
 
   const sink = { write: () => true };
   let res;
   try {
     const compare = deps.runCompare ?? runCompare;
-    res = await compare(
+    comparePromise = compare(
       {
         projectDir: options.projectDir,
         json: false,
         values: {
+          runId,
           threshold: baseline.thresholdOverride != null ? String(baseline.thresholdOverride) : undefined,
           against: baseline.diff?.againstRunId,
         },
         bools: { force: baseline.forced === true },
       },
-      { stdout: sink, stderr: sink, log: () => {}, runId, env: options.env },
+      { stdout: sink, stderr: sink, log: () => {}, runId: verificationRunId, env: options.env },
     );
+    res = await comparePromise;
   } catch (err) {
-    await rm(runDir, { recursive: true, force: true });
-    await rename(backupDir, runDir);
+    await restoreBaseline();
     stderr.write(
       errorLine(
         'noise visual-diff verify-neutral',
@@ -169,8 +206,7 @@ export async function runVerifyNeutral(options, deps = {}) {
   if (res.report === null) {
     // A refusal (provenance gate, config error, missing input) is never
     // neutrality — restore the baseline and report trust, per the exit map.
-    await rm(runDir, { recursive: true, force: true });
-    await rename(backupDir, runDir);
+    await restoreBaseline();
     stderr.write(
       codedLine(
         'noise visual-diff verify-neutral',
@@ -215,14 +251,9 @@ export async function runVerifyNeutral(options, deps = {}) {
   }
 
   const drifted = rows.filter((r) => r.drifts.length > 0);
-  if (drifted.length > 0) {
-    // Drift: the baseline wins — restore the shipped numbers; the drifting
-    // re-run is removed (re-run the command to regenerate it as evidence).
-    await rm(runDir, { recursive: true, force: true });
-    await rename(backupDir, runDir);
-  } else {
-    await rm(backupDir, { recursive: true, force: true });
-  }
+  // Neutral output is byte-identical, so restoring the baseline is equivalent
+  // and lets normal finalization and signal cleanup share one operation.
+  await restoreBaseline();
 
   stdout.write(`verify-neutral: run ${runId} re-compared with the current binary\n`);
   for (const r of rows) {
@@ -238,4 +269,7 @@ export async function runVerifyNeutral(options, deps = {}) {
   }
   stdout.write(`verify-neutral: DRIFT in ${drifted.length} state(s) — baseline restored; do not adopt this binary for the gate\n`);
   return { code: 1, runId, rows };
+  } finally {
+    clearSignalHandlers();
+  }
 }

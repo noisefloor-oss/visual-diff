@@ -5,14 +5,21 @@ export function frozenClockScriptSource(now) {
     const NativeDate = Date;
     const frozen = ${now};
     const frozenNow = () => frozen;
-    globalThis.Date = new Proxy(NativeDate, {
+    const FrozenDate = new Proxy(NativeDate, {
       apply() { return new NativeDate(frozen).toString(); },
       construct(target, args, newTarget) {
         return Reflect.construct(target, args.length === 0 ? [frozen] : args, newTarget);
       },
       get(target, property, receiver) {
-        return property === 'now' ? frozenNow : Reflect.get(target, property, receiver);
+        if (property === 'now') return frozenNow;
+        return Reflect.get(target, property, receiver);
+      },
+      getOwnPropertyDescriptor(target, property) {
+        if (property === 'now') return { configurable: true, enumerable: false, writable: false, value: frozenNow };
+        return Reflect.getOwnPropertyDescriptor(target, property);
       },
     });
+    NativeDate.prototype.constructor = FrozenDate;
+    globalThis.Date = FrozenDate;
   })();`;
 }

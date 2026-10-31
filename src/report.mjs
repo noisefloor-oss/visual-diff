@@ -105,9 +105,10 @@ function pct(v) {
  * run is a trust failure: the pointer no longer names a consumable run.
  */
 export async function loadPublishedReport(layout, runId) {
+  const path = layout.reportJson(runId);
   let text;
   try {
-    text = await readFile(layout.reportJson(runId), 'utf8');
+    text = await readFile(path, 'utf8');
   } catch (err) {
     throw reportError(
       'REPORT_JSON_UNREADABLE',

@@ -205,6 +205,31 @@ test('screens: data-screen-variable-size rides the entry as variableSize', () =>
   ]);
 });
 
+test('screens: void and self-closing elements do not become screen parents', () => {
+  const html = '<html><body><x-dc><div data-screen-label="One"><img><br><custom />' +
+    '</div><div data-screen-label="Two"></div></x-dc></body></html>';
+  assert.deepEqual(enumerateScreens(html), [
+    { label: 'One', id: 'one' },
+    { label: 'Two', id: 'two' },
+  ]);
+});
+
+test('screens: a static void element does not hide the following screen', () => {
+  const html = '<html><body><img><figure data-screen-label="One"></figure></body></html>';
+  assert.deepEqual(enumerateScreens(html), [{ label: 'One', id: 'one' }]);
+});
+
+test('screens: labeled void elements enumerate and nested labels still fail', () => {
+  assert.deepEqual(
+    enumerateScreens('<x-dc><img data-screen-label="One"></x-dc>'),
+    [{ label: 'One', id: 'one' }],
+  );
+  assert.throws(
+    () => enumerateScreens('<x-dc><div data-screen-label="Outer"><img data-screen-label="Inner"></div></x-dc>'),
+    /nested inside another screen/,
+  );
+});
+
 test('screens: nested screen figure fails with a clear diagnostic (FR-10)', () => {
   const html = readFixture('samples/nested.dc.html');
   assert.throws(() => enumerateScreens(html, { path: 'nested.dc.html' }), (err) => {

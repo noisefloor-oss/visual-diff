@@ -16,6 +16,11 @@ test('freezes every no-argument Date form without changing explicit dates', () =
     instance: new Date() instanceof Date,
     parsed: Date.parse('2020-01-01T00:00:00.000Z'),
     utc: Date.UTC(2020, 0, 1),
+    prototypeNow: Date.prototype.constructor.now(),
+    prototypeConstructed: new Date.prototype.constructor().getTime(),
+    instanceConstructed: new (new Date()).constructor().getTime(),
+    descriptorNow: Object.getOwnPropertyDescriptor(Date, 'now').value(),
+    staticConstructor: Date.constructor('return 1')(),
   })`, context);
   assert.equal(values.now, 1_700_000_000_000);
   assert.equal(values.constructed, values.now);
@@ -24,6 +29,11 @@ test('freezes every no-argument Date form without changing explicit dates', () =
   assert.equal(values.undefinedArgument, true);
   assert.equal(values.instance, true);
   assert.equal(values.parsed, values.utc);
+  assert.equal(values.prototypeNow, values.now);
+  assert.equal(values.prototypeConstructed, values.now);
+  assert.equal(values.instanceConstructed, values.now);
+  assert.equal(values.descriptorNow, values.now);
+  assert.equal(values.staticConstructor, 1);
 });
 
 test('rejects an unsafe frozen-clock literal', () => {

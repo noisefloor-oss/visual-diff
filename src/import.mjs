@@ -235,15 +235,19 @@ const MIME_BY_EXT = {
 
 // --- Determinism init scripts (FR-14), applied before every comp render ------
 
-const DETERMINISM_SCRIPTS = Object.freeze([
+export const DETERMINISM_SCRIPTS = Object.freeze([
   {
     content: frozenClockScriptSource(FROZEN_NOW),
   },
   {
     content: [
-      "(() => { const s = document.createElement('style');",
+      "(() => { const install = () => { if (!document.documentElement) return false;",
+      "const s = document.createElement('style');",
       "s.textContent = '*,*::before,*::after{animation:none!important;animation-duration:0s!important;transition:none!important;scroll-behavior:auto!important}';",
-      "document.head.appendChild(s); })();",
+      "document.documentElement.appendChild(s); return true; };",
+      "if (install()) return;",
+      "const observer = new MutationObserver(() => { if (install()) observer.disconnect(); });",
+      "observer.observe(document, { childList: true, subtree: true }); })();",
     ].join('\n'),
   },
   { content: INSTANT_SCROLL_SCRIPT },

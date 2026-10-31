@@ -379,6 +379,21 @@ describe('trust failures (exit 3)', () => {
     });
   });
 
+  test('loadPublishedReport preserves a report path escape', async () => {
+    const layout = {
+      reportJson() {
+        const err = new Error('report path escapes the project');
+        err.code = 'PATH_ESCAPE';
+        err.exitCode = 3;
+        throw err;
+      },
+    };
+    await assert.rejects(
+      () => loadPublishedReport(layout, RUN),
+      (err) => err.code === 'PATH_ESCAPE' && err.exitCode === 3 && !(err instanceof ReportError),
+    );
+  });
+
   test('loadPublishedReport throws typed ReportError (exit 3)', async () => {
     await withProject(async (dir, layout) => {
       const report = join(dir, '.visual-diff', 'diffs', RUN, 'report.json');

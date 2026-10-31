@@ -33,6 +33,7 @@ import { deflateRawSync, deflateSync, crc32 } from 'node:zlib';
 
 import {
   DEFAULT_VIEWPORT,
+  DETERMINISM_SCRIPTS,
   DEVICE_SCALE_FACTOR,
   FROZEN_NOW,
   IMPORT_LOCK_FILE,
@@ -630,6 +631,28 @@ describe('decodePng', () => {
     ]);
     assert.throws(() => decodePng(interlaced), /interlaced/);
   });
+});
+
+test('anti-animation init installs as soon as the document element exists', () => {
+  const appended = [];
+  let observe;
+  const document = {
+    head: null,
+    documentElement: null,
+    createElement: (name) => ({ name, textContent: '' }),
+  };
+  class MutationObserver {
+    constructor(callback) { this.callback = callback; }
+    observe() { observe = this.callback; }
+    disconnect() {}
+  }
+  new Function('document', 'MutationObserver', DETERMINISM_SCRIPTS[1].content)(document, MutationObserver);
+  assert.equal(appended.length, 0);
+  document.documentElement = { appendChild: (node) => appended.push(node) };
+  observe();
+  assert.equal(appended.length, 1);
+  assert.equal(appended[0].name, 'style');
+  assert.match(appended[0].textContent, /animation:none!important/);
 });
 
 describe('pixelDisagreement / measureNoiseFloor', () => {

@@ -440,6 +440,24 @@ describe('atomic pin commit and failure preservation', () => {
     assert.ok(!exists(dir, configPath), 'no config file on a fresh project');
   });
 
+  test('an invalid relative pin is rejected without replacing the existing config', async (t) => {
+    const dir = makeProject(t);
+    await writeConfigAtomic(dir, STATE_CONFIG());
+    const before = readFileSync(configPath(dir), 'utf8');
+    await assert.rejects(
+      acquireBrowser({
+        projectDir: dir,
+        config: (await loadConfig(dir)).config,
+        mode: 'native',
+        autoDiscover: true,
+        env: {},
+        resolveBrowser: resolveWith({ ...BACKEND, locator: { executablePath: 'relative/browser' } }),
+      }),
+      (err) => err.name === 'ConfigError' && /must be an absolute path/.test(err.message),
+    );
+    assert.equal(readFileSync(configPath(dir), 'utf8'), before);
+  });
+
   test('the pin write is temp+rename: no .tmp leftovers survive', async (t) => {
     const dir = makeProject(t);
     await acquireBrowser({

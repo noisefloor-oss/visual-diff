@@ -177,6 +177,34 @@ test('a stale lock times out with a manual-removal diagnostic and is preserved',
   assert.deepEqual(readdirSync(dirname(cacheDir)), [`${basename(cacheDir)}.lock`]);
 });
 
+test('SEA failures expose their documented error codes', async () => {
+  {
+    const { sea, manifest } = fakeSea(ASSETS, { version: '9.9.9-integrity-code' });
+    await materializeToCache(sea, cacheRoot);
+    writeFileSync(join(cacheDirOf(manifest), '.complete'), 'foreign');
+    await assert.rejects(
+      () => materializeToCache(sea, cacheRoot),
+      (err) => err.code === 'sea-cache-integrity',
+    );
+  }
+  {
+    const { sea, manifest } = fakeSea(ASSETS, { version: '9.9.9-asset-code' });
+    manifest.files[0].sha256 = '0'.repeat(64);
+    await assert.rejects(
+      () => materializeToCache(sea, cacheRoot),
+      (err) => err.code === 'sea-asset-mismatch',
+    );
+  }
+  {
+    const { sea, manifest } = fakeSea(ASSETS, { version: '9.9.9-lock-code' });
+    mkdirSync(`${cacheDirOf(manifest)}.lock`, { recursive: true });
+    await assert.rejects(
+      () => materializeToCache(sea, cacheRoot, { lockTimeoutMs: 20 }),
+      (err) => err.code === 'sea-cache-lock-timeout',
+    );
+  }
+});
+
 test('concurrent cold processes publish one complete cache', { timeout: 30000 }, async (t) => {
   const { manifest } = fakeSea(ASSETS, { version: '9.9.9-concurrent-cold' });
   const results = await runWorkers(t, manifest, 6, { holdFirstAsset: true });

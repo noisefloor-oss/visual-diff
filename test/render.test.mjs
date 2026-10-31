@@ -493,7 +493,7 @@ describe('renderPage with faked page/routing', () => {
     const page = makeFakePage();
     const browser = makeFakeBrowser(page);
     await renderPage({ browser, url: 'http://127.0.0.1:1/', contextOptions: { viewport: { width: 1502, height: 818 }, deviceScaleFactor: 2 } });
-    assert.deepEqual(browser._contexts[0]._opts, { viewport: { width: 1502, height: 818 }, deviceScaleFactor: 2 });
+    assert.deepEqual(browser._contexts[0]._opts, { viewport: { width: 1502, height: 818 }, deviceScaleFactor: 2, serviceWorkers: 'block' });
   });
 
   test('contextInitScripts run on the fresh context before the page exists (FR-14 hook)', async () => {

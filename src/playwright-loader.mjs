@@ -33,11 +33,13 @@ function sha256hex(buf) {
 // file must hash to its manifest entry. Any deviation is a hard error —
 // a corrupt cache is refused, never silently reused or repaired.
 async function verifyCache(cacheDir, marker, manifest) {
-  const refusal = (why) =>
+  const refusal = (why) => Object.assign(
     new Error(
       `SEA asset cache failed integrity verification (${why}); ` +
         `remove ${cacheDir} to force a clean re-materialization`,
-    );
+    ),
+    { code: 'sea-cache-integrity' },
+  );
   let markerContent;
   try {
     markerContent = await readFile(marker, 'utf8');
@@ -95,11 +97,11 @@ async function acquireCacheLock(cacheDir, timeoutMs) {
         .then((text) => JSON.parse(text))
         .catch(() => null);
       const owner = Number.isInteger(holder?.pid) ? ` (owner pid ${holder.pid})` : '';
-      throw new Error(
+      throw Object.assign(new Error(
         `timed out waiting for SEA asset cache lock ${lockPath}${owner}; ` +
           'another process may still be materializing the cache. If no other ' +
           `noise-visual-diff process is running, remove ${lockPath} manually and retry`,
-      );
+      ), { code: 'sea-cache-lock-timeout' });
     }
     await delay(Math.min(LOCK_RETRY_MS, Math.max(0, deadline - Date.now())));
   }
@@ -140,10 +142,10 @@ export async function materializeToCache(
       const buf = Buffer.from(await (await sea.getAssetAsBlob(entry.name)).arrayBuffer());
       const sha = sha256hex(buf);
       if (sha !== entry.sha256) {
-        throw new Error(
+        throw Object.assign(new Error(
           `SEA asset integrity mismatch for ${entry.rel} ` +
             `(want ${entry.sha256}, got ${sha})`,
-        );
+        ), { code: 'sea-asset-mismatch' });
       }
       const dest = join(stagingDir, entry.rel);
       await mkdir(dirname(dest), { recursive: true });

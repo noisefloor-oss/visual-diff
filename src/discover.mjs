@@ -27,7 +27,7 @@
 
 import { layoutFor } from './artifact-layout.mjs';
 import { BrowserResolutionError, resolveBrowser, validateBrowserMode } from './browser.mjs';
-import { ConfigError, configHash, configToDocument, loadConfig, writeConfigAtomic } from './config.mjs';
+import { ConfigError, configHash, configToDocument, loadConfig, validateConfig, writeConfigAtomic } from './config.mjs';
 
 /**
  * Effective browser mode: `--browser <ws|native>` wins; else
@@ -141,6 +141,7 @@ export async function acquireBrowser({
     const pin = pinFromBackend(resolved.backend, now());
     const oldPin = config && config.browser !== undefined ? config.browser : null;
     const next = withBrowserPin(config, pin);
+    validateConfig({ version: 1, states: {}, browser: next.browser }, { projectDir });
     const configPath = layoutFor(projectDir).configFile;
     log(`native discovery: old pin ${describePin(oldPin)}`);
     log('native discovery: probed candidates — see the launch-verify log above');

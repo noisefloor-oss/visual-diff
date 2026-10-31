@@ -279,12 +279,16 @@ export function selectStates(config, requested) {
   return { names: names.sort((a, b) => order.get(a) - order.get(b)) };
 }
 
-// The URL the harness actually opens (FR-32): a route.url is used verbatim; a
-// route.staticDir state is served on loopback at `port` with any params as the
-// query string.
+// The URL the harness actually opens (FR-32): a route.url keeps its existing
+// components and merges any params into its query string; a route.staticDir
+// state is served on loopback at `port` with any params as the query string.
 export function buildStateUrl(state, port) {
   if (state.route.url !== undefined) {
-    return state.route.url;
+    const url = new URL(state.route.url);
+    for (const [key, value] of Object.entries(state.route.params ?? {})) {
+      url.searchParams.set(key, String(value));
+    }
+    return url.toString();
   }
   if (port === undefined || port === null) {
     throw new TypeError('static-directory route needs a loopback port');
@@ -451,7 +455,7 @@ export async function startServeServer(projectDir, serveDir, config, stateNames,
         }
         continue;
       }
-      const u = new URL(state.route.url);
+      const u = new URL(buildStateUrl(state));
       if ((u.protocol === 'http:' || u.protocol === 'https:') && LOOPBACK_HOSTNAMES.has(u.hostname)) {
         urls.set(name, `http://127.0.0.1:${server.port}${u.pathname}${u.search}`);
         continue;

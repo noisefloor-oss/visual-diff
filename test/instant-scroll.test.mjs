@@ -7,11 +7,17 @@ import { createServer } from 'node:http';
 import { INSTANT_SCROLL_SCRIPT } from '../src/instant-scroll.mjs';
 
 test('settles smooth scrolling immediately without changing other scroll calls', () => {
-  const context = { calls: [] };
+  const context = { calls: [], reads: 0 };
   runInNewContext(`
     class Element {}
     for (const method of ['scroll', 'scrollTo', 'scrollBy', 'scrollIntoView']) {
-      Element.prototype[method] = function (...args) { calls.push({ target: 'element', method, args }); };
+      Element.prototype[method] = function (...args) {
+        calls.push({ target: 'element', method, args });
+        if (method === 'scrollTo' && args.length === 1 && typeof args[0] === 'object') {
+          if (args[0].top !== undefined) this._top = args[0].top;
+          if (args[0].left !== undefined) this._left = args[0].left;
+        }
+      };
     }
     // The window scroll methods are OWN properties of the window instance in
     // Chromium — modelling them on a Window.prototype would conceal a patch
@@ -19,6 +25,14 @@ test('settles smooth scrolling immediately without changing other scroll calls',
     const window = {};
     for (const method of ['scroll', 'scrollTo', 'scrollBy']) {
       window[method] = function (...args) { calls.push({ target: 'window', method, args }); };
+    }
+    for (const property of ['scrollTop', 'scrollLeft']) {
+      const offset = property === 'scrollTop' ? '_top' : '_left';
+      Object.defineProperty(Element.prototype, property, {
+        configurable: true,
+        get() { return this[offset] || 0; },
+        set(value) { this[offset] = value; },
+      });
     }
     globalThis.Element = Element;
     globalThis.window = window;
@@ -31,16 +45,28 @@ test('settles smooth scrolling immediately without changing other scroll calls',
     new Element().scrollTo(0, 10);
     window.scrollBy({ top: 10, behavior: 'smooth' });
     window.scrollTo({ top: 99, behavior: 'smooth' });
+    const element = new Element();
+    element.scrollTop = 40;
+    element.scrollLeft = 20;
+    element.scrollTo(Object.create({ top: 600, left: 500 }));
+    element.scrollTo({ get top() { return ++reads * 100; } });
+    element.scrollTop = undefined;
   `, context);
   const values = context.calls.map(({ target, method, args }) => ({ target, method, args: JSON.parse(JSON.stringify(args)) }));
   assert.deepEqual(values, [
     { target: 'element', method: 'scrollTo', args: [{ top: 0, behavior: 'instant' }] },
     { target: 'element', method: 'scrollIntoView', args: [{ behavior: 'instant', block: 'center' }] },
-    { target: 'element', method: 'scrollTo', args: [{ top: 5, behavior: 'auto' }] },
+    { target: 'element', method: 'scrollTo', args: [{ top: 5, behavior: 'instant' }] },
     { target: 'element', method: 'scrollTo', args: [0, 10] },
     { target: 'window', method: 'scrollBy', args: [{ top: 10, behavior: 'instant' }] },
     { target: 'window', method: 'scrollTo', args: [{ top: 99, behavior: 'instant' }] },
+    { target: 'element', method: 'scrollTo', args: [{ top: 40, left: 0, behavior: 'instant' }] },
+    { target: 'element', method: 'scrollTo', args: [{ top: 40, left: 20, behavior: 'instant' }] },
+    { target: 'element', method: 'scrollTo', args: [{ top: 600, left: 500, behavior: 'instant' }] },
+    { target: 'element', method: 'scrollTo', args: [{ top: 100, behavior: 'instant' }] },
+    { target: 'element', method: 'scrollTo', args: [{ top: 0, left: 500, behavior: 'instant' }] },
   ]);
+  assert.equal(context.reads, 1);
 });
 
 // =============================================================================

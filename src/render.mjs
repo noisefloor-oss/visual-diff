@@ -443,7 +443,7 @@ export async function renderPage({
   }
 
   const result = { url, aborted: [], fulfilled: [], defects: [] };
-  const context = await browser.newContext(contextOptions);
+  const context = await browser.newContext({ ...contextOptions, serviceWorkers: 'block' });
   for (const init of contextInitScripts) {
     await context.addInitScript(init);
   }

@@ -12,6 +12,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { PNG } from 'pngjs';
 
 import { tmpDir } from './helpers/tmp.mjs';
@@ -77,42 +78,53 @@ function mockStreams() {
 }
 
 // A temp project with one published compare run (run r1) over the given
-// reference/capture pair.
-async function makePublishedProject({ rects = [], values = {}, bools = {}, noiseFloor = 0, againstRunId = null } = {}) {
+// reference/capture pairs.
+async function makePublishedProject({ rects = [], values = {}, bools = {}, noiseFloor = 0, againstRunId = null, stateNames = ['home'] } = {}) {
   const dir = tmpDir('vd-verify-neutral');
   await init(dir);
   const layout = layoutFor(dir);
+  const config = structuredClone(CONFIG);
+  const manifest = structuredClone(MANIFEST);
+  for (const name of stateNames.slice(1)) {
+    config.states[name] = { ...CONFIG.states.home, comp: `app#02-${name}` };
+    manifest.comps.app.screens.push({ label: `02 ${name}`, id: `02-${name}`, noiseFloor });
+  }
   const inputs = {
     viewport: { width: 100, height: 50, fullPage: false },
     deviceScaleFactor: 2,
     readiness: { policy: 'networkidle', timeout: 10000, settle: 250 },
     fonts: [],
-    configHash: configHash(CONFIG),
+    configHash: configHash(config),
     vendorHashes: {},
   };
-  await writeFile(layout.configFile, JSON.stringify(CONFIG, null, 2) + '\n');
+  await writeFile(layout.configFile, JSON.stringify(config, null, 2) + '\n');
   const ref = pngBuffer(4, 4, { rects });
   const cap = pngBuffer(4, 4, {});
-  await writeFile(layout.referencePng('app', '01-main'), ref);
-  await writeRecord(layout.referenceProvenance('app', '01-main'), createRecord({
-    kind: 'reference',
-    artifactPath: '.visual-diff/references/app#01-main.png',
-    artifactBytes: ref,
-    renderer: RENDERER,
-    inputs,
-  }));
-  async function writeCapture(runId, image = cap) {
-    await mkdir(join(dir, '.visual-diff', 'captures', runId), { recursive: true });
-    await writeFile(layout.capturePng(runId, 'home'), image);
-    await writeRecord(layout.captureProvenance(runId, 'home'), createRecord({
-      kind: 'capture',
-      artifactPath: `.visual-diff/captures/${runId}/home.png`,
-      artifactBytes: image,
+  for (const [index, name] of stateNames.entries()) {
+    const screen = index === 0 ? '01-main' : `02-${name}`;
+    await writeFile(layout.referencePng('app', screen), ref);
+    await writeRecord(layout.referenceProvenance('app', screen), createRecord({
+      kind: 'reference',
+      artifactPath: `.visual-diff/references/app#${screen}.png`,
+      artifactBytes: ref,
       renderer: RENDERER,
       inputs,
     }));
   }
-  const manifest = structuredClone(MANIFEST);
+  async function writeCapture(runId, image = cap) {
+    await mkdir(join(dir, '.visual-diff', 'captures', runId), { recursive: true });
+    for (const [index, name] of stateNames.entries()) {
+      const screen = index === 0 ? '01-main' : `02-${name}`;
+      await writeFile(layout.capturePng(runId, name), image);
+      await writeRecord(layout.captureProvenance(runId, name), createRecord({
+        kind: 'capture',
+        artifactPath: `.visual-diff/captures/${runId}/${name}.png`,
+        artifactBytes: image,
+        renderer: RENDERER,
+        inputs,
+      }));
+    }
+  }
   manifest.comps.app.screens[0].noiseFloor = noiseFloor;
   await writeFile(join(dir, '.visual-diff', 'references', 'manifest.json'), JSON.stringify(manifest, null, 2));
   if (againstRunId !== null) {
@@ -222,8 +234,80 @@ describe('verify-neutral', () => {
     const res = await verifyAt(dir);
     assert.equal(res.code, 3);
     assert.match(res.streams.err(), /^noise visual-diff verify-neutral \[recompare-refused\]: re-compare of run r1 refused/m);
-    assert.match(res.streams.err(), /baseline was restored/);
+    assert.match(res.streams.err(), /restored untouched/);
     // the published report is byte-intact
+    const restored = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
+    assert.equal(restored.states.home.frame.differingPixels, 0);
+  });
+
+  test('an incomplete published baseline is refused before isolated verification', async () => {
+    const { dir, layout } = await makePublishedProject();
+    await rm(layout.diffPng('r1', 'home'));
+    const res = await verifyAt(dir);
+    assert.equal(res.code, 3);
+    assert.equal((await readCurrentRun(layout)).runId, 'r1');
+    assert.match(res.streams.err(), /published baseline is incomplete/);
+  });
+
+  test('one missing heatmap in a two-state baseline refuses before compare', async () => {
+    const { dir, layout } = await makePublishedProject({ stateNames: ['home', 'other'] });
+    await rm(layout.diffPng('r1', 'home'));
+    let compared = false;
+    const res = await verifyAt(dir, {
+      runCompare: async () => {
+        compared = true;
+        throw new Error('must not compare');
+      },
+    });
+    assert.equal(res.code, 3);
+    assert.equal(compared, false);
+    assert.equal((await readCurrentRun(layout)).runId, 'r1');
+  });
+
+  test('SIGINT waits for active writes and preserves the published baseline', async () => {
+    const { dir, layout } = await makePublishedProject();
+    const host = new EventEmitter();
+    let exitCode;
+    host.exit = (code) => { exitCode = code; };
+    let finishCompare;
+    const compareResult = new Promise((resolve) => { finishCompare = resolve; });
+    const verification = verifyAt(dir, {
+      process: host,
+      runCompare: async (_options, deps) => {
+        await mkdir(join(layout.diffsDir, deps.runId), { recursive: true });
+        await writeFile(join(layout.diffsDir, deps.runId, 'partial.json'), 'rerun');
+        return compareResult;
+      },
+    });
+    while (host.listenerCount('SIGINT') === 0) await new Promise((resolve) => setImmediate(resolve));
+    host.emit('SIGINT', 'SIGINT');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(exitCode, undefined, 'restoration waits for the writer to stop');
+    finishCompare({ code: 3, report: null });
+    await verification;
+    assert.equal(exitCode, 130);
+    const restored = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
+    assert.equal(restored.states.home.frame.differingPixels, 0);
+    assert.equal(host.listenerCount('SIGINT'), 0);
+    host.removeAllListeners('SIGTERM');
+  });
+
+  test('a signal during normal finalization shares the same baseline restoration', async () => {
+    const { dir, layout } = await makePublishedProject();
+    const host = new EventEmitter();
+    let exited;
+    host.exit = (code) => { exited(code); };
+    const exitCode = new Promise((resolve) => { exited = resolve; });
+    const verification = verifyAt(dir, {
+      process: host,
+      runCompare: async (options, deps) => {
+        const result = await runCompare(options, deps);
+        host.emit('SIGINT', 'SIGINT');
+        return result;
+      },
+    });
+    assert.equal(await exitCode, 130);
+    await verification;
     const restored = JSON.parse(await readFile(layout.reportJson('r1'), 'utf8'));
     assert.equal(restored.states.home.frame.differingPixels, 0);
   });
@@ -234,6 +318,14 @@ describe('verify-neutral', () => {
     const doc = JSON.parse(await readFile(reportPath, 'utf8'));
     doc.states.ghost = { comp: 'app#01-main', frame: { mismatch: 0, differingPixels: 0, totalPixels: 16 }, thresholdUsed: 1, verdict: 'pass' };
     await writeFile(reportPath, JSON.stringify(doc, null, 2) + '\n');
+    for (const path of [layout.capturePng('r1', 'ghost'), layout.captureProvenance('r1', 'ghost'), layout.diffPng('r1', 'ghost')]) {
+      const source = path === layout.capturePng('r1', 'ghost')
+        ? layout.capturePng('r1', 'home')
+        : path === layout.captureProvenance('r1', 'ghost')
+          ? layout.captureProvenance('r1', 'home')
+          : layout.diffPng('r1', 'home');
+      await writeFile(path, await readFile(source));
+    }
     const res = await verifyAt(dir);
     assert.equal(res.code, 1);
     assert.match(res.streams.out(), /ghost: .* \[DRIFT\]/);
