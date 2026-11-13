@@ -27,7 +27,7 @@ no Gatekeeper quarantine attribute is set; if you downloaded through a
 browser instead, `xattr -d com.apple.quarantine noise-visual-diff-darwin-<arch>`
 is the remedy (the binaries are ad-hoc signed, not notarized).
 
-**From a checkout:** also install Go 1.26.10 — `build:sea` and source-mode
+**From a checkout:** also install Go 1.26.11 — `build:sea` and source-mode
 capture build the first-party static-file helper from `native/` on demand.
 
 ```sh

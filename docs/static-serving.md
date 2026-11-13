@@ -21,7 +21,7 @@ escaping symlinks and non-regular files. It does not isolate changes to the
 contents of files already inside the authorized root or protect against an
 attacker who can modify the running tool itself.
 
-SEA packaging builds the helper with Go 1.26.10 for the build platform and embeds
+SEA packaging builds the helper with Go 1.26.11 for the build platform and embeds
 its bytes and SHA-256 in the one downloaded executable. At runtime it writes the
 verified bytes to a fresh owned temporary directory, starts it, and removes the
 directory on normal process exit. No Go installation is needed by release users.

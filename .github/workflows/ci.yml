@@ -8,14 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ${{ fromJSON(github.repository == 'noisefloor-oss/visual-diff' && '["ubuntu-24.04-arm"]' || '["self-hosted","Linux","ARM64"]') }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps:
-      - name: Reject external fork source on persistent runners
+      - name: Reject unadmitted external fork source
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         run: |
-          echo "Import this change into a same-repository branch before running self-hosted CI." >&2
+          echo "Import this change into a same-repository branch before CI certification." >&2
           exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -39,12 +44,13 @@ jobs:
     # writes into a live libexec root. The smoke step dispatches the built
     # binary directly so a build that cannot exec (missing postjection,
     # broken bundle) fails here.
-    runs-on: ${{ fromJSON(github.repository == 'noisefloor-oss/visual-diff' && '["ubuntu-24.04-arm"]' || '["self-hosted","Linux","ARM64"]') }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps:
-      - name: Reject external fork source on persistent runners
+      - name: Reject unadmitted external fork source
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         run: |
-          echo "Import this change into a same-repository branch before running self-hosted CI." >&2
+          echo "Import this change into a same-repository branch before CI certification." >&2
           exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -77,12 +83,13 @@ jobs:
           if-no-files-found: error
 
   macos-static-root:
-    runs-on: ${{ fromJSON(github.repository == 'noisefloor-oss/visual-diff' && '["macos-15"]' || '["self-hosted","macOS","ARM64"]') }}
+    runs-on: macos-15
+    timeout-minutes: 30
     steps:
-      - name: Reject external fork source on persistent runners
+      - name: Reject unadmitted external fork source
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         run: |
-          echo "Import this change into a same-repository branch before running self-hosted CI." >&2
+          echo "Import this change into a same-repository branch before CI certification." >&2
           exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

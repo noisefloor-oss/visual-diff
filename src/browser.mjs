@@ -46,7 +46,7 @@ import { homedir, release, cpus } from 'node:os';
 import { delimiter, join, dirname, isAbsolute, resolve } from 'node:path';
 
 /** Exact-pinned playwright client version (must match package.json / sidecar). */
-export const PINNED_CLIENT_VERSION = '1.64.1';
+export const PINNED_CLIENT_VERSION = '1.65.0';
 /** Connect timeout for the remote browser service WebSocket endpoint (ms). */
 export const SERVICE_CONNECT_TIMEOUT_MS = 10000;
 

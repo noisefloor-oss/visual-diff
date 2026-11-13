@@ -16,7 +16,7 @@ Pick one entry point and bootstrap it:
 - **From a checkout**: install the Node version pinned in the repository's
   `.nvmrc` (24.x; `nvm install` reads it) and install the repo's
   dependencies once from the repository root: `npm ci`. Source-mode `vd
-  capture` also needs Go 1.26.10 installed — the static-file server is
+  capture` also needs Go 1.26.11 installed — the static-file server is
   built from `native/` on first use. Then, from this
   directory: `vd() { node ../../src/cli.mjs "$@"; }`
 - **From a release binary**: download `noise-visual-diff` from a release,
